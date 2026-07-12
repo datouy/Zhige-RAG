@@ -1,0 +1,279 @@
+"""通用工具函数：日志、计时、文件加载、路径处理等。"""
+
+from __future__ import annotations
+
+import functools
+import hashlib
+import logging
+import os
+import re
+import time
+from pathlib import Path
+from typing import Any, Callable, Iterable, List, Optional
+
+
+# ----------------------------------------------------------------------
+#  路径处理
+# ----------------------------------------------------------------------
+def get_project_root() -> Path:
+    """获取项目根目录（配置文件所在目录的祖父目录）。"""
+    return Path(__file__).resolve().parent.parent
+
+
+def resolve_path(path: str | Path, base: Optional[Path] = None) -> Path:
+    """将相对路径解析为绝对路径。
+
+    Args:
+        path: 相对或绝对路径字符串。
+        base: 基准目录，默认为项目根目录。
+
+    Returns:
+        解析后的绝对 Path 对象。
+    """
+    p = Path(path)
+    if p.is_absolute():
+        return p
+    return (base or get_project_root()) / p
+
+
+def ensure_dir(path: str | Path) -> Path:
+    """确保目录存在，若不存在则创建。"""
+    p = resolve_path(path)
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+# ----------------------------------------------------------------------
+#  日志
+# ----------------------------------------------------------------------
+def setup_logger(
+    name: str = "ChineseRAGKB",
+    level: str = "INFO",
+    log_file: Optional[str | Path] = None,
+    console: bool = True,
+) -> logging.Logger:
+    """初始化日志器。
+
+    Args:
+        name: Logger 名称。
+        level: 日志级别字符串，如 INFO / DEBUG。
+        log_file: 日志文件路径，可选。
+        console: 是否输出到控制台。
+    """
+    logger = logging.getLogger(name)
+    logger.setLevel(getattr(logging, level.upper(), logging.INFO))
+    logger.handlers.clear()
+
+    fmt = logging.Formatter(
+        fmt="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    if console:
+        sh = logging.StreamHandler()
+        sh.setFormatter(fmt)
+        logger.addHandler(sh)
+
+    if log_file:
+        log_path = resolve_path(log_file)
+        ensure_dir(log_path.parent)
+        fh = logging.FileHandler(log_path, encoding="utf-8")
+        fh.setFormatter(fmt)
+        logger.addHandler(fh)
+
+    logger.propagate = False
+    return logger
+
+
+def get_logger(name: Optional[str] = None) -> logging.Logger:
+    """获取一个子 Logger，继承根 Logger 的配置。"""
+    if name:
+        return logging.getLogger(f"ChineseRAGKB.{name}")
+    return logging.getLogger("ChineseRAGKB")
+
+
+# ----------------------------------------------------------------------
+#  计时
+# ----------------------------------------------------------------------
+class Timer:
+    """上下文计时器，用于统计代码块耗时。"""
+
+    def __init__(self, name: str = "block", logger: Optional[logging.Logger] = None):
+        self.name = name
+        self.logger = logger or get_logger()
+        self.start: float = 0.0
+        self.elapsed_ms: float = 0.0
+
+    def __enter__(self) -> "Timer":
+        self.start = time.perf_counter()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.elapsed_ms = (time.perf_counter() - self.start) * 1000
+        self.logger.info("%s 耗时 %.2f ms", self.name, self.elapsed_ms)
+
+
+def timer(name: str = "func") -> Callable:
+    """装饰器：统计函数执行耗时。"""
+
+    def deco(fn: Callable) -> Callable:
+        @functools.wraps(fn)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            with Timer(name=f"{name}.{fn.__name__}"):
+                return fn(*args, **kwargs)
+
+        return wrapper
+
+    return deco
+
+
+# ----------------------------------------------------------------------
+#  文本处理
+# ----------------------------------------------------------------------
+_WHITESPACE_RE = re.compile(r"[ \t]+")
+_MULTI_NEWLINE_RE = re.compile(r"\n{3,}")
+
+
+def clean_text(text: str) -> str:
+    """基础文本清洗：合并多余空白、统一换行。
+
+    Args:
+        text: 原始文本。
+
+    Returns:
+        清洗后的文本。
+    """
+    if not text:
+        return ""
+    # 去除首尾空白
+    text = text.strip()
+    # 合并空格与制表符
+    text = _WHITESPACE_RE.sub(" ", text)
+    # 合并多余空行
+    text = _MULTI_NEWLINE_RE.sub("\n\n", text)
+    return text
+
+
+def chunk_text_by_length(text: str, max_chars: int) -> List[str]:
+    """将长文本按最大字符数切片（中英文字符皆按 1 计数）。"""
+    if max_chars <= 0 or len(text) <= max_chars:
+        return [text] if text else []
+    return [text[i : i + max_chars] for i in range(0, len(text), max_chars)]
+
+
+# ----------------------------------------------------------------------
+#  文件与目录
+# ----------------------------------------------------------------------
+SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".md", ".markdown", ".txt"}
+
+
+def iter_doc_files(root: str | Path, recursive: bool = True) -> Iterable[Path]:
+    """遍历目录下所有受支持文档文件。"""
+    root = resolve_path(root)
+    if not root.exists():
+        return
+    if recursive:
+        for p in root.rglob("*"):
+            if p.is_file() and p.suffix.lower() in SUPPORTED_EXTENSIONS:
+                yield p
+    else:
+        for p in root.iterdir():
+            if p.is_file() and p.suffix.lower() in SUPPORTED_EXTENSIONS:
+                yield p
+
+
+def file_md5(path: str | Path, chunk_size: int = 65536) -> str:
+    """计算文件 MD5，用于去重。"""
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(chunk_size)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
+# ----------------------------------------------------------------------
+#  环境变量加载（简易 .env）
+# ----------------------------------------------------------------------
+def load_env_file(env_path: str | Path = ".env", override: bool = False) -> None:
+    """加载 .env 文件到环境变量（不依赖 python-dotenv）。
+
+    Args:
+        env_path: .env 文件路径。
+        override: 是否覆盖已有环境变量。
+    """
+    path = resolve_path(env_path)
+    if not path.exists():
+        return
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if not override and key in os.environ:
+            continue
+        os.environ[key] = value
+
+
+# ----------------------------------------------------------------------
+#  配置加载
+# ----------------------------------------------------------------------
+def load_config(config_path: str | Path = "config/config.yaml") -> dict:
+    """加载 YAML 配置文件。
+
+    若 PyYAML 未安装，则抛出 ImportError 提示用户安装。
+    """
+    import yaml  # type: ignore
+
+    path = resolve_path(config_path)
+    if not path.exists():
+        raise FileNotFoundError(f"配置文件未找到: {path}")
+    with open(path, "r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f) or {}
+    return cfg
+
+
+def merge_dict(base: dict, override: dict) -> dict:
+    """递归合并两个 dict（override 覆盖 base）。"""
+    result = dict(base)
+    for k, v in (override or {}).items():
+        if isinstance(v, dict) and isinstance(result.get(k), dict):
+            result[k] = merge_dict(result[k], v)
+        else:
+            result[k] = v
+    return result
+
+
+# ----------------------------------------------------------------------
+#  环境变量覆盖支持
+# ---------------------------------------------------------------------
+def apply_env_overrides(cfg: dict) -> dict:
+    """根据环境变量覆盖部分常用配置。"""
+    mapping = {
+        "DEVICE": ("embedding", "device"),
+        "EMBEDDING_DEVICE": ("embedding", "device"),
+        "LLM_DEVICE": ("llm", "device"),
+        "USE_4BIT": ("llm", "quantization", "enabled"),
+        "STREAMLIT_SERVER_PORT": ("ui", "server_port"),
+    }
+    for env_key, path in mapping.items():
+        val = os.environ.get(env_key)
+        if val is None:
+            continue
+        cur = cfg
+        for p in path[:-1]:
+            cur = cur.setdefault(p, {})
+        key = path[-1]
+        # 简单类型推断
+        v_lower = val.lower()
+        if v_lower in ("true", "false"):
+            cur[key] = v_lower == "true"
+        else:
+            cur[key] = val
+    return cfg

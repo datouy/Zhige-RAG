@@ -1,0 +1,178 @@
+# =====================================================
+# 中文个人知识库 RAG 系统 - 主配置文件
+# 所有路径优先使用相对路径，便于跨平台移植
+# =====================================================
+
+# ------------------ 项目基础 ------------------
+project:
+  name: "ChineseRAGKB"
+  version: "0.1.0"
+  description: "面向 GTX 1060 4GB 等低端硬件的中文个人知识库 RAG 系统"
+
+# 与 UI 侧栏引用对齐
+app:
+  name: "中文个人知识库 RAG"
+  version: "0.1.0"
+
+# ------------------ 数据目录 ------------------
+paths:
+  raw_docs: "data/raw"          # 原始文档目录（UI/CLI 读取）
+  chroma_db: "data/chroma_db"    # 向量库目录
+  eval: "data/eval"              # 评估数据/报告目录
+  logs: "logs"                   # 日志目录
+
+# ------------------ 文档处理 ------------------
+document_loader:
+  supported_extensions:
+    - .pdf
+    - .docx
+    - .md
+    - .markdown
+    - .txt
+  pdf_engine: "pdfplumber"        # pdfplumber / pypdf
+  pdf_backend: "pdfplumber"       # 别名，兼容旧引用
+  encoding: "utf-8"               # TXT 编码
+  clean_text: true                # 是否做基础清洗
+  max_pdf_pages: 1000
+  markdown_extensions:
+    - tables
+    - fenced_code
+
+# ------------------ 文本分块 ------------------
+text_splitter:
+  strategy: "chinese"             # chinese / recursive
+  chunk_size: 300                 # 单块目标字符数
+  chunk_overlap: 50               # 块间重叠
+  min_chunk_size: 50              # 最小块大小
+  chinese_separators:             # ChineseTextSplitter 使用的分隔符
+    - "\n\n"
+    - "\n"
+    - "。"
+    - "！"
+    - "？"
+    - "；"
+    - "，"
+  separators:                     # 通用回退分隔符
+    - "\n\n"
+    - "\n"
+    - "。"
+    - "！"
+    - "？"
+    - "；"
+    - "，"
+  keep_separator: true
+  strip_whitespace: true
+
+# ------------------ Embedding 模型 ------------------
+embedding:
+  model_name: "BAAI/bge-small-zh-v1.5"
+  # 备选: shibing624/text2vec-base-chinese, BAAI/bge-base-zh-v1.5
+  device: "auto"                # cuda / cpu / auto
+  batch_size: 16
+  normalize_embeddings: true
+  max_seq_length: 512
+  query_instruction: "为这个句子生成表示以用于检索相关文章："
+  use_doc_instruction: false
+  cache_dir: "./models/sentence-transformers"
+  local_files_only: true        # 模型已在本地时不再联网
+
+# ------------------ 向量数据库 ------------------
+vector_store:
+  backend: "chroma"
+  collection_name: "chinese_rag_kb"
+  persist_directory: "data/chroma_db"
+  distance_fn: "cosine"           # cosine / l2 / ip
+  distance_function: "cosine"     # 别名，兼容旧引用
+  top_k: 4
+  fetch_k: 20
+  filter_metadata: {}
+  hybrid:
+    enabled: false                # BM25 混合检索（预留）
+
+# ------------------ 检索参数 ------------------
+retrieval:
+  top_k: 4                        # 检索 top-k
+  rerank_candidates: 12           # 重排候选数
+  score_threshold: 0.0            # 相似度阈值
+
+# ------------------ 重排序（可选） ------------------
+reranker:
+  enabled: false                  # 默认关闭，需要时打开
+  model_name: "BAAI/bge-reranker-base"
+  device: "cuda"
+  top_n: 3
+  max_length: 512
+  cache_dir: "./models/huggingface"
+
+# ------------------ 大语言模型 ------------------
+llm:
+  model_name: "./models/Qwen2.5-1.5B-Instruct"
+  # 备选: Qwen/Qwen2.5-3B-Instruct-GPTQ-Int4, Qwen/Qwen2.5-0.5B-Instruct
+  # 备选: google/gemma-2-2b-it, Qwen/Qwen2-1.5B-Instruct
+  model_path: ""                  # 留空使用 model_name 自动下载；可填本地路径
+  device: "auto"                # cuda / cpu / auto
+  device_map: "auto"
+  torch_dtype: "auto"             # auto / float16 / bfloat16 / float32
+  cache_dir: "./models/huggingface"
+  trust_remote_code: false
+  local_files_only: true          # 模型已在本地时不再联网
+  use_chat_template: true
+  chat_template: "auto"           # auto / qwen / chatml / raw
+
+  # 4bit 量化配置（与 src/llm.py 的 LocalLLM.quant 字段对应）
+  quantization:
+    enabled: false              # CPU 跑 1.5B 默认不开 4bit 量化（bitsandbytes 在 Windows CPU 上不稳定）
+    quant_type: "nf4"             # nf4 / fp4
+    compute_dtype: "float16"
+    double_quant: true
+    cache_dir: "./models/huggingface"
+
+  # 生成参数（与 src/llm.py 的 GenerationConfig 字段对应）
+  generation:
+    max_new_tokens: 512
+    temperature: 0.2
+    top_p: 0.9
+    repetition_penalty: 1.05
+    do_sample: true
+    stream: true
+
+# ------------------ RAG 推理参数 ------------------
+rag:
+  top_k: 4
+  use_reranker: false
+  max_context_tokens: 2000        # 拼接 prompt 的最大上下文 token 数
+  max_context_length: 2000        # 别名
+  max_history_turns: 0            # 多轮对话历史轮数
+  score_threshold: 0.0
+  answer_citations: true
+  return_sources: true
+  fallback_answer: "抱歉，知识库中未找到相关信息，无法回答该问题。"
+  system_prompt_file: "config/prompts.yaml"
+
+# ------------------ 评估 ------------------
+evaluation:
+  retrieval_top_k: 5
+  judge_model: ""                 # 留空使用主 LLM 自评；可指定另一个本地模型
+  dataset_path: "data/eval/eval_set.jsonl"
+  output_path: "data/eval/results.json"
+  report_path: "data/eval/report.json"
+  metrics:
+    - retrieval_hit_rate
+    - answer_keyword_containment
+    - avg_latency_sec
+
+# ------------------ Web UI ------------------
+ui:
+  title: "中文个人知识库 RAG"
+  page_icon: "📚"
+  theme: "light"                  # light / dark
+  default_top_k: 4
+  default_temperature: 0.2
+  show_thinking: false
+  max_upload_mb: 50
+  max_chat_history: 20
+  allowed_upload_types:
+    - pdf
+    - docx
+    - md
+    - txt

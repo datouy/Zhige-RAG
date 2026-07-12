@@ -1,0 +1,5 @@
+{"question": "什么是 RAG？", "expected_sources": ["rag-intro.md"], "expected_keywords": ["检索增强生成", "信息检索", "文本生成"]}
+{"question": "RAG 相比传统的微调有什么优势？", "expected_sources": ["rag-intro.md"], "expected_keywords": ["知识更新", "重新入库", "可解释"]}
+{"question": "请列出 RAG 的核心流程步骤。", "expected_sources": ["rag-intro.md"], "expected_keywords": ["文档解析", "向量化", "检索", "生成"]}
+{"question": "RAG 能解决大模型的哪些问题？", "expected_sources": ["rag-intro.md"], "expected_keywords": ["幻觉", "知识陈旧"]}
+{"question": "什么场景适合用 RAG？", "expected_sources": ["rag-intro.md"], "expected_keywords": ["知识库", "问答"]}
