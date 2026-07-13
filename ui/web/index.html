@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>中文知识库 RAG</title>
+    <link rel="stylesheet" href="/css/main.css">
+</head>
+<body>
+    <!-- Header -->
+    <header class="header">
+        <div class="header-inner">
+            <h1>📚 中文知识库 RAG</h1>
+            <span id="ws-status" class="status disconnected">连接中...</span>
+        </div>
+    </header>
+
+    <!-- Navigation -->
+    <nav class="nav">
+        <div class="nav-inner">
+            <a href="/index.html" class="active">💬 智能问答</a>
+            <a href="/upload.html">📤 上传文档</a>
+            <a href="/docs.html">📁 知识库</a>
+        </div>
+    </nav>
+
+    <!-- Alert Container -->
+    <div id="alert-container" class="container"></div>
+
+    <!-- Chat Container -->
+    <main class="chat-container">
+        <div id="messages" class="messages">
+            <div class="empty-state" id="welcome-state">
+                <div class="icon">💬</div>
+                <p>开始提问吧！</p>
+                <p style="font-size: 0.85rem; margin-top: 0.5rem;">
+                    基于本地知识库的 RAG 智能问答助手
+                </p>
+            </div>
+        </div>
+
+        <div class="input-area">
+            <div class="input-wrapper">
+                <input 
+                    type="text" 
+                    id="chat-input" 
+                    placeholder="输入你的问题，按 Enter 发送..."
+                    autocomplete="off"
+                >
+                <button id="send-btn">发送</button>
+                <button id="clear-btn" class="btn btn-secondary">清空</button>
+            </div>
+            <div class="settings-row">
+                <label>Top-K: 
+                    <input type="number" id="top-k" value="4" min="1" max="20">
+                </label>
+                <span id="chunk-count-info">知识库: <span id="chunk-count">0</span> 条</span>
+            </div>
+        </div>
+    </main>
+
+    <!-- Chunk Detail Modal -->
+    <div id="chunk-modal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>分块详情</h3>
+                <button class="modal-close">&times;</button>
+            </div>
+            <pre id="modal-text" style="white-space: pre-wrap; word-wrap: break-word;"></pre>
+        </div>
+    </div>
+
+    <footer class="footer">
+        ChineseRAGKB v0.2.0 | FastAPI + WebSocket
+    </footer>
+
+    <script src="/js/app.js"></script>
+</body>
+</html>

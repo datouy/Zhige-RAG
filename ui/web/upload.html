@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>上传文档 - 中文知识库 RAG</title>
+    <link rel="stylesheet" href="/css/main.css">
+</head>
+<body>
+    <!-- Header -->
+    <header class="header">
+        <div class="header-inner">
+            <h1>📚 中文知识库 RAG</h1>
+            <span id="ws-status" class="status disconnected">连接中...</span>
+        </div>
+    </header>
+
+    <!-- Navigation -->
+    <nav class="nav">
+        <div class="nav-inner">
+            <a href="/index.html">💬 智能问答</a>
+            <a href="/upload.html" class="active">📤 上传文档</a>
+            <a href="/docs.html">📁 知识库</a>
+        </div>
+    </nav>
+
+    <!-- Alert Container -->
+    <div id="alert-container" class="page"></div>
+
+    <!-- Upload Page -->
+    <main class="page">
+        <h2>📤 上传文档</h2>
+        <p style="color: var(--text-muted); margin-bottom: 1rem;">
+            支持 PDF、DOCX、Markdown、TXT 格式。文件将上传到服务器并自动解析入库。
+        </p>
+
+        <div class="upload-area">
+            <input type="file" id="file-input" multiple accept=".pdf,.docx,.md,.markdown,.txt">
+            <label for="file-input">选择文件</label>
+            <div class="hint" id="file-hint">未选择文件</div>
+        </div>
+
+        <div style="display: flex; gap: 0.5rem; margin-bottom: 1rem;">
+            <button id="upload-btn" class="btn btn-primary" disabled>上传并入库</button>
+            <button id="clear-btn" class="btn btn-secondary">清空选择</button>
+        </div>
+
+        <hr style="border: none; border-top: 1px solid var(--border); margin: 2rem 0;">
+
+        <h3>📂 批量入库目录</h3>
+        <p style="color: var(--text-muted); margin-bottom: 1rem;">
+            将 <code>data/raw</code> 目录下的所有文档入库。
+        </p>
+        <button id="ingest-dir-btn" class="btn btn-primary">📥 入库 data/raw</button>
+    </main>
+
+    <!-- Chunk Detail Modal -->
+    <div id="chunk-modal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>分块详情</h3>
+                <button class="modal-close">&times;</button>
+            </div>
+            <pre id="modal-text" style="white-space: pre-wrap; word-wrap: break-word;"></pre>
+        </div>
+    </div>
+
+    <footer class="footer">
+        ChineseRAGKB v0.2.0 | FastAPI + WebSocket
+    </footer>
+
+    <script>
+        // 文件选择处理
+        const fileInput = document.getElementById('file-input');
+        const fileHint = document.getElementById('file-hint');
+        const uploadBtn = document.getElementById('upload-btn');
+        const clearBtn = document.getElementById('clear-btn');
+        const alertContainer = document.getElementById('alert-container');
+
+        fileInput.addEventListener('change', () => {
+            const files = fileInput.files;
+            if (files.length === 0) {
+                fileHint.textContent = '未选择文件';
+                uploadBtn.disabled = true;
+            } else {
+                const names = Array.from(files).map(f => f.name).join(', ');
+                fileHint.textContent = `已选择 ${files.length} 个文件: ${names.substring(0, 100)}${names.length > 100 ? '...' : ''}`;
+                uploadBtn.disabled = false;
+            }
+        });
+
+        clearBtn.addEventListener('click', () => {
+            fileInput.value = '';
+            fileHint.textContent = '未选择文件';
+            uploadBtn.disabled = true;
+        });
+
+        // 上传文件
+        uploadBtn.addEventListener('click', async () => {
+            const files = fileInput.files;
+            if (!files || files.length === 0) return;
+
+            const formData = new FormData();
+            for (const file of files) {
+                formData.append('file', file);
+            }
+
+            uploadBtn.disabled = true;
+            uploadBtn.innerHTML = '<span class="spinner"></span> 上传中...';
+
+            try {
+                const resp = await fetch('/api/ingest', {
+                    method: 'POST',
+                    body: formData
+                });
+                
+                if (!resp.ok) throw new Error(await resp.text());
+                
+                const result = await resp.json();
+                showAlert(`上传成功！文件名: ${result.filename}，新增 ${result.ingested} 个分块`, 'success');
+                fileInput.value = '';
+                fileHint.textContent = '未选择文件';
+                uploadBtn.disabled = true;
+            } catch (e) {
+                showAlert('上传失败: ' + e.message, 'error');
+            } finally {
+                uploadBtn.disabled = false;
+                uploadBtn.textContent = '上传并入库';
+            }
+        });
+
+        // 批量入库
+        document.getElementById('ingest-dir-btn').addEventListener('click', async () => {
+            const btn = document.getElementById('ingest-dir-btn');
+            btn.disabled = true;
+            btn.innerHTML = '<span class="spinner"></span> 入库中...';
+
+            try {
+                const formData = new FormData();
+                formData.append('dir_path', 'data/raw');
+                formData.append('recursive', 'true');
+
+                const resp = await fetch('/api/ingest/dir', {
+                    method: 'POST',
+                    body: formData
+                });
+                
+                if (!resp.ok) throw new Error(await resp.text());
+                
+                const result = await resp.json();
+                showAlert(`入库完成！处理 ${result.docs} 个文档，${result.ingested} 个分块`, 'success');
+            } catch (e) {
+                showAlert('入库失败: ' + e.message, 'error');
+            } finally {
+                btn.disabled = false;
+                btn.textContent = '📥 入库 data/raw';
+            }
+        });
+
+        // WebSocket 连接状态
+        function updateStatus() {
+            const statusEl = document.getElementById('ws-status');
+            // 简化实现：仅用于显示
+            statusEl.textContent = 'API Ready';
+            statusEl.className = 'status connected';
+        }
+        updateStatus();
+
+        function showAlert(message, type = 'success') {
+            const alert = document.createElement('div');
+            alert.className = `alert alert-${type}`;
+            alert.textContent = message;
+            alertContainer.innerHTML = '';
+            alertContainer.appendChild(alert);
+            setTimeout(() => alert.remove(), 5000);
+        }
+
+        // 模态框关闭
+        document.addEventListener('click', (e) => {
+            if (e.target.classList.contains('modal') || e.target.classList.contains('modal-close')) {
+                document.getElementById('chunk-modal').classList.remove('active');
+            }
+        });
+    </script>
+</body>
+</html>

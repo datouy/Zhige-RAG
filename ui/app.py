@@ -2,6 +2,9 @@
 
 启动命令：
     streamlit run ui/app.py --server.port 8501
+
+注意：如需使用新的 FastAPI 模式，请运行：
+    uvicorn api.main:app --reload --host 0.0.0.0 --port 8000
 """
 
 from __future__ import annotations
@@ -14,6 +17,30 @@ from pathlib import Path
 # 让 Streamlit 能从项目根目录导入 src.*
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+
+# =========================== Streamlit 兼容性检测 ===========================
+# 检测是否应在 FastAPI 模式下运行
+_streamlit_mode = os.environ.get("STREAMLIT_RUNTIME", "")
+
+def _check_fastapi_mode():
+    """检测 FastAPI 模式：如果 ui/web 目录存在且未强制要求 Streamlit，则提示用户。"""
+    ui_web_dir = ROOT / "ui" / "web"
+    # 如果 ui/web 目录存在，说明 FastAPI 模式已启用
+    if ui_web_dir.exists() and not _streamlit_mode.lower() == "enable":
+        print("=" * 60)
+        print("⚠️  FastAPI 模式已启用！")
+        print()
+        print("推荐使用新的 Web UI：")
+        print("    uvicorn api.main:app --reload --host 0.0.0.0 --port 8000")
+        print()
+        print("然后在浏览器中打开 http://localhost:8000")
+        print()
+        print("如需使用旧版 Streamlit UI，请设置环境变量：")
+        print("    STREAMLIT_RUNTIME=enable streamlit run ui/app.py")
+        print("=" * 60)
+        print()
+
+_check_fastapi_mode()
 
 import streamlit as st
 
@@ -33,6 +60,9 @@ from src.utils import (
 from src.vector_store import ChromaStore
 
 from ui.page_modules.analytics import render_page as page_analytics
+from ui.page_modules.versions import render_page as page_versions
+from ui.page_modules.agent import render_page as page_agent
+from ui.page_modules.kg import render_page as page_kg
 
 logger = get_logger("ui")
 
@@ -170,7 +200,7 @@ def render_sidebar(config_path: str):
         st.divider()
         page = st.radio(
             "功能导航",
-            ["💬 智能问答", "📤 文档上传", "📁 知识库管理", "⚙️ 系统设置", "📈 评估", "📊 指标可视化"],
+            ["💬 智能问答", "🤖 Agent", "📤 文档上传", "📁 知识库管理", "📜 文档版本", "🕸 知识图谱", "⚙️ 系统设置", "📈 评估", "📊 指标可视化"],
             index=0,
         )
         st.divider()
@@ -472,10 +502,16 @@ def main():
 
     if page.startswith("💬"):
         page_chat(pipeline, cfg)
+    elif page.startswith("🤖"):
+        page_agent(cfg)
     elif page.startswith("📤"):
         page_upload(cfg, embed, store)
     elif page.startswith("📁"):
         page_manage(cfg, store)
+    elif page.startswith("📜"):
+        page_versions()
+    elif page.startswith("🕸"):
+        page_kg(cfg)
     elif page.startswith("⚙️"):
         page_settings(cfg)
     elif page.startswith("📈"):

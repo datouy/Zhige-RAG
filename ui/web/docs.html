@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>知识库管理 - 中文知识库 RAG</title>
+    <link rel="stylesheet" href="/css/main.css">
+</head>
+<body>
+    <!-- Header -->
+    <header class="header">
+        <div class="header-inner">
+            <h1>📚 中文知识库 RAG</h1>
+            <span id="ws-status" class="status connected">API Ready</span>
+        </div>
+    </header>
+
+    <!-- Navigation -->
+    <nav class="nav">
+        <div class="nav-inner">
+            <a href="/index.html">💬 智能问答</a>
+            <a href="/upload.html">📤 上传文档</a>
+            <a href="/docs.html" class="active">📁 知识库</a>
+        </div>
+    </nav>
+
+    <!-- Alert Container -->
+    <div id="alert-container" class="page"></div>
+
+    <!-- Documents Page -->
+    <main class="page">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem;">
+            <h2>📁 知识库管理</h2>
+            <div style="font-size: 0.9rem; color: var(--text-muted);">
+                共 <strong id="doc-count">0</strong> 个文档，
+                <strong id="chunk-total">0</strong> 个分块
+            </div>
+        </div>
+
+        <!-- Search -->
+        <div class="search-box">
+            <input type="text" id="search-input" placeholder="🔍 搜索文档名称...">
+        </div>
+
+        <!-- Document List -->
+        <div id="doc-list" class="doc-list">
+            <div class="empty-state">
+                <div class="spinner"></div>
+                <p>加载中...</p>
+            </div>
+        </div>
+
+        <!-- Delete Confirmation Modal -->
+        <div id="delete-modal" class="modal">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h3>确认删除</h3>
+                    <button class="modal-close">&times;</button>
+                </div>
+                <p id="delete-message">确定要删除此文档吗？</p>
+                <div style="display: flex; gap: 0.5rem; justify-content: flex-end; margin-top: 1rem;">
+                    <button class="btn btn-secondary" onclick="closeDeleteModal()">取消</button>
+                    <button id="confirm-delete-btn" class="btn btn-danger">确认删除</button>
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <!-- Chunk Detail Modal -->
+    <div id="chunk-modal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3 id="modal-title">分块详情</h3>
+                <button class="modal-close">&times;</button>
+            </div>
+            <pre id="modal-text" style="white-space: pre-wrap; word-wrap: break-word; max-height: 60vh; overflow-y: auto;"></pre>
+        </div>
+    </div>
+
+    <footer class="footer">
+        ChineseRAGKB v0.2.0 | FastAPI + WebSocket
+    </footer>
+
+    <script>
+        let allDocs = [];
+        let deleteTarget = null;
+
+        // 加载文档列表
+        async function loadDocuments() {
+            try {
+                const resp = await fetch('/api/documents');
+                const data = await resp.json();
+                allDocs = data.documents || [];
+                renderDocuments(allDocs);
+                document.getElementById('doc-count').textContent = allDocs.length;
+                document.getElementById('chunk-total').textContent = data.total_chunks || 0;
+            } catch (e) {
+                showAlert('加载失败: ' + e.message, 'error');
+            }
+        }
+
+        // 渲染文档列表
+        function renderDocuments(docs) {
+            const list = document.getElementById('doc-list');
+            
+            if (docs.length === 0) {
+                list.innerHTML = `
+                    <div class="empty-state">
+                        <div class="icon">📭</div>
+                        <p>${allDocs.length === 0 ? '知识库为空，请先上传文档' : '没有找到匹配的文档'}</p>
+                    </div>
+                `;
+                return;
+            }
+
+            list.innerHTML = docs.map(doc => `
+                <div class="doc-item">
+                    <div>
+                        <div class="name">📄 ${escapeHtml(doc.source)}</div>
+                        <div class="meta">${doc.chunks} 个分块</div>
+                    </div>
+                    <div class="actions">
+                        <button class="btn btn-secondary" onclick="viewDocument('${escapeHtml(doc.source)}')">预览</button>
+                        <button class="btn btn-danger" onclick="confirmDelete('${escapeHtml(doc.source)}')">删除</button>
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        // 搜索
+        document.getElementById('search-input').addEventListener('input', (e) => {
+            const keyword = e.target.value.toLowerCase();
+            const filtered = allDocs.filter(doc => 
+                doc.source.toLowerCase().includes(keyword)
+            );
+            renderDocuments(filtered);
+        });
+
+        // 预览文档
+        async function viewDocument(source) {
+            try {
+                const resp = await fetch(`/api/documents/${encodeURIComponent(source)}/chunks?limit=10`);
+                const data = await resp.json();
+                
+                const modal = document.getElementById('chunk-modal');
+                document.getElementById('modal-title').textContent = `📄 ${source}`;
+                document.getElementById('modal-text').textContent = 
+                    data.chunks.map((c, i) => `【分块 ${i + 1}】\n${c.text}\n`).join('\n---\n') || '无分块内容';
+                modal.classList.add('active');
+            } catch (e) {
+                showAlert('预览失败: ' + e.message, 'error');
+            }
+        }
+
+        // 删除确认
+        function confirmDelete(source) {
+            deleteTarget = source;
+            document.getElementById('delete-message').textContent = 
+                `确定要删除文档 "${source}" 吗？此操作将从知识库中删除所有相关分块。`;
+            document.getElementById('delete-modal').classList.add('active');
+        }
+
+        function closeDeleteModal() {
+            document.getElementById('delete-modal').classList.remove('active');
+            deleteTarget = null;
+        }
+
+        // 确认删除
+        document.getElementById('confirm-delete-btn').addEventListener('click', async () => {
+            if (!deleteTarget) return;
+            
+            const btn = document.getElementById('confirm-delete-btn');
+            btn.disabled = true;
+            btn.innerHTML = '<span class="spinner"></span>';
+
+            try {
+                // 注意: 这里需要后端实现删除 API
+                // 暂时通过重新入库实现刷新
+                showAlert('删除功能需要后端实现，当前仅刷新列表', 'error');
+                closeDeleteModal();
+                await loadDocuments();
+            } catch (e) {
+                showAlert('删除失败: ' + e.message, 'error');
+            } finally {
+                btn.disabled = false;
+                btn.textContent = '确认删除';
+            }
+        });
+
+        function showAlert(message, type = 'success') {
+            const container = document.getElementById('alert-container');
+            const alert = document.createElement('div');
+            alert.className = `alert alert-${type}`;
+            alert.textContent = message;
+            container.innerHTML = '';
+            container.appendChild(alert);
+            setTimeout(() => alert.remove(), 5000);
+        }
+
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML.replace(/'/g, "\\'").replace(/"/g, '\\"');
+        }
+
+        // 模态框关闭
+        document.addEventListener('click', (e) => {
+            if (e.target.classList.contains('modal') || e.target.classList.contains('modal-close')) {
+                document.querySelectorAll('.modal').forEach(m => m.classList.remove('active'));
+            }
+        });
+
+        // 初始化
+        loadDocuments();
+    </script>
+</body>
+</html>
