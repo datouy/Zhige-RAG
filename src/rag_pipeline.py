@@ -463,3 +463,21 @@ class RAGPipeline:
             yield {"event": "error", "data": str(exc)}
             return
         yield {"event": "done", "data": cites}
+
+    async def astream_answer(self, question: str, top_k: Optional[int] = None):
+        """异步流式问答：yield ``{"event":..., "data":...}`` 事件。
+
+        基于现有的同步 ``stream_answer()`` 改造，使用 asyncio 封装。
+
+        事件类型：
+        - ``hits``: 命中来源（最早发出）
+        - ``token``: 生成 token
+        - ``done``: 结束（data 含 cites）
+        - ``error``: 异常
+        """
+        import asyncio
+
+        # 在线程池中运行同步的 stream_answer，避免阻塞事件循环
+        loop = asyncio.get_event_loop()
+        for event in await loop.run_in_executor(None, self.stream_answer, question, top_k):
+            yield event
