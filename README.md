@@ -19,6 +19,7 @@
 - 📊 **指标可视化与历史对比**：Plotly 多维图表 + NDCG/MRR/TTFT/tokens/s + 自动历史存档
 - 📊 **指标可视化面板** — Streamlit 中一键查看 NDCG@5、MRR、TTFT、tokens/s，附带历史趋势对比（详见 docs/usage.md 第 11 节）
 - 🧪 **工程化**：模块化、配置驱动、可替换组件（Embedding / LLM / Reranker）
+- 🧬 **数据合成 Pipeline** — 从 markdown 自动抽取实体 → 填空 10 类问题模板，批量产出 Easy/Medium 评估样本（详见 docs/usage.md 第 12 节）
 
 ---
 
@@ -134,7 +135,8 @@ ChineseRAGKB/
 ├── scripts/
 │   ├── ingest.py              # 命令行入库
 │   ├── query.py               # 命令行查询
-│   └── evaluate.py            # 评估脚本
+│   ├── evaluate.py            # 评估脚本
+│   └── synthesize.py          # 评估集数据合成 pipeline（从 md 自动出题）
 │
 ├── data/
 │   ├── raw/                   # 原始文档（.gitkeep 占位）
@@ -144,7 +146,9 @@ ChineseRAGKB/
 ├── tests/
 │   ├── test_document_loader.py
 │   ├── test_text_splitter.py
-│   └── test_rag_pipeline.py
+│   ├── test_rag_pipeline.py
+│   ├── test_evaluate_metrics.py
+│   └── test_synthesize.py     # 数据合成 pipeline 单元测试
 │
 └── docs/
     ├── architecture.md        # 架构说明（含 mermaid 图）

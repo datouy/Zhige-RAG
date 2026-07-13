@@ -176,3 +176,25 @@ ui:
     - docx
     - md
     - txt
+
+# ------------------ 知识图谱 ------------------
+knowledge_graph:
+  enabled: true
+  backend: sqlite              # neo4j / sqlite
+  sqlite_path: data/kg.db
+  neo4j:
+    uri: bolt://localhost:7687
+    user: neo4j
+    password: ${NEO4J_PASSWORD:-password}
+    database: neo4j
+  extractor:
+    max_entities_per_chunk: 20
+    max_relations_per_chunk: 30
+    batch_size: 5
+  retriever:
+    top_k_entities: 5
+    default_hops: 2
+    enable_fuzzy_match: true
+  graph_rag:
+    enabled: true
+    graph_hops: 2

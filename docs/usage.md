@@ -272,3 +272,87 @@ streamlit run ui/app.py --server.port 8501
 3. 在 `data/eval/reports/index.json` 追加一行，最近 50 条超出部分自动丢弃。
 
 若想关掉存档可加 `--no-archive`。
+
+## 12. 数据合成 Pipeline
+
+`scripts/synthesize.py` 是一个**可独立运行**的 LLM 驱动数据合成 pipeline，用于把 `data/raw/*.md` 中的文档扩展为评估题，**无需事先建好向量库**。
+
+### 12.1 它在做什么
+
+1. 读取 `data/raw/` 下所有 `.md` 文件。
+2. 对每份文档按 `## ` 切分为若干 section。
+3. 对每个 section 用 LLM 抽取 `entities / definition / key_facts`（中文 JSON，LLM 调用失败时跳过该 section 并记录警告）。
+4. 对每个抽取结果随机套用 10 个预制问题模板（4 个 Easy + 6 个 Medium），填入 entity / section 标题。
+5. 全局去重（按 `hash(question)`），结果不超过 `--max-questions`，按 `--append` 或覆盖写入 `data/eval/eval_set.jsonl`。
+
+### 12.2 快速使用
+
+```bash
+# 仅打印 10 条题（不写文件）
+python scripts/synthesize.py --dry-run --max-questions 10
+
+# 写入 50 条（默认覆盖 data/eval/eval_set.jsonl）
+python scripts/synthesize.py --max-questions 50
+
+# 追加（保留已有）
+python scripts/synthesize.py --max-questions 80 --append
+
+# 仅保留 medium 难度的题目
+python scripts/synthesize.py --difficulty medium --max-questions 30
+
+# 用 OpenAI 兼容 API
+python scripts/synthesize.py --llm-backend openai --model gpt-4o-mini
+```
+
+### 12.3 CLI 参数
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--input` | `data/raw` | 输入 markdown 文件或目录 |
+| `--output` | `data/eval/eval_set.jsonl` | 输出 JSONL 路径 |
+| `--max-questions` | `50` | 最大题目数量 |
+| `--llm-backend` | `local` | `local` / `openai` / `ollama` |
+| `--model` | — | 覆盖 config 中的模型名 |
+| `--difficulty` | `all` | `easy` / `medium` / `all` |
+| `--dry-run` | — | 只打印题目，不写文件 |
+| `--append` | — | 追加到现有 JSONL，默认覆盖 |
+
+### 12.4 输出格式
+
+每行一条 JSON（与 `scripts/evaluate.py` 完全兼容）：
+
+```json
+{
+  "question": "RAG 的核心原理是什么？",
+  "expected_sources": ["rag-intro.md"],
+  "expected_keywords": ["RAG是检索增强生成", "RAG是一种AI技术架构", "RAG结合了信息检索和文本生成"],
+  "difficulty": "easy",
+  "source_section": "RAG 是什么？",
+  "template_id": "tmpl_4",
+  "generation_note": "基于 entity[RAG] + section[RAG 是什么？] 生成"
+}
+```
+
+字段含义：
+- `question`：合成出的题目。
+- `expected_sources`：来源 markdown 文件名列表（来自 `Document.metadata['source']`）。
+- `expected_keywords`：从 LLM 抽取的 `key_facts` 取前 3 条。
+- `difficulty`：`easy`（recall） / `medium`（对比/推理）。
+- `source_section`：所属 `##` 章节标题。
+- `template_id`：套用模板编号（`tmpl_1` ~ `tmpl_10` / `fallback_section_title`）。
+- `generation_note`：可选调试信息。
+
+### 12.5 健壮性
+
+- LLM 调用失败：跳过 section，记录警告。
+- 无实体可提：自动生成 1 条 `"{title} 的核心内容是什么？"` 作为 fallback。
+- 全局去重：相同 question 不重复写入。
+- LLM 串行调用：每次间隔 0.5s，避免 token 溢出。
+
+### 12.6 单元测试
+
+```bash
+pytest tests/test_synthesize.py -q
+```
+
+10 个测试覆盖模板填空、对照题生成、去重、fallback、字段完整性、`max-questions` 截断等。

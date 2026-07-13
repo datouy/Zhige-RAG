@@ -41,8 +41,12 @@ logs/
 # Data and Models
 data/raw/*
 !data/raw/.gitkeep
-data/chroma_db/*
-!data/chroma_db/.gitkeep
+data/chroma/
+data/chroma_db/
+data/kg.db
+data/kg.db-journal
+data/versions/
+!data/chroma/.gitkeep
 models/
 *.bin
 *.safetensors
