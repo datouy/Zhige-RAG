@@ -6,6 +6,7 @@
 - 对比两个版本的差异（chunk-level diff）
 - 差异可视化（新增/删除/修改高亮）
 - 清理旧版本
+- 多租户支持：按用户隔离文档和版本
 """
 
 from __future__ import annotations
@@ -200,7 +201,14 @@ def render_page():
 
     col_keep, col_btn = st.columns([1, 4])
     with col_keep:
-        keep_n = st.number_input("保留最近", min_value=1, max_value=len(versions), value=3, step=1)
+        keep_n = st.number_input(
+            "保留最近",
+            min_value=1,
+            max_value=max(1, len(versions)),
+            # 默认值不能超过 max_value，否则单版本文档直接崩溃（小白视角 C1）
+            value=min(3, max(1, len(versions))),
+            step=1,
+        )
     with col_btn:
         st.markdown("")
         if st.button(f"🗑 删除旧版本（保留 {keep_n} 个）", help="删除所有版本，保留最新的 N 个"):
@@ -279,3 +287,86 @@ def _render_diff_result(result: dict):
     # JSON 输出
     with st.expander("📄 原始 JSON", expanded=False):
         st.json(result)
+
+
+# ----------------------------------------------------------------------
+# 多租户支持函数
+# ----------------------------------------------------------------------
+def get_user_document_filter() -> dict | None:
+    """获取当前用户的文档过滤条件。
+    
+    根据 session_state 中的用户信息返回过滤条件。
+    多租户环境下，不同用户的文档应该被隔离。
+    """
+    if "user_id" in st.session_state:
+        user_id = st.session_state.get("user_id")
+        if user_id:
+            return {"user_id": user_id}
+    return None
+
+
+def list_user_documents() -> list:
+    """列出当前用户的文档（多租户隔离）。
+    
+    Returns:
+        文档列表（仅返回当前用户拥有的文档）
+    """
+    all_docs = list_all_documents()
+    user_filter = get_user_document_filter()
+    
+    if user_filter is None:
+        return all_docs
+    
+    # 过滤出属于当前用户的文档
+    filtered_docs = [
+        doc for doc in all_docs 
+        if _is_document_owned_by_user(doc, user_filter.get("user_id", ""))
+    ]
+    return filtered_docs
+
+
+def _is_document_owned_by_user(doc_path: str, user_id: str) -> bool:
+    """检查文档是否属于指定用户。
+    
+    Args:
+        doc_path: 文档路径
+        user_id: 用户 ID
+    
+    Returns:
+        是否属于该用户
+    """
+    # 文档路径格式: data/raw/{user_id_prefix}/filename
+    # 或者通过 metadata 中的 user_id 判断
+    user_prefix = user_id[:8] if user_id else ""
+    return user_prefix in str(doc_path)
+
+
+def render_tenant_version_selector():
+    """渲染多租户版本选择器。
+    
+    在版本管理页面中显示当前用户拥有的文档版本。
+    """
+    st.sidebar.subheader("🏢 多租户设置")
+    
+    # 显示当前租户信息
+    if "user_id" in st.session_state:
+        user_id = st.session_state.get("user_id", "")
+        st.sidebar.caption(f"用户: {user_id[:8]}...")
+        
+        if "subscription_tier" in st.session_state:
+            tier = st.session_state.get("subscription_tier", "free")
+            st.sidebar.caption(f"套餐: {tier.upper()}")
+    else:
+        st.sidebar.info("未登录")
+
+
+def render_multi_tenant_badge():
+    """渲染多租户状态徽章。"""
+    if "subscription_tier" in st.session_state:
+        tier = st.session_state.get("subscription_tier", "free")
+        tier_icons = {"free": "🔵", "pro": "🟢", "enterprise": "🟣"}
+        icon = tier_icons.get(tier, "🔵")
+        st.markdown(f"{icon} **{tier.upper()}** 租户")
+    else:
+        st.markdown("🔵 **FREE** 租户")
+

@@ -3,6 +3,8 @@
 > 一个面向 **GTX 1060 4GB / 32GB** 低端硬件、本地化、零外部依赖的中文 RAG 知识库系统。
 > 支持 PDF / Word / Markdown / TXT 多格式入库、轻量中文 Embedding、4bit 量化本地 LLM、可选重排序、Streamlit Web UI 与命令行工具。
 
+📦 **文档导航**：[安装文档 INSTALL.md](INSTALL.md) · [部署手册 DEPLOYMENT.md](DEPLOYMENT.md) · [架构 docs/architecture.md](docs/architecture.md) · [使用指南 docs/usage.md](docs/usage.md)
+
 ![arch](docs/architecture.md)
 
 ---
@@ -27,6 +29,8 @@
 
 - [硬件要求](#-硬件要求)
 - [快速开始](#-快速开始)
+- [全新电脑从 Git 拉取运行](#-全新电脑从-git-拉取运行完整流程)
+- [常见问题 FAQ](#-常见问题faq)
 - [项目结构](#-项目结构)
 - [配置说明](#-配置说明)
 - [性能优化建议](#-性能优化建议)
@@ -242,6 +246,225 @@ DEVICE=cuda
 
 ---
 
+## 🗄️ 数据库迁移
+
+项目使用 Alembic 进行数据库版本管理。
+
+### 迁移命令
+
+```bash
+# 安装依赖
+pip install alembic>=0.9.0
+
+# 初始化迁移环境（首次）
+alembic init alembic
+
+# 创建新迁移
+alembic revision --autogenerate -m "描述迁移内容"
+
+# 应用所有迁移
+alembic upgrade head
+
+# 回滚上一个迁移
+alembic downgrade -1
+
+# 回滚到指定版本
+alembic downgrade <revision>
+
+# 查看迁移状态
+alembic current
+alembic history
+
+# 验证迁移（检查是否与模型同步）
+alembic check
+```
+
+### 配置说明
+
+数据库 URL 通过以下顺序加载：
+1. 环境变量 `DATABASE_URL`
+2. `config/config.yaml` 中的 `database.url`
+3. 默认 SQLite（`data/users.db`）
+
+生产环境推荐使用 PostgreSQL：
+```bash
+export DATABASE_URL=postgresql://user:password@localhost:5432/chineseragkb
+```
+
+### PostgreSQL 连接池配置
+
+```bash
+export DB_POOL_SIZE=20          # 基础连接数
+export DB_MAX_OVERFLOW=40       # 最大溢出连接数
+export DB_POOL_TIMEOUT=30       # 获取连接超时（秒）
+export DB_POOL_RECYCLE=1800      # 连接回收时间（秒）
+export DB_POOL_PRE_PING=true     # 使用前验证连接
+```
+
+---
+
+## 🆕 全新电脑从 Git 拉取运行（完整流程）
+
+> 假设你已经把项目推到了 GitHub / Gitee，另一台电脑是**干净环境**。
+
+### 第 0 步：确认对方电脑已装 Python
+
+```bash
+python --version
+# 要求 Python 3.10 ~ 3.12，推荐 3.11
+```
+
+没有的话：
+- **Windows**：去 [python.org](https://www.python.org/downloads/) 下载安装，**勾选 Add to PATH**
+- **Linux**：`sudo apt install python3.11 python3.11-venv python3-pip`
+- **macOS**：`brew install python@3.11`
+
+### 第 1 步：克隆代码
+
+```bash
+# HTTPS（推荐）
+git clone https://github.com/你的用户名/ChineseRAGKB.git
+# 或者 Gitee（国内快）
+# git clone https://gitee.com/tokyi/agent.git
+
+cd ChineseRAGKB
+```
+
+### 第 2 步：一键安装（自动完成虚拟环境 + 依赖 + 模型）
+
+```bash
+# Windows
+python scripts\install.py
+
+# Linux / macOS
+python scripts/install.py
+```
+
+> ⚠️ 首次运行脚本需要网络下载依赖（约 1-2 GB），请耐心等待。脚本会自动：
+> - 创建 `.venv` 虚拟环境
+> - 检测是否有 NVIDIA 显卡，自动选择 PyTorch 版本
+> - 用清华镜像加速下载
+> - 下载 Embedding + LLM 模型
+
+### 第 3 步：一键启动（同时开后端 + 前端 + LLM 预加载）
+
+```bash
+# Windows
+python scripts\start_all.py
+
+# Linux / macOS
+python scripts/start_all.py
+```
+
+浏览器会自动打开 `http://localhost:8501`。
+
+---
+
+## 🧯 常见问题（FAQ）
+
+### Q1: `pip install` 报错 "Microsoft Visual C++ 14.0 or greater is required"
+**A:** Windows 上 `pdfplumber`、`chroma` 等依赖需要 C++ 编译环境。
+- 安装 [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/)，勾选 **"使用 C++ 的桌面开发"**
+- 或者使用 conda：`conda install -c conda-forge pdfplumber chromadb`
+
+### Q2: `bitsandbytes` 安装失败 / 报 `CUDA Setup failed`
+**A:** 三种解决方案任选：
+1. **CPU-only 模式**：跳过 bitsandbytes，按上面的方法不装它
+2. **更新版本**：`pip install -U bitsandbytes`
+3. **Windows 用户**：`bitsandbytes 0.43+` 才支持 Windows + CUDA 11.8+
+
+### Q3: 启动报 `RuntimeError: No GPU found` / `CUDA not available`
+**A:** 检查 PyTorch 是否识别到 GPU：
+```bash
+python -c "import torch; print(torch.cuda.is_available())"
+```
+- 返回 `False`：CUDA 没装好，重装 PyTorch：
+  ```bash
+  pip install torch --index-url https://download.pytorch.org/whl/cu118
+  ```
+- 返回 `True` 但启动还报错：把 `config/config.yaml` 里的 `device` 改成 `cpu`
+
+### Q4: 下载模型超时 / 失败
+**A:** 必须用国内镜像：
+```bash
+# 设置环境变量后再装
+$env:HF_ENDPOINT = "https://hf-mirror.com"   # PowerShell
+# export HF_ENDPOINT=https://hf-mirror.com   # Bash
+```
+
+### Q5: ChromaDB 报 `sqlite3` 版本过旧（Linux）
+**A:** 部分老 Linux 自带 sqlite < 3.35，安装新版：
+```bash
+# 在 requirements.txt 顶部添加：
+pysqlite3-binary; sys_platform == 'linux'
+```
+然后在 `api/main.py` 开头加：
+```python
+import sys, pysqlite3
+sys.modules['sqlite3'] = sys.modules.pop('pysqlite3')
+```
+
+### Q6: 端口 8000 / 8501 被占用
+**A:** 换端口：
+```bash
+python -m uvicorn api.main:app --port 8001
+python -m streamlit run ui/app.py --server.port 8502
+```
+
+### Q7: Streamlit 一直转圈 / 不显示内容
+**A:**
+1. 看后端终端有没有报错
+2. 浏览器开无痕模式排除缓存
+3. 检查防火墙是否拦截了 8501
+
+### Q8: "端口拒绝访问" / "Connection refused"
+**A:**
+- 后端没启动 / 启动失败 → 看后端终端日志
+- 启动时加上 `--host 0.0.0.0` 才能从局域网访问
+
+### Q9: 重新换电脑后数据没了？
+**A:** 数据都存在 `data/` 目录下（向量库 + 用户库 + 上传文件）。
+把这个目录整体备份/迁移即可恢复。
+
+### Q10: `.env` / 密钥怎么处理？
+**A:** `.env` 文件**不要**提交到 git（已在 `.gitignore` 中）。
+提供 `.env.example` 作为模板，新电脑复制一份：
+```bash
+cp .env.example .env
+# 编辑填入真实值
+```
+
+### Q11: 想换 LLM 模型怎么办？
+**A:** 修改 `config/config.yaml`：
+```yaml
+llm:
+  model_name: "Qwen/Qwen2.5-3B-Instruct-GPTQ-Int4"  # 换这里
+  quantization:
+    enabled: true
+    quant_type: gptq  # 同步改这里
+```
+或者用 `.env` 临时覆盖：
+```bash
+LLM_MODEL_PATH=Qwen/Qwen2.5-3B-Instruct-GPTQ-Int4
+```
+
+### Q12: 如何确认我的环境装好了？
+**A:** 运行一键诊断脚本：
+```bash
+python -c "
+import torch, transformers, chromadb, fastapi, streamlit
+print('PyTorch:', torch.__version__, 'CUDA:', torch.cuda.is_available())
+print('Transformers:', transformers.__version__)
+print('ChromaDB:', chromadb.__version__)
+print('FastAPI:', fastapi.__version__)
+print('Streamlit:', streamlit.__version__)
+print('All OK!')
+"
+```
+输出 "All OK!" 就说明没问题。
+
+---
+
 ## 📝 License
 
 MIT License — 详见 `LICENSE`。
@@ -259,4 +482,5 @@ MIT License — 详见 `LICENSE`。
 
 
 > 本项目代码同时托管在 Gitee：<https://gitee.com/tokyi/agent.git>
+> GitHub: <https://github.com/你的用户名/ChineseRAGKB>
 

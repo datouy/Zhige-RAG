@@ -46,7 +46,26 @@ class Document:
 #  PDF
 # ----------------------------------------------------------------------
 def _load_pdf(path: Path, engine: str = "pdfplumber") -> List[Document]:
-    """解析 PDF，每页一个 Document。"""
+    """解析 PDF，每页一个 Document。
+
+    主引擎无输出（异常或全部页未提取到文本）时自动切换备用引擎重试一次；
+    两个引擎都失败大概率是扫描件，明确告警提示需要 OCR，而不是静默返回空。
+    """
+    docs = _load_pdf_with_engine(path, engine)
+    if not docs:
+        other = "pypdf" if engine == "pdfplumber" else "pdfplumber"
+        logger.warning("PDF 引擎 %s 未提取到内容，回退到 %s 重试: %s", engine, other, path.name)
+        docs = _load_pdf_with_engine(path, other)
+    if not docs:
+        logger.warning(
+            "PDF 两个引擎均未提取到文本，可能是扫描件（图片型 PDF 需 OCR 后再入库）: %s",
+            path.name,
+        )
+    return docs
+
+
+def _load_pdf_with_engine(path: Path, engine: str) -> List[Document]:
+    """用指定引擎解析 PDF。"""
     docs: List[Document] = []
     try:
         if engine == "pdfplumber":
@@ -101,26 +120,54 @@ def _load_pdf(path: Path, engine: str = "pdfplumber") -> List[Document]:
 # ----------------------------------------------------------------------
 #  DOCX
 # ----------------------------------------------------------------------
+# DOCX 标题样式（python-docx 的 style.name，兼容英文/中文 Word 模板）
+_DOCX_HEADING_RE = re.compile(r"^(?:heading|标题)\s*(\d+)$", re.IGNORECASE)
+
+
+def _iter_docx_blocks_ordered(path: Path) -> List[tuple]:
+    """按文档顺序产出 DOCX 块：(heading_level 或 None, text)。
+
+    通过 body 子元素顺序遍历，让表格出现在其真实位置——旧实现把所有
+    表格行追加到全文末尾，导致表格内容与文档尾部章节混入同一分块。
+    标题级别由段落样式名（Heading N / 标题 N）识别，供按章节切分使用。
+    """
+    from docx import Document as DocxDocument  # type: ignore
+    from docx.table import Table  # type: ignore
+    from docx.text.paragraph import Paragraph  # type: ignore
+
+    d = DocxDocument(str(path))
+    blocks: List[tuple] = []
+    for child in d.element.body.iterchildren():
+        tag = child.tag if isinstance(child.tag, str) else ""
+        if tag.endswith("}p"):
+            para = Paragraph(child, d)
+            text = (para.text or "").strip()
+            if not text:
+                continue
+            level: Optional[int] = None
+            try:
+                style_name = (para.style.name or "") if para.style is not None else ""
+            except Exception:
+                style_name = ""
+            hm = _DOCX_HEADING_RE.match(style_name.strip())
+            if hm:
+                level = int(hm.group(1))
+            blocks.append((level, text))
+        elif tag.endswith("}tbl"):
+            tbl = Table(child, d)
+            for row in tbl.rows:
+                row_text = " | ".join((cell.text or "").strip() for cell in row.cells)
+                if row_text.strip(" |"):
+                    blocks.append((None, row_text))
+    return blocks
+
+
 def _load_docx(path: Path) -> List[Document]:
     """解析 Word 文档，按段落聚合为单个 Document。"""
     docs: List[Document] = []
     try:
-        from docx import Document as DocxDocument  # type: ignore
-
-        d = DocxDocument(str(path))
-        paragraphs = []
-        for p in d.paragraphs:
-            t = (p.text or "").strip()
-            if t:
-                paragraphs.append(t)
-
-        # 也尝试读取表格内容（可选）
-        for tbl in d.tables:
-            for row in tbl.rows:
-                row_text = " | ".join((cell.text or "").strip() for cell in row.cells)
-                if row_text.strip(" |"):
-                    paragraphs.append(row_text)
-
+        blocks = _iter_docx_blocks_ordered(path)
+        paragraphs = [t for _, t in blocks]
         full_text = clean_text("\n".join(paragraphs))
         if full_text:
             docs.append(
@@ -211,10 +258,31 @@ load_markdown = _load_markdown
 # ----------------------------------------------------------------------
 #  TXT
 # ----------------------------------------------------------------------
-def _load_txt(path: Path, encoding: str = "utf-8") -> List[Document]:
+# 编码探测链：中文场景最常见的乱码来源是 GBK/GB2312 文件被硬按 UTF-8 读。
+# 逐个"严格"解码尝试，全部失败再用 UTF-8 宽松兜底（坏字节替换为 �，
+# 至少保住文件名等可用信息，不致整篇 mojibake 混入知识库）。
+_TXT_ENC_CANDIDATES = ("utf-8-sig", "gb18030", "big5")
+
+
+def _decode_text_bytes(data: bytes) -> tuple[str, str]:
+    """按候选编码链解码字节流，返回 (文本, 实际使用的编码)。"""
+    for enc in _TXT_ENC_CANDIDATES:
+        try:
+            return data.decode(enc), enc
+        except (UnicodeDecodeError, ValueError):
+            continue
+    return data.decode("utf-8", errors="replace"), "utf-8(replace)"
+
+
+def _load_txt(path: Path, encoding: str = "auto") -> List[Document]:
     docs: List[Document] = []
     try:
-        text = path.read_text(encoding=encoding, errors="ignore")
+        data = path.read_bytes()
+        if encoding and encoding.lower() != "auto":
+            text = data.decode(encoding, errors="replace")
+            used_enc = encoding
+        else:
+            text, used_enc = _decode_text_bytes(data)
         text = clean_text(text)
         if text:
             docs.append(
@@ -225,6 +293,7 @@ def _load_txt(path: Path, encoding: str = "utf-8") -> List[Document]:
                         "source": str(path.name),
                         "filepath": str(path),
                         "ext": path.suffix.lower(),
+                        "encoding": used_enc,
                     },
                 )
             )
@@ -239,15 +308,15 @@ def _load_txt(path: Path, encoding: str = "utf-8") -> List[Document]:
 def load_document(
     file_path: str | Path,
     pdf_engine: str = "pdfplumber",
-    encoding: str = "utf-8",
+    encoding: str = "auto",
     clean: bool = True,
 ) -> List[Document]:
     """根据文件扩展名分发到对应解析器。
 
     Args:
         file_path: 文件路径。
-        pdf_engine: PDF 解析引擎，可选 pdfplumber / pypdf。
-        encoding: TXT 文件编码。
+        pdf_engine: PDF 解析引擎，可选 pdfplumber / pypdf（主引擎失败自动互为回退）。
+        encoding: TXT 编码，``auto`` 时按 utf-8-sig → gb18030 → big5 自动探测。
         clean: 是否清洗文本。
 
     Returns:

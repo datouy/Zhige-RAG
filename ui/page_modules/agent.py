@@ -31,7 +31,7 @@ def _get_agent_for_ui(cfg: dict):
     from src.agent import BuiltinTools, ReActAgent
     from src.embeddings import EmbeddingModel
     from src.utils import apply_env_overrides, load_config
-    from src.vector_store import ChromaStore
+    from src.vector_store import ChromaStore, hybrid_kwargs
 
     base_cfg = load_config("config/config.yaml")
     base_cfg = apply_env_overrides(base_cfg)
@@ -54,15 +54,24 @@ def _get_agent_for_ui(cfg: dict):
         collection_name=vs_cfg.get("collection_name", "chinese_rag_kb"),
         embedding_model=embedding,
         distance_fn=vs_cfg.get("distance_fn", "cosine"),
+        **hybrid_kwargs(base_cfg.get("vector_store", {})),
     )
     tools = BuiltinTools.create(vector_store=vs)
 
     max_steps = int(base_cfg.get("agent", {}).get("max_steps", 5))
 
     # LLM：与 RAG 流水线共享，避免内存翻倍
-    from ui.app import load_pipeline  # 复用现有 cache_resource
-
-    pipeline = load_pipeline("config/config.yaml")
+    # 关键修复：从 ui._pipeline 导入（独立模块），绝不 import ui.app
+    # 否则 streamlit rerun 时会重新执行 ui.app.py，触发 set_page_config 重复调用报错。
+    import streamlit as st
+    try:
+        from ui._pipeline import load_pipeline
+        pipeline = load_pipeline("config/config.yaml")
+    except Exception as exc:
+        logger.warning("复用 _pipeline 失败 (%s)，重新创建", exc)
+        from src.rag_pipeline import RAGPipeline
+        pipeline = RAGPipeline.from_config("config/config.yaml",
+                                          overrides=base_cfg, lazy_llm=True)
     try:
         pipeline.ensure_llm()
     except Exception as exc:  # noqa: BLE001
@@ -101,9 +110,8 @@ def render_page(cfg: dict) -> None:
 
     st.header("🤖 Agent（ReAct 工具调用）")
     st.caption(
-        "LLM 通过 Thought → Action → Observation 循环决定调用哪些工具来回答问题。"
-        "内置工具：search_documents / list_documents / calculator / get_current_time / "
-        "text_stats / python_eval 等。"
+        "Agent 会一边思考一边调用工具（查文档、算数、查时间等）来回答问题，"
+        "适合需要“查多个来源或做计算”的问题；日常知识库问答用左侧“💬 智能问答”即可，更快。"
     )
 
     # 加载 / 显示 Agent

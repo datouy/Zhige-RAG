@@ -18,7 +18,6 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from src.document_loader import load_directory, load_document
 from src.embeddings import EmbeddingModel
 from src.text_splitter import ChineseTextSplitter, RecursiveTextSplitter
 from src.utils import apply_env_overrides, ensure_dir, get_logger, load_config, merge_dict
@@ -68,19 +67,18 @@ def ingest_path(
     """
     dl_cfg = cfg.get("document_loader", {})
 
+    # 数据层统一管线：元数据增强（标题/层级/更新时间/权限/状态）
+    # → 深度清洗 → 去重 → 准入门（过滤过期/草稿/权限不清）→ 分块 → 分块去重
+    from src.data_quality import run_data_pipeline
+    from src.document_meta import enrich_directory, enrich_file
+
     if target.is_file():
-        docs = load_document(
-            target,
-            pdf_engine=dl_cfg.get("pdf_engine", "pdfplumber"),
-            encoding=dl_cfg.get("encoding", "utf-8"),
-            clean=dl_cfg.get("clean_text", True),
-        )
+        docs = enrich_file(target, default_acl=cfg.get("data_quality", {}).get("default_acl", "*"))
     elif target.is_dir():
-        docs = load_directory(
+        docs = enrich_directory(
             target,
-            pdf_engine=dl_cfg.get("pdf_engine", "pdfplumber"),
+            default_acl=cfg.get("data_quality", {}).get("default_acl", "*"),
             recursive=True,
-            encoding=dl_cfg.get("encoding", "utf-8"),
         )
     else:
         logger.warning("路径不存在: %s", target)
@@ -90,28 +88,39 @@ def ingest_path(
         logger.warning("未解析到任何文档")
         return 0
 
-    # 分块（每个 Document 可能产生多个 Chunk）
-    all_chunks: list = []
-    doc_chunks_map: dict = {}  # doc.source -> list of serialized chunks
+    all_chunks, report = run_data_pipeline(docs, cfg, splitter)
+    logger.info(
+        "数据层管线完成：%d 个小节 → %d 个分块（文档去重丢弃 %d，准入门拒绝 %d，分块去重丢弃 %d）",
+        len(docs),
+        len(all_chunks),
+        report.get("doc_dedup_dropped", 0),
+        report.get("gate", {}).get("rejected", 0),
+        report.get("chunk_dedup_dropped", 0),
+    )
+    gate = report.get("gate", {})
+    if gate.get("rejected"):
+        for detail in gate.get("details", [])[:10]:
+            logger.warning("准入门拒绝：%s", detail)
 
-    for doc in docs:
-        doc_chunks = splitter.split_text(doc.content, metadata=doc.metadata)
-        all_chunks.extend(doc_chunks)
-        # 保存版本用的序列化格式
-        doc_chunks_map[doc.metadata.get("source", target.name)] = [
-            {"text": ck.text, "metadata": dict(ck.metadata)}
-            for ck in doc_chunks
-        ]
+    if not all_chunks:
+        logger.warning("管线后没有可入库分块（可能全部被准入门拒绝）")
+        return 0
 
-    logger.info("共生成 %d 个分块", len(all_chunks))
-
-    # 保存版本（如果启用）
+    # 保存版本（如果启用）——按原始文档（清洗前）逐份保存
     if enable_version:
+        seen_sources: set = set()
         for doc in docs:
             source_name = doc.metadata.get("source", target.name)
-            chunks_for_version = doc_chunks_map.get(source_name, [])
+            if source_name in seen_sources:
+                continue
+            seen_sources.add(source_name)
+            doc_hash = _compute_doc_hash(doc.content)
+            chunks_for_version = [
+                {"text": ck.text, "metadata": dict(ck.metadata)}
+                for ck in all_chunks
+                if (ck.metadata or {}).get("source") == source_name
+            ]
             if chunks_for_version:
-                doc_hash = _compute_doc_hash(doc.content)
                 version = version_manager.save_version(
                     doc_name=source_name,
                     chunks=chunks_for_version,
@@ -136,6 +145,20 @@ def ingest_path(
         embedding_model=embed,
         distance_fn=cfg["vector_store"].get("distance_fn", "cosine"),
     )
+
+    # 入库前按 source 清理同名文档旧分块，避免内容更新后残留旧块
+    # （分块 id 只含 source|page|chunk_index，upsert 不会删除已消失的块）
+    stale_sources = {
+        str(c.metadata.get("source") or c.metadata.get("filepath") or "unknown")
+        for c in all_chunks
+    }
+    for src in stale_sources:
+        try:
+            deleted = store.delete_by_metadata({"source": {"$eq": src}})
+            if deleted:
+                logger.info("已清理 %s 的 %d 条旧分块", src, deleted)
+        except Exception as exc:
+            logger.warning("清理旧分块失败（source=%s）: %s", src, exc)
 
     n = store.add_chunks(all_chunks)
     logger.info("✅ 入库完成，新增/覆盖 %d 条", n)

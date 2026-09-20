@@ -52,7 +52,16 @@ def build(
     limit: Optional[int] = None,
     llm: Optional[LocalLLM] = None,
     config_path: str = "config/config.yaml",
+    store=None,
 ) -> Dict:
+    """构建知识图谱。
+
+    Args:
+        store: 已构造好的 KGStore（多租户场景由路由传入用户专属 store）。
+            传入时忽略 output_path/backend，**不会**再按配置创建全局库——
+            之前 API 路由虽然构造了租户 pipeline，但抽取结果全部写进了
+            全局 data/kg.db，租户隔离被破坏。
+    """
     cfg = load_config(config_path)
     kg_cfg = cfg.get("knowledge_graph", {}) or {}
 
@@ -89,12 +98,13 @@ def build(
                 }
             )
 
-    if output_path:
-        kg_cfg = {**kg_cfg, "backend": backend or kg_cfg.get("backend", "sqlite"), "sqlite_path": output_path}
-    if backend:
-        kg_cfg = {**kg_cfg, "backend": backend}
-
-    store = create_kg_store(kg_cfg)
+    if store is None:
+        store_kg_cfg = kg_cfg
+        if output_path:
+            store_kg_cfg = {**store_kg_cfg, "backend": backend or kg_cfg.get("backend", "sqlite"), "sqlite_path": output_path}
+        if backend:
+            store_kg_cfg = {**store_kg_cfg, "backend": backend}
+        store = create_kg_store(store_kg_cfg)
 
     extractor = None
     if llm is not None:

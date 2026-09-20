@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 from typing import Dict, List, Tuple
 
 from src.llm import LocalLLM
@@ -39,38 +40,47 @@ class KGExtractor:
         llm: LocalLLM,
         max_entities_per_chunk: int = 20,
         max_relations_per_chunk: int = 30,
+        extract_timeout: float = 60.0,
     ) -> None:
         self.llm = llm
         self.max_entities = max_entities_per_chunk
         self.max_relations = max_relations_per_chunk
+        # 单次抽取超时（秒）。本地 1.5B 模型 10 秒经常跑不完，默认放宽到 60。
+        self.extract_timeout = extract_timeout
 
     def extract(self, text: str, source_doc: str = "") -> Tuple[List[Entity], List[Relation]]:
         """Extract entities and relations from a single text."""
-        if not text.strip():
+        if not text or not text.strip():
             return [], []
-        prompt = f"""{{
-  "entities": [
-    {{"name": "实体名", "type": "Person/Organization/Location/Concept/Event", "description": "简短描述"}}
-  ],
-  "relations": [
-    {{"source": "实体A", "target": "实体B", "type": "RELATION_TYPE", "description": "关系描述"}}
-  ]
-}}
+        # 控制输入长度，避免超长文本打爆 prompt
+        text = text.strip()
+        if len(text) > 6000:
+            text = text[:6000]
+        # EXTRACT_PROMPT 内含 JSON 大括号，不能走 str.format，用替换注入
+        prompt = self.EXTRACT_PROMPT.replace("{text}", text)
+        # 用 daemon 线程跑 LLM 调用并 join(timeout)：超时后主流程立即返回。
+        # 之前的 ThreadPoolExecutor 写法在 with 块退出时 shutdown(wait=True)
+        # 仍会阻塞到生成结束，超时形同虚设。
+        holder: Dict[str, object] = {}
 
-只输出 JSON，不要其他内容。
+        def _run() -> None:
+            try:
+                holder["raw"] = self.llm.chat(
+                    [{"role": "user", "content": prompt}], stream=False
+                )
+            except Exception as exc:  # noqa: BLE001
+                holder["err"] = exc
 
-文本：
-{text}
-"""
-        try:
-            from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
-            with ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(self.llm.chat, [{"role": "user", "content": prompt}], stream=False)
-                raw = future.result(timeout=10)
-        except Exception as exc:
-            logger.warning("LLM 抽取超时或失败：%s", exc)
+        worker = threading.Thread(target=_run, daemon=True)
+        worker.start()
+        worker.join(timeout=max(1.0, float(self.extract_timeout)))
+        if worker.is_alive():
+            logger.warning("LLM 抽取超时（%ss），放弃本次结果", self.extract_timeout)
             return [], []
-        return self._parse_llm_output(raw)
+        if "err" in holder:
+            logger.warning("LLM 抽取失败：%s", holder["err"])
+            return [], []
+        return self._parse_llm_output(holder.get("raw"))
 
     def extract_from_chunks(
         self, chunks: List[Dict]

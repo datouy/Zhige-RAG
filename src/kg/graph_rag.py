@@ -5,7 +5,6 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 
 from src.kg.retriever import GraphRetriever
-from src.kg.schema import Triple
 from src.rag_pipeline import RAGPipeline
 from src.vector_store import ChromaStore
 
@@ -28,31 +27,14 @@ class GraphRAG:
         self.llm = llm
 
     def query(self, question: str, top_k: int = 4, graph_hops: int = 2) -> Dict[str, Any]:
+        """GraphRAG 问答：向量检索 + 图谱扩展，查询路径只读。
+
+        注意：不要在查询时做 KG 抽取——那需要对每个命中 chunk 各调一次 LLM
+        （查询延迟被抽取主导），还会把查询期的低质量抽取写进图谱污染数据。
+        实体/关系的抽取与入库应发生在文档入库或 ``kg/build`` 阶段。
+        """
         hits = self.vector_store.query(query_text=question, top_k=top_k)
         texts = [h.text for h in hits]
-        chunks = [
-            {
-                "text": h.text,
-                "metadata": h.metadata or {},
-                "source_doc": (h.metadata or {}).get("source") or (h.metadata or {}).get("filepath", ""),
-                "id": h.id,
-            }
-            for h in hits
-        ]
-        entities: List = []
-        relations: List = []
-        triples: List[Triple] = []
-        if self.extractor:
-            try:
-                entities, relations, triples = self.extractor.extract_from_chunks(chunks)
-                if entities:
-                    self.kg_store.upsert_entities(entities)
-                if relations:
-                    self.kg_store.upsert_relations(relations)
-            except Exception as exc:  # noqa: BLE001
-                from src.utils import get_logger
-
-                get_logger("kg.graph_rag").warning("抽取失败：%s", exc)
         graph_context = self.retriever.search(question, top_k_entities=top_k, hops=graph_hops)
         context_parts = [f"[文档片段 {i+1}]\n{t}" for i, t in enumerate(texts)]
         if graph_context.get("triples"):
@@ -65,6 +47,9 @@ class GraphRAG:
         try:
             answer = self.llm.chat(messages, stream=False)
         except Exception as exc:  # noqa: BLE001
+            from src.utils import get_logger
+
+            get_logger("kg.graph_rag").warning("GraphRAG 生成失败：%s", exc)
             answer = "（生成失败）"
         return {
             "answer": answer,

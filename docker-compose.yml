@@ -1,0 +1,97 @@
+# ============================================================
+# ChineseRAGKB docker-compose - Production deployment
+# ============================================================
+version: '3.8'
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: chineseragkb-api
+    ports:
+      - "8000:8000"
+    environment:
+      # Database
+      - DATABASE_URL=postgresql+asyncpg://raguser:ragpass@postgres:5432/chineseragkb
+      - SYNC_DATABASE_URL=postgresql://raguser:ragpass@postgres:5432/chineseragkb
+      # LLM Configuration
+      - LLM_MODEL_PATH=${LLM_MODEL_PATH:-/models/chatglm3-6b}
+      - EMBEDDING_MODEL_NAME=BAAI/bge-large-zh-v1.5
+      - DEVICE=cuda
+      # Security
+      - SECRET_KEY=${SECRET_KEY:-your-secret-key-change-in-production}
+      - ALLOWED_ORIGINS=http://localhost:8000,http://127.0.0.1:8000
+      # Rate Limiting
+      - RATE_LIMIT_STORAGE_URL=redis://redis:6379/0
+      # Chroma
+      - CHROMA_PERSIST_DIRECTORY=/app/data/chroma
+      # Paths
+      - DATA_PATH=/app/data/raw
+      - LOG_PATH=/app/logs/server.log
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./config:/app/config:ro
+      - ./ui/web:/app/ui/web:ro
+      # Mount model cache (optional)
+      # - ${MODEL_CACHE_DIR:-~/.cache}:/root/.cache:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - chineseragkb-network
+
+  postgres:
+    image: postgres:15-alpine
+    container_name: chineseragkb-postgres
+    environment:
+      - POSTGRES_USER=raguser
+      - POSTGRES_PASSWORD=ragpass
+      - POSTGRES_DB=chineseragkb
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U raguser -d chineseragkb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - chineseragkb-network
+
+  redis:
+    image: redis:7-alpine
+    container_name: chineseragkb-redis
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - chineseragkb-network
+
+networks:
+  chineseragkb-network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:

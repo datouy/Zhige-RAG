@@ -1,0 +1,121 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: chineseragkb-api
+  namespace: chineseragkb
+  labels:
+    app: chineseragkb
+  annotations:
+    # NGINX Ingress Controller annotations
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/proxy-body-size: "50m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
+    nginx.ingress.kubernetes.io/rate-limit: "100"
+    nginx.ingress.kubernetes.io/rate-limit-window: "1m"
+
+    # Custom annotations
+    nginx.ingress.kubernetes.io/configuration-snippet: |
+      proxy_set_header X-Real-IP $remote_addr;
+      proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+      proxy_set_header X-Forwarded-Proto $scheme;
+
+    # CORS headers
+    nginx.ingress.kubernetes.io/cors-allow-origin: "https://app.example.com"
+    nginx.ingress.kubernetes.io/cors-allow-methods: "PUT, GET, POST, DELETE, OPTIONS"
+    nginx.ingress.kubernetes.io/cors-allow-headers: "Authorization,Content-Type,Accept,Origin,User-Agent,Cache-Control,Keep-Alive,X-Requested-With,X-Request-ID"
+
+    # Monitoring
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "80"
+
+spec:
+  ingressClassName: nginx
+
+  tls:
+    - hosts:
+        - api.chineseragkb.example.com
+      secretName: chineseragkb-tls
+
+  rules:
+    - host: api.chineseragkb.example.com
+      http:
+        paths:
+          # API endpoints
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: chineseragkb-api
+                port:
+                  name: http
+
+          # WebSocket endpoints
+          - path: /ws
+            pathType: Prefix
+            backend:
+              service:
+                name: chineseragkb-api
+                port:
+                  name: http
+
+          # Health check paths (no auth required)
+          - path: /api/health
+            pathType: Exact
+            backend:
+              service:
+                name: chineseragkb-api
+                port:
+                  name: http
+
+          - path: /api/ready
+            pathType: Exact
+            backend:
+              service:
+                name: chineseragkb-api
+                port:
+                  name: http
+
+          - path: /api/metrics
+            pathType: Exact
+            backend:
+              service:
+                name: chineseragkb-api
+                port:
+                  name: http
+
+          # Default fallback
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: chineseragkb-api
+                port:
+                  name: http
+
+---
+# Alternative ingress for internal services (no TLS)
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: chineseragkb-api-internal
+  namespace: chineseragkb
+  labels:
+    app: chineseragkb
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "false"
+spec:
+  ingressClassName: nginx
+
+  rules:
+    - host: chineseragkb-api.internal
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: chineseragkb-api
+                port:
+                  name: http

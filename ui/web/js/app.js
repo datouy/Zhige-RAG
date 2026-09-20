@@ -19,7 +19,7 @@ class ChatApp {
     }
 
     getApiUrl(path) {
-        return `/api${path}`;
+        return `/api/v1${path}`;
     }
 
     init() {

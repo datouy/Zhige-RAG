@@ -1,25 +1,28 @@
 # =====================================================
-# 中文个人知识库 RAG 系统 - 主配置文件
-# 所有路径优先使用相对路径，便于跨平台移植
+# 中文知识库 RAG 系统 - 优化版配置文件
+# 
+# 优化要点：
+# 1. 文本分块：递归字符切分 + 中文标点优先
+# 2. 检索：混合检索（向量 + BM25）
+# 3. 重排序：Rerank 过滤噪声
 # =====================================================
 
 # ------------------ 项目基础 ------------------
 project:
   name: "ChineseRAGKB"
-  version: "0.1.0"
-  description: "面向 GTX 1060 4GB 等低端硬件的中文个人知识库 RAG 系统"
+  version: "0.2.0"
+  description: "中文知识库 RAG 系统"
 
-# 与 UI 侧栏引用对齐
 app:
-  name: "中文个人知识库 RAG"
-  version: "0.1.0"
+  name: "中文知识库 RAG"
+  version: "0.2.0"
 
 # ------------------ 数据目录 ------------------
 paths:
-  raw_docs: "data/raw"          # 原始文档目录（UI/CLI 读取）
-  chroma_db: "data/chroma_db"    # 向量库目录
-  eval: "data/eval"              # 评估数据/报告目录
-  logs: "logs"                   # 日志目录
+  raw_docs: "data/raw"
+  chroma_db: "data/chroma_db"
+  eval: "data/eval"
+  logs: "logs"
 
 # ------------------ 文档处理 ------------------
 document_loader:
@@ -29,130 +32,170 @@ document_loader:
     - .md
     - .markdown
     - .txt
-  pdf_engine: "pdfplumber"        # pdfplumber / pypdf
-  pdf_backend: "pdfplumber"       # 别名，兼容旧引用
-  encoding: "utf-8"               # TXT 编码
-  clean_text: true                # 是否做基础清洗
+  pdf_engine: "pdfplumber"
+  encoding: "auto"
+  clean_text: true
   max_pdf_pages: 1000
   markdown_extensions:
     - tables
     - fenced_code
 
-# ------------------ 文本分块 ------------------
+# ------------------ 文本分块（优化版）------------------
+# 
+# 关键优化：
+# - chunk_size: 400（中文经验值 300-500）
+# - chunk_overlap: 50（必须有重叠，防止边界语义丢失）
+# - separators: 中文标点优先（。！？；，）
+#
 text_splitter:
-  strategy: "chinese"             # chinese / recursive
-  chunk_size: 300                 # 单块目标字符数
-  chunk_overlap: 50               # 块间重叠
-  min_chunk_size: 50              # 最小块大小
-  chinese_separators:             # ChineseTextSplitter 使用的分隔符
-    - "\n\n"
-    - "\n"
-    - "。"
-    - "！"
-    - "？"
-    - "；"
-    - "，"
-  separators:                     # 通用回退分隔符
-    - "\n\n"
-    - "\n"
-    - "。"
-    - "！"
-    - "？"
-    - "；"
-    - "，"
+  strategy: "chinese"
+  chunk_size: 400                 # 中文推荐 300-500，太大语义稀释，太小不完整
+  chunk_overlap: 50              # 块间重叠，防止边界语义丢失
+  min_chunk_size: 32             # 最小块大小
+  chinese_separators:             # 中文标点优先（关键！）
+    - "\n\n"                    # 段落分隔
+    - "\n"                      # 换行
+    - "。"                       # 句号
+    - "！"                       # 感叹号
+    - "？"                       # 问号
+    - "；"                       # 分号
+    - "，"                       # 逗号
   keep_separator: true
   strip_whitespace: true
 
 # ------------------ Embedding 模型 ------------------
 embedding:
   model_name: "BAAI/bge-small-zh-v1.5"
-  # 备选: shibing624/text2vec-base-chinese, BAAI/bge-base-zh-v1.5
-  device: "auto"                # cuda / cpu / auto
+  device: "cpu"
   batch_size: 16
   normalize_embeddings: true
   max_seq_length: 512
   query_instruction: "为这个句子生成表示以用于检索相关文章："
   use_doc_instruction: false
   cache_dir: "./models/sentence-transformers"
-  local_files_only: true        # 模型已在本地时不再联网
+  local_files_only: true
 
 # ------------------ 向量数据库 ------------------
 vector_store:
   backend: "chroma"
   collection_name: "chinese_rag_kb"
   persist_directory: "data/chroma_db"
-  distance_fn: "cosine"           # cosine / l2 / ip
-  distance_function: "cosine"     # 别名，兼容旧引用
+  distance_fn: "cosine"
   top_k: 4
   fetch_k: 20
   filter_metadata: {}
+  
+  # 混合检索（优化版）
   hybrid:
-    enabled: false                # BM25 混合检索（预留）
+    enabled: true                 # 必须开启：向量 + BM25 混合
+    fetch_k: 20                  # BM25 召回数（> top_k 保证融合质量）
 
-# ------------------ 检索参数 ------------------
+# ------------------ 数据层质量管线 ------------------
+data_quality:
+  deep_clean: true
+  breadcrumb_in_chunk: true       # 分块文本前缀章节路径
+  default_acl: "*"
+  near_dup_threshold: 0.0
+  gate:
+    allowed_status: [active]
+    require_explicit_acl: false
+    expiry_days: 0
+    reject_multi_group_acl: true
+
+# ------------------ 检索参数（优化版）------------------
+#
+# 推荐配置：
+# - top_k: 8（检索数）
+# - rerank_candidates: 24（重排候选数，top_k * 3）
+# - min_score: 0.25（最低分兜底）
+#
 retrieval:
-  top_k: 4                        # 检索 top-k
-  rerank_candidates: 12           # 重排候选数
-  score_threshold: 0.0            # 相似度阈值
+  top_k: 8                       # 召回数
+  rerank_candidates: 24            # 重排候选数（top_k * 3）
+  score_threshold: 0.0
+  min_score: 0.25                 # 命中最低分兜底
+  status_filter: true
+  status_filter_fallback: true
+  acl_filter: true
 
-# ------------------ 重排序（可选） ------------------
+# ------------------ 重排序（关键优化）------------------
+# 
+# Rerank 作用：
+# 用 cross-encoder 重排模型（如 bge-reranker）对候选结果重新打分
+# 只把真正相关的 Top-3~5 喂给大模型
+#
 reranker:
-  enabled: false                  # 默认关闭，需要时打开
-  model_name: "BAAI/bge-reranker-base"
-  device: "cuda"
-  top_n: 3
-  max_length: 512
+  enabled: true
+  model_name: "./models/bge-reranker-base"
+  device: "cpu"
+  top_n: 3                        # 最终返回数
+  max_length: 256
   cache_dir: "./models/huggingface"
+  min_relevance: 0.3             # 重排后最低相关度阈值
 
 # ------------------ 大语言模型 ------------------
 llm:
   model_name: "./models/Qwen2.5-1.5B-Instruct"
-  # 备选: Qwen/Qwen2.5-3B-Instruct-GPTQ-Int4, Qwen/Qwen2.5-0.5B-Instruct
-  # 备选: google/gemma-2-2b-it, Qwen/Qwen2-1.5B-Instruct
-  model_path: ""                  # 留空使用 model_name 自动下载；可填本地路径
-  device: "auto"                # cuda / cpu / auto
-  device_map: "auto"
-  torch_dtype: "auto"             # auto / float16 / bfloat16 / float32
+  model_path: ""
+  device: "auto"
+  device_map: '{"": 0}'
+  torch_dtype: "float16"
   cache_dir: "./models/huggingface"
   trust_remote_code: false
-  local_files_only: true          # 模型已在本地时不再联网
+  local_files_only: true
   use_chat_template: true
-  chat_template: "auto"           # auto / qwen / chatml / raw
+  chat_template: "auto"
 
-  # 4bit 量化配置（与 src/llm.py 的 LocalLLM.quant 字段对应）
   quantization:
-    enabled: false              # CPU 跑 1.5B 默认不开 4bit 量化（bitsandbytes 在 Windows CPU 上不稳定）
-    quant_type: "nf4"             # nf4 / fp4
+    enabled: true
+    quant_type: "nf4"
     compute_dtype: "float16"
     double_quant: true
     cache_dir: "./models/huggingface"
 
-  # 生成参数（与 src/llm.py 的 GenerationConfig 字段对应）
   generation:
-    max_new_tokens: 512
-    temperature: 0.2
+    max_new_tokens: 256
+    temperature: 0.15              # 低温：事实型问答
     top_p: 0.9
     repetition_penalty: 1.05
     do_sample: true
     stream: true
 
+  timeout: 120.0
+  max_retries: 2
+
 # ------------------ RAG 推理参数 ------------------
 rag:
   top_k: 4
   use_reranker: false
-  max_context_tokens: 2000        # 拼接 prompt 的最大上下文 token 数
-  max_context_length: 2000        # 别名
-  max_history_turns: 0            # 多轮对话历史轮数
+  max_context_tokens: 3000
+  max_history_turns: 3
   score_threshold: 0.0
   answer_citations: true
   return_sources: true
   fallback_answer: "抱歉，知识库中未找到相关信息，无法回答该问题。"
   system_prompt_file: "config/prompts.yaml"
+  assistant_name: "小识"
+  org_name: "企业知识库"
+  
+  # 可验证性校验
+  verification:
+    enabled: true
+    min_cited_ratio: 0.5
+    min_grounding: 0.6
+
+# ------------------ 上下文与记忆 ------------------
+memory:
+  enabled: true
+  session_turns: 2
+  session_ttl_minutes: 30
+  retrieval_rewrite: true
+  long_term_inject_limit: 10
 
 # ------------------ 评估 ------------------
 evaluation:
   retrieval_top_k: 5
-  judge_model: ""                 # 留空使用主 LLM 自评；可指定另一个本地模型
+  judge_model: ""
   dataset_path: "data/eval/eval_set.jsonl"
   output_path: "data/eval/results.json"
   report_path: "data/eval/report.json"
@@ -163,9 +206,9 @@ evaluation:
 
 # ------------------ Web UI ------------------
 ui:
-  title: "中文个人知识库 RAG"
+  title: "中文知识库 RAG"
   page_icon: "📚"
-  theme: "light"                  # light / dark
+  theme: "light"
   default_top_k: 4
   default_temperature: 0.2
   show_thinking: false
@@ -179,8 +222,8 @@ ui:
 
 # ------------------ 知识图谱 ------------------
 knowledge_graph:
-  enabled: true
-  backend: sqlite              # neo4j / sqlite
+  enabled: false                  # 默认关闭
+  backend: sqlite
   sqlite_path: data/kg.db
   neo4j:
     uri: bolt://localhost:7687
@@ -196,5 +239,5 @@ knowledge_graph:
     default_hops: 2
     enable_fuzzy_match: true
   graph_rag:
-    enabled: true
+    enabled: false
     graph_hops: 2

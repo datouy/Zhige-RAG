@@ -1,0 +1,229 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: chineseragkb-api
+  namespace: chineseragkb
+  labels:
+    app: chineseragkb
+    component: api
+    version: v1
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: chineseragkb
+      component: api
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: chineseragkb
+        component: api
+        version: v1
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/api/metrics"
+    spec:
+      serviceAccountName: chineseragkb-api
+
+      # Graceful shutdown
+      terminationGracePeriodSeconds: 60
+
+      # Init containers
+      initContainers:
+        - name: wait-for-db
+          image: postgres:15-alpine
+          command:
+            - sh
+            - -c
+            - |
+              until PGPASSWORD=$POSTGRES_PASSWORD psql -h "postgresql" -U "$POSTGRES_USER" -d "postgres" -c '\q'; do
+                echo "Waiting for PostgreSQL..."
+                sleep 2
+              done
+              echo "PostgreSQL is ready!"
+          env:
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: chineseragkb-secrets
+                  key: DATABASE_URL
+                  optional: true
+            - name: POSTGRES_USER
+              value: "raguser"
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+
+      # Application containers
+      containers:
+        - name: api
+          image: chineseragkb/api:0.3.0
+          imagePullPolicy: Always
+
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+
+          env:
+            # Secrets
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: chineseragkb-secrets
+                  key: JWT_SECRET
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: chineseragkb-secrets
+                  key: DATABASE_URL
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: chineseragkb-secrets
+                  key: REDIS_URL
+                  optional: true
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: chineseragkb-secrets
+                  key: OPENAI_API_KEY
+                  optional: true
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: chineseragkb-secrets
+                  key: HF_TOKEN
+                  optional: true
+
+            # Config from ConfigMap
+            - name: APP_VERSION
+              valueFrom:
+                configMapKeyRef:
+                  name: chineseragkb-config
+                  key: APP_VERSION
+            - name: LLM_DEVICE
+              valueFrom:
+                configMapKeyRef:
+                  name: chineseragkb-config
+                  key: LLM_DEVICE
+            - name: VECTOR_STORE_PERSIST_DIR
+              valueFrom:
+                configMapKeyRef:
+                  name: chineseragkb-config
+                  key: VECTOR_STORE_PERSIST_DIR
+
+          envFrom:
+            - configMapRef:
+                name: chineseragkb-config
+
+          # Health checks
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+            successThreshold: 1
+
+          readinessProbe:
+            httpGet:
+              path: /api/ready
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+            successThreshold: 1
+
+          startupProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 30
+
+          # Resources
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+              nvidia.com/gpu: 1
+            limits:
+              cpu: 2000m
+              memory: 4Gi
+              nvidia.com/gpu: 1
+
+          # Volume mounts
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: cache
+              mountPath: /root/.cache
+            - name: tmp
+              mountPath: /tmp
+
+          # Security context
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            fsGroup: 1000
+
+      # Volumes
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: chineseragkb-data
+        - name: cache
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+
+      # Node scheduling
+      nodeSelector:
+        gpu: "true"
+
+      tolerations:
+        - key: "nvidia.com/gpu"
+          operator: "Exists"
+          effect: "NoSchedule"
+
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: chineseragkb
+                topologyKey: kubernetes.io/hostname
+
+      # Security
+      securityContext:
+        fsGroup: 1000
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: chineseragkb-api
+  namespace: chineseragkb
+  labels:
+    app: chineseragkb

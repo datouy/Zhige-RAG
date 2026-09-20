@@ -57,7 +57,10 @@ logger = get_logger("agent.react")
 # =====================================================================
 #  ReAct 提示模板
 # =====================================================================
-REACT_SYSTEM_PROMPT = """你是一个中文知识库助手，可以使用以下工具：
+# 日期/时间意图：命中即走本地时钟确定性回答，不进 ReAct 循环
+_DATETIME_INTENT_RE = re.compile(r"今天|现在.*(?:时间|日期)|几号|几点|日期|星期")
+
+REACT_SYSTEM_PROMPT = """你是一个中文知识库助手。当前日期：{current_date}。可以使用以下工具：
 
 {tools}
 
@@ -74,6 +77,8 @@ Final Answer: 你的最终中文回答
 约束：
 1. 只使用列出的工具，不允许编造工具名；
 2. ActionInput 必须是合法 JSON；
+3. 涉及"今天/现在/当前时间/日期"的问题，必须调用 get_current_time 工具获取，禁止凭记忆猜测日期；
+4. 最终回答只依据工具返回结果；工具没有提供的信息，明确说明无法得知；
 3. 若工具出错，按 Observation 中的错误提示继续推理或改用其它工具；
 4. 当不需要工具也能直接回答时，Action 写 None 并在下一行直接给 Final Answer。
 """
@@ -205,9 +210,12 @@ class ReActAgent:
     def _build_system_prompt(self) -> str:
         tool_list = self.tools.list_tools()
         names = self.tools.list_names()
+        from datetime import datetime
+
         return REACT_SYSTEM_PROMPT.format(
             tools=_format_tools_block(tool_list),
             tool_names=", ".join(names),
+            current_date=datetime.now().strftime("%Y年%m月%d日"),
         )
 
     def _ensure_llm_loaded(self) -> None:
@@ -241,6 +249,21 @@ class ReActAgent:
 
         if not query or not isinstance(query, str):
             yield {"event": "error", "data": "query 不能为空"}
+            return
+
+        # A3 确定性短路：日期/时间类问题直接用本地时钟回答。
+        # 1.5B 模型在 ReAct 协议下经常不调用 get_current_time 而凭训练记忆
+        # 编造日期（实测答"2023年4月1日"），这类确定性事实不交给模型。
+        if _DATETIME_INTENT_RE.search(query):
+            from datetime import datetime
+
+            now = datetime.now()
+            answer = f"今天是 {now.strftime('%Y年%m月%d日')}，当前时间 {now.strftime('%H:%M:%S')}。"
+            steps = 1
+            yield {
+                "event": "done",
+                "data": {"steps": steps, "tools_used": ["local_clock"], "answer": answer},
+            }
             return
 
         self._ensure_llm_loaded()

@@ -1,0 +1,48 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: chineseragkb-config
+  namespace: chineseragkb
+  labels:
+    app: chineseragkb
+    version: v1
+data:
+  # Application settings
+  APP_VERSION: "0.3.0"
+  LOG_LEVEL: "INFO"
+  LOG_FORMAT: "json"
+
+  # Database settings
+  DB_TYPE: "postgresql"
+
+  # Vector store settings
+  VECTOR_STORE_BACKEND: "chroma"
+  VECTOR_STORE_PERSIST_DIR: "/data/chroma"
+
+  # Knowledge graph settings
+  KG_ENABLED: "true"
+  KG_BACKEND: "sqlite"
+
+  # LLM settings
+  LLM_DEVICE: "cuda"
+  LLM_MODEL_NAME: "Qwen/Qwen2-7B-Instruct"
+
+  # Embedding settings
+  EMBEDDING_MODEL_NAME: "BAAI/bge-base-zh-v1.5"
+  EMBEDDING_DEVICE: "cuda"
+
+  # Monitoring settings
+  OTEL_SERVICE_NAME: "ChineseRAGKB"
+  OTEL_EXPORTER_TYPE: "otlp"
+  OTEL_EXPORTER_ENDPOINT: "http://otel-collector:4317"
+
+  # CORS settings
+  ALLOWED_ORIGINS: "https://app.example.com,https://admin.example.com"
+
+  # Rate limiting
+  RATE_LIMIT_AUTH: "5/minute"
+  RATE_LIMIT_QUERY: "60/minute"
+  RATE_LIMIT_DEFAULT: "120/minute"
+
+  # Resource limits
+  SLOW_REQUEST_THRESHOLD_MS: "1000"

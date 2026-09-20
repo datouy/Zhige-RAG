@@ -371,15 +371,19 @@ def render_page(cfg: dict) -> None:
     # ---------- 第二排：NDCG/MRR/TTFT/tokens/s 副指标卡 ----------
     if latest:
         s1, s2, s3, s4 = st.columns(4)
-        s1.metric("NDCG@5", _format_float(latest.get("ndcg_at_5")))
-        s2.metric("MRR", _format_float(latest.get("mrr")))
+        s1.metric("NDCG@5", _format_float(latest.get("ndcg_at_5")),
+                  help="排序质量分（0~1）：正确来源是否排在结果前列，越接近 1 越好")
+        s2.metric("MRR", _format_float(latest.get("mrr")),
+                  help="首个正确来源的平均排名倒数（0~1）：正确来源平均出现在第几位")
         s3.metric(
             "平均 TTFT (ms)",
             f"{float(latest.get('avg_ttft_ms')):.0f}" if latest.get("avg_ttft_ms") is not None else "—",
+            help="Time To First Token：从提问到出现第一个字的等待时间，越短感觉响应越快",
         )
         s4.metric(
             "平均 tokens/s",
             f"{float(latest.get('avg_tokens_per_sec')):.2f}" if latest.get("avg_tokens_per_sec") is not None else "—",
+            help="回答的生成速度：数值越大，文字出现得越流畅",
         )
 
     st.divider()

@@ -200,6 +200,8 @@ def evaluate(pipeline: RAGPipeline, items: List[Dict[str, Any]], llm_self_eval: 
     tokens_per_sec_values: List[float] = []
     ndcgs: List[float] = []
     mrrs: List[float] = []
+    # 可验证性聚合（核心指标：答案必须可回溯到上下文）
+    verifications: List[Dict[str, Any]] = []
     details: List[Dict[str, Any]] = []
 
     for i, item in enumerate(items, 1):
@@ -251,6 +253,11 @@ def evaluate(pipeline: RAGPipeline, items: List[Dict[str, Any]], llm_self_eval: 
         if isinstance(tps, (int, float)) and tps > 0:
             tokens_per_sec_values.append(float(tps))
 
+        # 可验证性（pipeline 侧规则校验结果）
+        verification = getattr(result, "verification", None)
+        if verification:
+            verifications.append(verification)
+
         details.append(
             {
                 "index": i,
@@ -264,6 +271,7 @@ def evaluate(pipeline: RAGPipeline, items: List[Dict[str, Any]], llm_self_eval: 
                 "keyword_coverage": kw_cov,
                 "ndcg_at_5": ndcg,
                 "mrr": mrr_val,
+                "verification": verification,
             }
         )
         logger.info(
@@ -278,6 +286,9 @@ def evaluate(pipeline: RAGPipeline, items: List[Dict[str, Any]], llm_self_eval: 
             f"{ttft_ms:.0f}" if isinstance(ttft_ms, (int, float)) else "—",
         )
 
+    # 可验证性汇总：verified 比例、平均引用覆盖率、编造事实计数
+    answered = [v for v in verifications if not v.get("refused")]
+    verified = [v for v in answered if v.get("status") == "verified"]
     summary: Dict[str, Any] = {
         "samples": n,
         "retrieval_hit_rate": retrieval_hits / n if n else 0.0,
@@ -291,6 +302,15 @@ def evaluate(pipeline: RAGPipeline, items: List[Dict[str, Any]], llm_self_eval: 
         "avg_tokens_per_sec": (
             sum(tokens_per_sec_values) / len(tokens_per_sec_values) if tokens_per_sec_values else None
         ),
+        "verifiability": {
+            "checked": len(verifications),
+            "verified_rate": (len(verified) / len(answered)) if answered else None,
+            "avg_cited_sentence_ratio": (
+                sum(v.get("cited_sentence_ratio", 0.0) for v in answered) / len(answered)
+            ) if answered else None,
+            "unsupported_fact_total": sum(len(v.get("unsupported_facts", [])) for v in verifications),
+            "invalid_citation_total": sum(len(v.get("invalid_citations", [])) for v in verifications),
+        },
         "details": details,
     }
     return summary
@@ -354,6 +374,7 @@ def archive_report(summary: Dict[str, Any], report_path: Path) -> Dict[str, Any]
         "mrr": summary.get("mrr"),
         "avg_ttft_ms": summary.get("avg_ttft_ms"),
         "avg_tokens_per_sec": summary.get("avg_tokens_per_sec"),
+        "verified_rate": ((summary.get("verifiability") or {}).get("verified_rate")),
         "archive_path": str(archive_path.relative_to(report_path.parent)),
     }
     index_entries.append(entry)
@@ -368,12 +389,85 @@ def archive_report(summary: Dict[str, Any], report_path: Path) -> Dict[str, Any]
 # ======================================================================
 #  CLI
 # ======================================================================
+def evaluate_retrieval(pipeline: RAGPipeline, items: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """检索回归评估：只跑"召回 + 重排"，不加载 LLM、不生成答案。
+
+    用途：UI 占用 GPU 时也能做检索质量回归（CPU 即可），改动分词/分块/
+    检索参数后快速看 hit_rate / NDCG / MRR 的涨跌。指标口径与全量评估
+    的检索部分一致（expected_sources 子串匹配）。
+    """
+    n = len(items)
+    if n == 0:
+        return {"samples": 0}
+    hits_total = 0
+    ndcgs: List[float] = []
+    mrrs: List[float] = []
+    latencies: List[float] = []
+    details: List[Dict[str, Any]] = []
+    for i, item in enumerate(items, 1):
+        q = item["question"]
+        expected_sources = item.get("expected_sources", []) or []
+        t0 = time.perf_counter()
+        try:
+            hits = pipeline.retrieve(q)
+        except Exception as exc:
+            logger.error("第 %d 条检索失败: %s", i, exc)
+            details.append({"index": i, "question": q, "error": str(exc)})
+            continue
+        latency = (time.perf_counter() - t0) * 1000
+        latencies.append(latency)
+        sources = [str((h.metadata or {}).get("source") or "") for h in hits]
+        hit = 0
+        if expected_sources:
+            for src in sources:
+                if any(es in src for es in expected_sources):
+                    hit = 1
+                    break
+        else:
+            hit = 1
+        hits_total += hit
+        ndcg = ndcg_at_k(sources, expected_sources, k=5)
+        mrr_val = mrr(sources, expected_sources)
+        if ndcg is not None:
+            ndcgs.append(ndcg)
+        if mrr_val is not None:
+            mrrs.append(mrr_val)
+        details.append(
+            {
+                "index": i,
+                "question": q,
+                "retrieval_hit": bool(hit),
+                "ndcg_at_5": ndcg,
+                "mrr": mrr_val,
+                "latency_ms": round(latency, 2),
+                "retrieved_sources": sources[:5],
+            }
+        )
+        logger.info(
+            "[%d/%d] 命中=%s NDCG=%s MRR=%s 检索延迟=%.0fms",
+            i, n, bool(hit),
+            f"{ndcg:.2f}" if ndcg is not None else "—",
+            f"{mrr_val:.2f}" if mrr_val is not None else "—",
+            latency,
+        )
+    return {
+        "samples": n,
+        "mode": "retrieval_only",
+        "retrieval_hit_rate": hits_total / n if n else 0.0,
+        "ndcg_at_5": sum(ndcgs) / len(ndcgs) if ndcgs else None,
+        "mrr": sum(mrrs) / len(mrrs) if mrrs else None,
+        "avg_retrieval_latency_ms": sum(latencies) / len(latencies) if latencies else None,
+        "details": details,
+    }
+
+
 def _build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="RAG 评估脚本")
     p.add_argument("--config", default="config/config.yaml")
     p.add_argument("--dataset", default=None, help="覆盖评估集路径")
     p.add_argument("--output", default="data/eval/report.json", help="报告输出路径")
     p.add_argument("--llm-self-eval", action="store_true", help="启用 LLM 自评")
+    p.add_argument("--retrieval-only", action="store_true", help="只评估检索（不加载 LLM/GPU，CPU 可跑）")
     p.add_argument("--top-k", type=int, default=None, help="覆盖 retrieval.top_k")
     p.add_argument(
         "--synthesize-demo",
@@ -408,8 +502,13 @@ def main():
         logger.error("评估集为空或不存在：%s", dataset_path)
         return 1
 
-    pipeline = RAGPipeline.from_config(args.config, overrides=cfg)
-    summary = evaluate(pipeline, items, llm_self_eval=args.llm_self_eval)
+    if args.retrieval_only:
+        # 检索回归模式：lazy_llm 不加载生成模型（CPU 可跑，可与 UI 并存）
+        pipeline = RAGPipeline.from_config(args.config, overrides=cfg, lazy_llm=True)
+        summary = evaluate_retrieval(pipeline, items)
+    else:
+        pipeline = RAGPipeline.from_config(args.config, overrides=cfg)
+        summary = evaluate(pipeline, items, llm_self_eval=args.llm_self_eval)
 
     out = resolve_path(args.output)
     ensure_dir(out.parent)
@@ -428,8 +527,24 @@ def main():
     print("\n========== 评估报告 ==========")
     print(f"样本数            : {summary['samples']}")
     print(f"检索命中率        : {summary['retrieval_hit_rate']:.2%}")
+    if summary.get("mode") == "retrieval_only":
+        print("(retrieval-only 模式：不含生成侧指标)")
+        n5 = summary.get("ndcg_at_5")
+        print(f"NDCG@5            : {n5:.3f}" if n5 is not None else "NDCG@5            : —")
+        mr = summary.get("mrr")
+        print(f"MRR               : {mr:.3f}" if mr is not None else "MRR               : —")
+        rl = summary.get("avg_retrieval_latency_ms")
+        print(f"平均检索延迟      : {rl:.0f}ms" if rl is not None else "平均检索延迟      : —")
+        print(f"报告已写入        : {out}")
+        return 0
     cov = summary.get("avg_keyword_coverage")
     print(f"平均关键词覆盖率  : {cov:.2%}" if cov is not None else "平均关键词覆盖率  : —")
+    v = summary.get("verifiability") or {}
+    vr = v.get("verified_rate")
+    print(f"可验证率          : {vr:.2%}" if vr is not None else "可验证率          : —")
+    cr = v.get("avg_cited_sentence_ratio")
+    print(f"平均引用覆盖率    : {cr:.2%}" if cr is not None else "平均引用覆盖率    : —")
+    print(f"编造事实/越界引用 : {v.get('unsupported_fact_total', 0)} / {v.get('invalid_citation_total', 0)}")
     lat = summary.get("avg_latency_ms")
     print(f"平均响应时间      : {lat:.0f} ms" if lat is not None else "平均响应时间      : —")
     ndcg = summary.get("ndcg_at_5")

@@ -1,0 +1,6 @@
+"""Alembic migration versions directory.
+
+This directory stores database migration scripts.
+Run `alembic upgrade head` to apply all migrations.
+Run `alembic downgrade -1` to revert the last migration.
+"""

@@ -71,3 +71,24 @@ def test_load_pdf_if_available(tmp_path):
     pytest.importorskip("pdfplumber")
     # 这里仅做冒烟测试：使用 reportlab 或最小 PDF 都可。简化处理：直接跳过构造。
     pytest.skip("PDF 构造需要 reportlab 等额外库，跳过自动测试")
+
+def test_load_txt_gbk_auto_detected(tmp_path):
+    """GBK 编码的 TXT 应被自动探测解码，而不是读成乱码。"""
+    p = tmp_path / "gbk.txt"
+    p.write_bytes("公司的年假制度：入职满一年可休五天。".encode("gbk"))
+    from src.document_loader import _load_txt
+
+    docs = _load_txt(p)
+    assert docs, "GBK 文件应能解析出内容"
+    assert "年假制度" in docs[0].content
+    assert docs[0].metadata["encoding"] == "gb18030"
+
+
+def test_load_txt_explicit_encoding_still_supported(tmp_path):
+    """显式指定 encoding 时保持旧行为（按指定编码解码）。"""
+    p = tmp_path / "u16.txt"
+    p.write_bytes("你好知识库".encode("utf-16"))
+    from src.document_loader import _load_txt
+
+    docs = _load_txt(p, encoding="utf-16")
+    assert docs and "知识库" in docs[0].content

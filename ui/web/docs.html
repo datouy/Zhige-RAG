@@ -3,26 +3,17 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>知识库管理 - 中文知识库 RAG</title>
+    <title>知识库管理</title>
     <link rel="stylesheet" href="/css/main.css">
 </head>
 <body>
     <!-- Header -->
     <header class="header">
         <div class="header-inner">
-            <h1>📚 中文知识库 RAG</h1>
-            <span id="ws-status" class="status connected">API Ready</span>
+            <h1>📁 知识库管理</h1>
+            <span id="status" class="status connected">就绪</span>
         </div>
     </header>
-
-    <!-- Navigation -->
-    <nav class="nav">
-        <div class="nav-inner">
-            <a href="/index.html">💬 智能问答</a>
-            <a href="/upload.html">📤 上传文档</a>
-            <a href="/docs.html" class="active">📁 知识库</a>
-        </div>
-    </nav>
 
     <!-- Alert Container -->
     <div id="alert-container" class="page"></div>
@@ -30,16 +21,16 @@
     <!-- Documents Page -->
     <main class="page">
         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem;">
-            <h2>📁 知识库管理</h2>
+            <h2>知识库文档</h2>
             <div style="font-size: 0.9rem; color: var(--text-muted);">
-                共 <strong id="doc-count">0</strong> 个文档，
-                <strong id="chunk-total">0</strong> 个分块
+                <span id="doc-count">0</span> 个文档，
+                <span id="chunk-total">0</span> 个分块
             </div>
         </div>
 
         <!-- Search -->
         <div class="search-box">
-            <input type="text" id="search-input" placeholder="🔍 搜索文档名称...">
+            <input type="text" id="search-input" placeholder="搜索文档名称...">
         </div>
 
         <!-- Document List -->
@@ -50,7 +41,7 @@
             </div>
         </div>
 
-        <!-- Delete Confirmation Modal -->
+        <!-- Delete Modal -->
         <div id="delete-modal" class="modal">
             <div class="modal-content">
                 <div class="modal-header">
@@ -66,7 +57,7 @@
         </div>
     </main>
 
-    <!-- Chunk Detail Modal -->
+    <!-- Chunk Modal -->
     <div id="chunk-modal" class="modal">
         <div class="modal-content">
             <div class="modal-header">
@@ -78,7 +69,7 @@
     </div>
 
     <footer class="footer">
-        ChineseRAGKB v0.2.0 | FastAPI + WebSocket
+        中文知识库 RAG
     </footer>
 
     <script>
@@ -88,7 +79,7 @@
         // 加载文档列表
         async function loadDocuments() {
             try {
-                const resp = await fetch('/api/documents');
+                const resp = await fetch('/api/v1/documents');
                 const data = await resp.json();
                 allDocs = data.documents || [];
                 renderDocuments(allDocs);
@@ -107,7 +98,7 @@
                 list.innerHTML = `
                     <div class="empty-state">
                         <div class="icon">📭</div>
-                        <p>${allDocs.length === 0 ? '知识库为空，请先上传文档' : '没有找到匹配的文档'}</p>
+                        <p>${allDocs.length === 0 ? '知识库为空，请上传文档' : '没有找到匹配的文档'}</p>
                     </div>
                 `;
                 return;
@@ -139,11 +130,11 @@
         // 预览文档
         async function viewDocument(source) {
             try {
-                const resp = await fetch(`/api/documents/${encodeURIComponent(source)}/chunks?limit=10`);
+                const resp = await fetch(`/api/v1/documents/${encodeURIComponent(source)}/chunks?limit=10`);
                 const data = await resp.json();
                 
                 const modal = document.getElementById('chunk-modal');
-                document.getElementById('modal-title').textContent = `📄 ${source}`;
+                document.getElementById('modal-title').textContent = source;
                 document.getElementById('modal-text').textContent = 
                     data.chunks.map((c, i) => `【分块 ${i + 1}】\n${c.text}\n`).join('\n---\n') || '无分块内容';
                 modal.classList.add('active');
@@ -156,7 +147,7 @@
         function confirmDelete(source) {
             deleteTarget = source;
             document.getElementById('delete-message').textContent = 
-                `确定要删除文档 "${source}" 吗？此操作将从知识库中删除所有相关分块。`;
+                `确定要删除文档 "${source}" 吗？`;
             document.getElementById('delete-modal').classList.add('active');
         }
 
@@ -174,9 +165,13 @@
             btn.innerHTML = '<span class="spinner"></span>';
 
             try {
-                // 注意: 这里需要后端实现删除 API
-                // 暂时通过重新入库实现刷新
-                showAlert('删除功能需要后端实现，当前仅刷新列表', 'error');
+                const resp = await fetch(`/api/v1/documents/${encodeURIComponent(deleteTarget)}`, {
+                    method: 'DELETE'
+                });
+                
+                if (!resp.ok) throw new Error(await resp.text());
+                
+                showAlert('删除成功', 'success');
                 closeDeleteModal();
                 await loadDocuments();
             } catch (e) {

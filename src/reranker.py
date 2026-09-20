@@ -10,21 +10,17 @@ from __future__ import annotations
 
 from typing import List, Sequence
 
-from .utils import Timer, get_logger, resolve_path
+from .utils import Timer, get_logger, resolve_path, select_torch_device
 from .vector_store import Hit
 
 logger = get_logger("reranker")
 
 
 def _select_device(device: str) -> str:
-    if device and device != "auto":
-        return device
-    try:
-        import torch  # type: ignore
-
-        return "cuda" if torch.cuda.is_available() else "cpu"
-    except Exception:
-        return "cpu"
+    """委托到 :func:`src.utils.select_torch_device`，与 embeddings 行为一致
+    （CPU 版 torch + CUDA 驱动时回落 cpu，避免 FlagReranker/CrossEncoder
+    在 ``to('cuda')`` 时崩溃）。"""
+    return select_torch_device(device, logger=logger)
 
 
 class BgeReranker:
@@ -58,7 +54,15 @@ class BgeReranker:
 
             logger.info("使用 FlagEmbedding 加载 Reranker: %s", model_name)
             with Timer(f"加载 Reranker {model_name}"):
-                self.model = FlagReranker(model_name, use_fp16=(self.device == "cuda"), cache_dir=cache_path)
+                # devices 必须显式收窄为单设备：默认的多设备探测（cuda+cpu）
+                # 会走 encode_multi_process，CPU 环境下进程池为空，
+                # compute_score 一调用就 ZeroDivisionError（预存在的坑）。
+                self.model = FlagReranker(
+                    model_name,
+                    use_fp16=(self.device == "cuda"),
+                    cache_dir=cache_path,
+                    devices=[self.device],
+                )
             self._backend = "flag"
         except Exception as exc:
             logger.info("FlagEmbedding 不可用（%s），回退到 sentence-transformers CrossEncoder", exc)
@@ -100,7 +104,13 @@ class BgeReranker:
         pairs = [(query, h.text) for h in hits]
         with Timer(f"rerank x{len(pairs)}"):
             if self._backend == "flag":
-                scores = self.model.compute_score(pairs, normalize=True)
+                try:
+                    scores = self.model.compute_score(pairs, normalize=True)
+                except Exception as exc:  # noqa: BLE001
+                    # 重排是"锦上添花"环节：失败时保持初检顺序降级返回，
+                    # 绝不能让重排故障拖垮整条问答链路
+                    logger.warning("重排失败，按初检顺序降级返回: %s", exc)
+                    return list(hits)[:top_n]
                 if isinstance(scores, float):
                     scores = [scores]
             else:

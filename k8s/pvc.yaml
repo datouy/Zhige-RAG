@@ -1,0 +1,102 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: chineseragkb-data
+  namespace: chineseragkb
+  labels:
+    app: chineseragkb
+    type: data
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: standard
+  resources:
+    requests:
+      storage: 50Gi
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: chineseragkb-models
+  namespace: chineseragkb
+  labels:
+    app: chineseragkb
+    type: models
+spec:
+  accessModes:
+    - ReadOnlyMany
+  storageClassName: standard
+  resources:
+    requests:
+      storage: 20Gi
+
+---
+# NetworkPolicy for pod-to-pod communication
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: chineseragkb-api-network-policy
+  namespace: chineseragkb
+spec:
+  podSelector:
+    matchLabels:
+      app: chineseragkb
+      component: api
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Allow traffic from ingress controller
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              name: ingress-nginx
+      ports:
+        - protocol: TCP
+          port: 8000
+    # Allow metrics scraping
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              name: monitoring
+      ports:
+        - protocol: TCP
+          port: 8000
+  egress:
+    # Allow DNS
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+    # Allow egress to PostgreSQL
+    - to:
+        - podSelector:
+            matchLabels:
+              app: postgresql
+      ports:
+        - protocol: TCP
+          port: 5432
+    # Allow egress to Redis
+    - to:
+        - podSelector:
+            matchLabels:
+              app: redis
+      ports:
+        - protocol: TCP
+          port: 6379
+    # Allow HTTPS for HuggingFace/OpenAI
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+      ports:
+        - protocol: TCP
+          port: 443

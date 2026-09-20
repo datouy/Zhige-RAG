@@ -7,32 +7,38 @@
 - 流式输出（generate stream）
 - 简单 chat template（Qwen / ChatML）
 - 单条 / 批量推理
+- 超时控制与重试机制
 
 针对 GTX 1060 4GB：建议使用 4bit 量化 + 小模型（Qwen2.5-1.5B-Instruct）。
 """
 
 from __future__ import annotations
 
+import json
 import os
+import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass
 from typing import Any, Dict, Generator, List, Optional
 
-from .utils import Timer, get_logger, resolve_path
+from .utils import Timer, get_logger, resolve_path, select_torch_device
 
 logger = get_logger("llm")
 
+# 默认 LLM 推理超时（秒）
+DEFAULT_TIMEOUT = 120.0
+# 最大重试次数
+DEFAULT_MAX_RETRIES = 2
+
+# 超时控制用的共享线程池。线程无法被强制中断，因此超时后放弃的是
+# "等待结果"，worker 线程会随解释器退出（daemon）。池只按需创建。
+_TIMEOUT_POOL: Optional[ThreadPoolExecutor] = None
+
 
 def _detect_device(device: str) -> str:
-    if device and device != "auto":
-        return device
-    try:
-        import torch  # type: ignore
-
-        if torch.cuda.is_available():
-            return "cuda"
-    except Exception:
-        pass
-    return "cpu"
+    """委托到 :func:`src.utils.select_torch_device`，与 embeddings/reranker
+    行为一致（CPU 版 torch + CUDA 驱动时回落 cpu）。"""
+    return select_torch_device(device, logger=logger)
 
 
 def _detect_dtype(torch_dtype: str):
@@ -50,6 +56,26 @@ def _detect_dtype(torch_dtype: str):
         "fp32": torch.float32,
     }
     return mapping.get(torch_dtype.lower(), "auto")
+
+
+def _get_timeout_pool() -> ThreadPoolExecutor:
+    """按需创建超时控制线程池。
+
+    worker 数与 LLM 并发上限对齐（``LLM_MAX_CONCURRENT``，默认 4）：如果池
+    比 LLM 并发小，后续请求会在队列里等待，而 ``future.result(timeout)``
+    把排队时间也计入超时，导致"本可完成的请求被误判超时"。池足够大时，
+    timeout 基本只度量生成本身。
+    """
+    global _TIMEOUT_POOL
+    if _TIMEOUT_POOL is None:
+        max_workers = max(
+            2,
+            int(os.getenv("LLM_TIMEOUT_POOL_WORKERS", os.getenv("LLM_MAX_CONCURRENT", "4"))),
+        )
+        _TIMEOUT_POOL = ThreadPoolExecutor(
+            max_workers=max_workers, thread_name_prefix="llm-timeout"
+        )
+    return _TIMEOUT_POOL
 
 
 @dataclass
@@ -89,6 +115,7 @@ class LocalLLM:
         chat_template: str = "auto",
         local_files_only: bool = False,
         trust_remote_code: bool = False,
+        max_retries: int = DEFAULT_MAX_RETRIES,
     ) -> None:
         self.model_name = model_name
         self.device = _detect_device(device)
@@ -98,6 +125,7 @@ class LocalLLM:
         self.chat_template = chat_template
         self.local_files_only = local_files_only
         self.trust_remote_code = trust_remote_code
+        self.max_retries = max_retries
 
         # 解析缓存目录
         self.cache_dir = resolve_path(cache_dir) if cache_dir else None
@@ -123,13 +151,22 @@ class LocalLLM:
         import torch  # type: ignore
         from transformers import AutoModelForCausalLM  # type: ignore
 
-        model_kwargs: Dict[str, Any] = {
-            "device_map": self.device_map,
+        # device_map 支持 JSON dict 字符串（如 '{"": 0}'）——强制全部层进
+        # 第一块 GPU，绕开 accelerate 在小显存卡上的保守卸载策略
+        device_map_kw: Any = self.device_map
+        if isinstance(self.device_map, str) and self.device_map.strip().startswith("{"):
+            try:
+                device_map_kw = json.loads(self.device_map)
+            except ValueError:
+                pass
+        base_kwargs: Dict[str, Any] = {
+            "device_map": device_map_kw,
             "cache_dir": str(self.cache_dir) if self.cache_dir else None,
             "local_files_only": self.local_files_only,
             "trust_remote_code": self.trust_remote_code,
         }
 
+        quant_exc: Optional[Exception] = None
         if self.quant and self.quant.get("enabled"):
             try:
                 from transformers import BitsAndBytesConfig  # type: ignore
@@ -141,17 +178,29 @@ class LocalLLM:
                     bnb_4bit_quant_type=self.quant.get("quant_type", "nf4"),
                     bnb_4bit_use_double_quant=bool(self.quant.get("double_quant", True)),
                     bnb_4bit_compute_dtype=compute_dtype if compute_dtype != "auto" else torch.float16,
+                    llm_int8_enable_fp32_cpu_offload=True,
                 )
-                model_kwargs["quantization_config"] = bnb_cfg
+                quant_kwargs = {**base_kwargs, "quantization_config": bnb_cfg, "device_map": "auto"}
+                with Timer(f"加载 LLM {self.model_name} (4bit)"):
+                    self.model = AutoModelForCausalLM.from_pretrained(self.model_name, **quant_kwargs)
                 logger.info("已启用 4bit 量化：%s", self.quant)
             except Exception as exc:
-                logger.warning("量化配置失败，回退到非量化加载：%s", exc)
-        else:
-            dtype = self.torch_dtype
-            model_kwargs["torch_dtype"] = dtype if dtype != "auto" else (torch.float16 if self.device == "cuda" else torch.float32)
+                # 量化加载失败（bitsandbytes 未装/不支持当前 CUDA/版本不兼容等）
+                # 回退到非量化 fp16/fp32 加载，保证功能可用
+                quant_exc = exc
+                logger.warning(
+                    "4bit 量化加载失败（%s: %s），回退到非量化加载",
+                    type(exc).__name__, exc,
+                )
 
-        with Timer(f"加载 LLM {self.model_name}"):
-            self.model = AutoModelForCausalLM.from_pretrained(self.model_name, **model_kwargs)
+        if not (self.quant and self.quant.get("enabled")) or quant_exc is not None:
+            dtype = self.torch_dtype
+            fallback_kwargs = {
+                **base_kwargs,
+                "torch_dtype": dtype if dtype != "auto" else (torch.float16 if self.device == "cuda" else torch.float32),
+            }
+            with Timer(f"加载 LLM {self.model_name}"):
+                self.model = AutoModelForCausalLM.from_pretrained(self.model_name, **fallback_kwargs)
         self.model.eval()
         # 设置 pad token id（生成时需要 eos/pad 区分）
         if getattr(self.model.config, "pad_token_id", None) is None:
@@ -206,6 +255,7 @@ class LocalLLM:
         messages: List[Dict[str, str]],
         generation: Optional[GenerationConfig] = None,
         stream: bool = False,
+        timeout: float = DEFAULT_TIMEOUT,
     ) -> str | Generator[str, None, None]:
         """对话式生成。
 
@@ -213,6 +263,7 @@ class LocalLLM:
             messages: OpenAI 风格消息列表 [{"role":..., "content":...}]。
             generation: 覆盖默认生成参数。
             stream: 是否流式返回（str 生成器）。
+            timeout: 同步调用超时秒数（仅非流式生效）。
 
         Returns:
             非流式：完整回答；流式：逐片段生成器。
@@ -221,7 +272,45 @@ class LocalLLM:
         gen_cfg = generation or self.gen_cfg
         if stream:
             return self._stream_generate(prompt, gen_cfg)
-        return self._generate(prompt, gen_cfg)
+        return self._generate_with_timeout(prompt, gen_cfg, timeout)
+
+    def _generate_with_retry(self, prompt: str, gen_cfg: GenerationConfig) -> str:
+        """带重试的生成方法，处理临时性失败。"""
+        last_error = None
+        for attempt in range(self.max_retries + 1):
+            try:
+                return self._generate(prompt, gen_cfg)
+            except Exception as exc:
+                last_error = exc
+                if attempt < self.max_retries:
+                    wait_time = (attempt + 1) * 1.0  # 简单指数退避
+                    logger.warning("LLM 生成失败（第 %d 次），%.1fs 后重试: %s", attempt + 1, wait_time, exc)
+                    time.sleep(wait_time)
+                else:
+                    logger.error("LLM 生成最终失败（已重试 %d 次）: %s", self.max_retries, exc)
+        raise last_error
+
+    def _generate_with_timeout(self, prompt: str, gen_cfg: GenerationConfig, timeout: float) -> str:
+        """带超时的生成方法。
+
+        说明：之前这里用 ``signal.alarm/SIGALRM`` 实现，但 Windows 上根本没有
+        ``alarm``，且 signal 处理器只能在主线程生效（FastAPI 的同步端点跑在
+        线程池里），因此跨平台一律改为线程池 + ``future.result(timeout)``。
+        超时后放弃等待并抛出 :class:`TimeoutError`；推理线程本身无法被强制
+        中断，作为 daemon 线程随进程退出。
+        """
+        pool = _get_timeout_pool()
+
+        def _run() -> str:
+            return self._generate_with_retry(prompt, gen_cfg)
+
+        future = pool.submit(_run)
+        try:
+            return future.result(timeout=max(0.1, float(timeout)))
+        except FuturesTimeoutError:
+            future.cancel()
+            logger.warning("LLM 生成超时（%.1f 秒）", timeout)
+            raise TimeoutError(f"LLM 生成超时（{timeout}s）") from None
 
     def _generate(self, prompt: str, gen_cfg: GenerationConfig) -> str:
         import torch  # type: ignore
@@ -267,8 +356,19 @@ class LocalLLM:
         )
 
         def _worker():
-            with torch.no_grad():
-                self.model.generate(**gen_kwargs)
+            # generate 抛异常（OOM 等）时 TextIteratorStreamer 永远收不到
+            # 结束信号，消费端 `for piece in streamer` 会无限阻塞——必须
+            # 在 finally 里补发 end()，保证迭代器一定终止。
+            try:
+                with torch.no_grad():
+                    self.model.generate(**gen_kwargs)
+            except Exception as exc:  # noqa: BLE001
+                logger.error("流式生成失败: %s", exc)
+            finally:
+                try:
+                    streamer.end()
+                except Exception:  # noqa: BLE001
+                    pass
 
         th = Thread(target=_worker, daemon=True)
         th.start()

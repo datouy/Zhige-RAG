@@ -59,7 +59,7 @@ def _get_graph_rag():
     try:
         from src.embeddings import EmbeddingModel
         from src.rag_pipeline import RAGPipeline
-        from src.vector_store import ChromaStore
+        from src.vector_store import ChromaStore, hybrid_kwargs
 
         cfg = load_config("config/config.yaml")
         emb_cfg = cfg.get("embedding", {}) or {}
@@ -77,6 +77,7 @@ def _get_graph_rag():
             collection_name=cfg["vector_store"].get("collection_name", "chinese_rag_kb"),
             embedding_model=embedding,
             distance_fn=cfg["vector_store"].get("distance_fn", "cosine"),
+            **hybrid_kwargs(cfg.get("vector_store", {})),
         )
         kg_store = _get_kg_store()
         retriever = GraphRetriever(kg_store)
@@ -168,10 +169,23 @@ def render_page(cfg: dict) -> None:  # noqa: D401
     with tabs[0]:
         st.subheader("图谱统计")
         _show_stats(store)
-        if st.button("🗑 清空图谱（谨慎操作）"):
-            store.clear()
-            st.success("已清空")
-            st.rerun()
+        _kg_counts = {}
+        try:
+            _kg_counts = store.count() or {}
+        except Exception:
+            pass
+        if int(_kg_counts.get("entities", 0) or 0) <= 0:
+            # C3: 空状态引导——小白需要知道"为什么是空的、怎么构建"
+            st.info(
+                "📖 知识图谱目前是空的。**这不影响正常问答**；若要启用"
+                "\"图谱增强问答\"（回答实体之间关系类问题更擅长），请在命令行运行 "
+                "`python scripts/build_kg.py` 构建图谱（需要先关闭占用 GPU 的程序）。"
+            )
+        else:
+            if st.button("🗑 清空图谱（谨慎操作，将删除全部实体与关系）"):
+                store.clear()
+                st.success("已清空")
+                st.rerun()
 
     with tabs[1]:
         st.subheader("实体列表")

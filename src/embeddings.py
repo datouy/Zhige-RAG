@@ -20,44 +20,14 @@ from __future__ import annotations
 import os
 from typing import List, Optional, Sequence
 
-from .utils import Timer, get_logger, resolve_path
+from .utils import Timer, get_logger, resolve_path, select_torch_device
 
 logger = get_logger("embeddings")
 
 
 def _select_device(device: str) -> str:
-    """解析设备字符串，返回 sentence-transformers 可识别的设备。
-
-    注意：``torch.cuda.is_available()`` 在 Windows + NVIDIA 驱动存在但 torch
-    为 CPU 版时仍可能返回 True。``module.to('cuda')`` 会在此时抛出
-    ``AssertionError: Torch not compiled with CUDA enabled``。因此这里多加
-    一层 ``torch.version.cuda`` 的校验，确保只在真正 CUDA 编译的 torch 上
-    才返回 cuda，否则一律回落到 cpu。
-    """
-    if device and device != "auto":
-        # 用户显式指定时同样校验 CUDA 可用性
-        if device.startswith("cuda"):
-            try:
-                import torch  # type: ignore
-
-                if not (torch.cuda.is_available() and torch.version.cuda):
-                    logger.warning(
-                        "请求 %s 但当前 torch 未启用 CUDA（torch.version.cuda=%s），自动回落到 cpu",
-                        device,
-                        getattr(torch.version, "cuda", None),
-                    )
-                    return "cpu"
-            except Exception:
-                return "cpu"
-        return device
-    try:
-        import torch  # type: ignore
-
-        if torch.cuda.is_available() and torch.version.cuda:
-            return "cuda"
-    except Exception:
-        pass
-    return "cpu"
+    """委托到 :func:`src.utils.select_torch_device`（三处共用，避免漂移）。"""
+    return select_torch_device(device, logger=logger)
 
 
 class EmbeddingModel:

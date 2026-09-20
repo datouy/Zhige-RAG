@@ -1,5 +1,5 @@
 ﻿# ========== 核心框架 ==========
-# Python 3.10+ 推荐；3.9 也能跑，但 bitsandbytes 与 chromadb 在 3.12 下需注意 wheel
+# Python 3.11+ 推荐 (用于 Docker)
 torch>=2.0.0,<2.5.0
 transformers>=4.40.0,<4.46.0
 accelerate>=0.27.0,<0.35.0
@@ -15,6 +15,16 @@ python-multipart>=0.0.9
 aiofiles>=23.3.0
 pydantic>=2.0.0
 
+# ========== 多租户认证 ==========
+# JWT 使用 pyjwt，密码哈希使用 bcrypt（代码中直接依赖）
+sqlalchemy>=2.0.0
+bcrypt>=4.0.0
+pyjwt>=2.8.0
+email-validator>=2.0.0
+
+# ========== 数据库迁移 ==========
+alembic>=0.9.0
+
 # ========== 量化（4bit）==========
 # Windows 上 bitsandbytes >= 0.43 支持 CUDA 11.8+；CPU-only 可跳过
 bitsandbytes>=0.43.0
@@ -28,6 +38,9 @@ FlagEmbedding>=1.2.0
 chromadb>=0.4.24,<0.6.0
 # 在某些 Linux 上 chromadb 需要更新的 sqlite，可选安装
 # pysqlite3-binary; sys.modules['sqlite3'] = sys.modules.pop('pysqlite3')
+
+# ========== 中文分词（BM25 混合检索用；未安装时自动回退字符 bigram） ==========
+jieba>=0.42.1
 
 # ========== 文档解析 ==========
 pdfplumber>=0.10.0
@@ -50,6 +63,15 @@ rank-bm25>=0.2.2
 # ========== 测试 ==========
 pytest>=8.0.0
 pytest-cov>=4.1.0
+filelock>=3.12.0  # P3.3: scripts/preload_llm.py 单飞行锁
+
+# ========== Docker & Production ==========
+slowapi>=0.1.9
+
+# ========== 健康检查 / 指标 ==========
+# /api/health 依赖 psutil；未安装时健康检查直接 500，k8s 探针会全部失败
+psutil>=5.9.0
+prometheus-client>=0.19.0
 
 # ========== 指标可视化（📊 页面）==========
 plotly>=5.18,<6.0
