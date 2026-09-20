@@ -160,6 +160,7 @@ class ChineseTextSplitter:
         keep_separator: bool = True,
         min_chunk_size: int = 32,
         custom_dict_words: Optional[List[str]] = None,
+        custom_dict_path: Optional[str] = None,
     ) -> None:
         if chunk_size <= 0:
             raise ValueError("chunk_size 必须 > 0")
@@ -171,7 +172,12 @@ class ChineseTextSplitter:
         self.separators = separators or self.DEFAULT_SEPARATORS
         self.keep_separator = keep_separator
         self.min_chunk_size = min_chunk_size
-        self.custom_dict_words: Set[str] = set(custom_dict_words or [])
+        
+        # 合并传入的词表和文件词表
+        words = set(custom_dict_words or [])
+        if custom_dict_path:
+            words.update(load_custom_dict_from_file(custom_dict_path))
+        self.custom_dict_words: Set[str] = words
         
         # 加载自定义词典到 jieba（如果有）
         if self.custom_dict_words:

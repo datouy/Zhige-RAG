@@ -124,8 +124,11 @@ retrieval:
 # 用 cross-encoder 重排模型（如 bge-reranker）对候选结果重新打分
 # 只把真正相关的 Top-3~5 喂给大模型
 #
+# ⚡ 速度优化：如需更快响应，可关闭 reranker (enabled: false)
+# 🎯 精度优先：保持开启状态
+#
 reranker:
-  enabled: true
+  enabled: false                   # 默认关闭以提升速度，需要更精准时设为 true
   model_name: "./models/bge-reranker-base"
   device: "cpu"
   top_n: 3                        # 最终返回数
@@ -155,7 +158,7 @@ llm:
 
   generation:
     max_new_tokens: 256
-    temperature: 0.15              # 低温：事实型问答
+    temperature: 0.1               # 更低温度：0.1 更精准（事实型问答推荐）
     top_p: 0.9
     repetition_penalty: 1.05
     do_sample: true

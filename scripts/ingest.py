@@ -44,6 +44,7 @@ def build_splitter(cfg: dict):
             separators=sp_cfg.get("chinese_separators") or sp_cfg.get("separators"),
             keep_separator=sp_cfg.get("keep_separator", True),
             min_chunk_size=sp_cfg.get("min_chunk_size", 32),
+            custom_dict_path="config/custom_dict.txt",  # 自动加载自定义词典
         )
     return RecursiveTextSplitter(
         chunk_size=sp_cfg.get("chunk_size", 512),
@@ -162,7 +163,55 @@ def ingest_path(
 
     n = store.add_chunks(all_chunks)
     logger.info("✅ 入库完成，新增/覆盖 %d 条", n)
+    
+    # 入库后打印几条分块样例，检查质量
+    _print_chunk_samples(all_chunks, num_samples=5)
+    
     return n
+
+
+def _print_chunk_samples(chunks, num_samples: int = 5):
+    """打印分块样例用于质量检查。"""
+    if not chunks:
+        return
+    
+    print(f"\n{'='*80}")
+    print(f"分块质量检查 - 样例展示")
+    print(f"{'='*80}\n")
+    
+    print(f"总分块数: {len(chunks)}")
+    avg_len = sum(len(c.text) for c in chunks) / len(chunks)
+    print(f"平均长度: {avg_len:.1f} 字符")
+    print(f"最小长度: {min(len(c.text) for c in chunks)}")
+    print(f"最大长度: {max(len(c.text) for c in chunks)}\n")
+    
+    print(f"{'='*80}")
+    print(f"前 {min(num_samples, len(chunks))} 个分块预览:")
+    print(f"{'='*80}\n")
+    
+    for i, chunk in enumerate(chunks[:num_samples]):
+        print(f"{'-'*80}")
+        print(f"分块 {i+1}:")
+        print(f"  长度: {len(chunk.text)} 字符")
+        print(f"  来源: {chunk.metadata.get('source', 'N/A')}")
+        if 'title' in chunk.metadata:
+            print(f"  标题: {chunk.metadata['title']}")
+        print(f"  内容预览:\n")
+        
+        # 显示前 200 字符
+        preview = chunk.text[:200]
+        if len(chunk.text) > 200:
+            preview += "..."
+        print(f"    {preview}")
+        print()
+    
+    print(f"{'='*80}")
+    print("质量检查要点:")
+    print("   [OK] 每个块语义完整（未在句子中间截断）")
+    print("   [OK] 块长度合理（300-500 字符为宜）")
+    print("   [OK] 专有名词未被切碎")
+    print("   [OK] 有适当的上下文重叠")
+    print(f"{'='*80}\n")
 
 
 def main():
