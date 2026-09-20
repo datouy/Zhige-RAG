@@ -3,7 +3,7 @@
 > 一个面向 **GTX 1060 4GB / 32GB** 低端硬件、本地化、零外部依赖的中文 RAG 知识库系统。
 > 支持 PDF / Word / Markdown / TXT 多格式入库、轻量中文 Embedding、4bit 量化本地 LLM、可选重排序、Streamlit Web UI 与命令行工具。
 
-📦 **文档导航**：[安装文档 INSTALL.md](INSTALL.md) · [部署手册 DEPLOYMENT.md](DEPLOYMENT.md) · [架构 docs/architecture.md](docs/architecture.md) · [使用指南 docs/usage.md](docs/usage.md)
+📦 **文档导航**：[安装文档 INSTALL.md](INSTALL.md) · [部署手册 DEPLOYMENT.md](DEPLOYMENT.md) · [架构 docs/architecture.md](docs/architecture.md) · [使用指南 docs/usage.md](docs/usage.md) · **[优化指南 README_optimization.md](README_optimization.md)** · [优化变更日志 CHANGELOG_optimization.md](CHANGELOG_optimization.md)
 
 ![arch](docs/architecture.md)
 
