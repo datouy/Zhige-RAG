@@ -184,8 +184,11 @@ def _register_documents(db: Session, user_id: str, chunks: List[Any], report: Di
         return
     md = dict(chunks[0].metadata or {})
     source = str(md.get("source") or md.get("filepath") or "unknown")
+    # 多知识库：同一个文件名可能存在于不同库里，故 kb_id 参与唯一性判定
+    kb_id = md.get("kb_id")
     hashes = report.get("content_hashes") or []
     values = {
+        "kb_id": kb_id,
         "title": md.get("title") or source,
         "doc_status": str(md.get("doc_status") or "active"),
         "acl": str(md.get("acl") or "*"),
@@ -196,11 +199,12 @@ def _register_documents(db: Session, user_id: str, chunks: List[Any], report: Di
         "updated_at_source": _parse_datetime_safe(md.get("updated_at")),
     }
     try:
-        rec = (
-            db.query(DocumentRecord)
-            .filter(DocumentRecord.user_id == user_id, DocumentRecord.source == source)
-            .first()
+        query = db.query(DocumentRecord).filter(
+            DocumentRecord.user_id == user_id, DocumentRecord.source == source
         )
+        if kb_id is not None:
+            query = query.filter(DocumentRecord.kb_id == kb_id)
+        rec = query.first()
         if rec is None:
             db.add(DocumentRecord(user_id=user_id, source=source, **values))
         else:
@@ -349,6 +353,7 @@ class ChatRequest(BaseModel):
     query: str = Field(..., min_length=1, description="查询文本，不能为空")
     top_k: int = Field(4, ge=1, le=50, description="检索 Top-K")
     session_id: str = Field("", description="会话 ID；同一会话的多轮问答共享即时记忆")
+    kb_id: Optional[str] = Field(None, description="在指定知识库内检索，缺省为默认知识库")
 
 
 @router.post("/api/v1/chat", tags=["问答"])
@@ -375,7 +380,9 @@ def chat_sync(
     status_code = 200
     error_detail: Optional[str] = None
     try:
-        pipeline = get_runtime_pipeline(user_id=user.id)
+        # 指定知识库时在该库内检索，否则用默认库（行为与之前一致）
+        kb = _resolve_kb(user, get_runtime_config(), body.kb_id) if body.kb_id else None
+        pipeline = get_runtime_pipeline(user_id=user.id, kb=kb)
         session_id = (body.session_id or "").strip() or "default"
 
         # 长期记忆：显式"记住"指令先行落库（替身 pipeline / 存储缺失时静默跳过）
@@ -400,12 +407,28 @@ def chat_sync(
         SESSION_MEMORY.append(user.id, session_id, "user", body.query)
         SESSION_MEMORY.append(user.id, session_id, "assistant", result.answer or "")
 
+        # 会话持久化：session_id 指向真实会话时把本轮问答落库（供会话列表与历史回看）。
+        # 前端自由传入的 id 取不到会话记录 → 静默跳过，不影响问答本身。
+        if body.session_id and session_id != "default":
+            try:
+                from src.kb_service import KBError, append_message
+
+                append_message(db, user.id, session_id, "user", body.query)
+                append_message(
+                    db, user.id, session_id, "assistant", result.answer or "", result.sources
+                )
+            except KBError:
+                pass
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("会话消息落库失败（已忽略）: %s", exc)
+
         return {
             "answer": result.answer,
             "sources": result.sources,
             "timings": result.timings,
             "verification": result.verification,
             "session_id": session_id,
+            "kb_id": (kb or {}).get("id"),
             "memories_written": memories_written,
         }
     except HTTPException:
@@ -427,13 +450,43 @@ def chat_sync(
 
 
 # =========================== Ingest ===========================
+def _resolve_kb(user: User, cfg: Dict[str, Any], kb_id: Optional[str]) -> Dict[str, str]:
+    """解析本次写入的目标知识库。
+
+    返回**脱离 ORM 会话的普通 dict**（id / name / collection_name）——
+    直接把 ORM 对象带出 ``SessionLocal()`` 会在属性访问时抛
+    ``DetachedInstanceError``。
+
+    ``kb_id`` 为空时落到默认知识库（保证老客户端行为不变）。
+    """
+    from src.db.database import SessionLocal
+    from src.kb_service import KBError, ensure_default_kb, get_kb
+
+    db = SessionLocal()
+    try:
+        if kb_id:
+            try:
+                kb = get_kb(db, user.id, kb_id)
+            except KBError as exc:
+                raise HTTPException(status_code=404, detail=str(exc)) from exc
+        else:
+            kb = ensure_default_kb(db, user.id, cfg)
+        return {"id": kb.id, "name": kb.name, "collection_name": kb.collection_name}
+    finally:
+        db.close()
+
+
 @router.post("/api/v1/ingest", tags=["文档"])
 async def ingest_file(
     file: UploadFile = File(...),
     version: bool = False,
+    kb_id: Optional[str] = Form(None),
     current_user: User = Depends(get_current_user),
 ) -> Dict[str, Any]:
     """上传文件并入库。需要认证。
+
+    ``kb_id`` 指定写入哪个知识库，缺省写入**默认知识库**（行为与之前一致）。
+    每个知识库有独立的向量 collection，互不干扰。
 
     安全（P5 审计修复）：
     - 扩展名白名单在写盘前校验；
@@ -464,15 +517,18 @@ async def ingest_file(
             标题/层级/更新时间/权限在 enrich_file 中抽取；过期/草稿/权限
             不清的内容被 DataGate 拒绝（拒绝原因返回给调用方便于整改）。
             """
+            ocr_cfg = cfg.get("document_loader", {}).get("ocr") or {}
             docs = enrich_file(
                 temp_path,
                 default_acl=cfg.get("data_quality", {}).get("default_acl", "*"),
+                ocr_cfg=ocr_cfg,
             )
             if not docs:
                 docs = load_document(
                     temp_path,
                     pdf_engine=cfg["document_loader"].get("pdf_engine", "pdfplumber"),
                     encoding=cfg["document_loader"].get("encoding", "utf-8"),
+                    ocr_cfg=ocr_cfg,
                 )
             chunks, report = run_data_pipeline(docs, cfg, splitter)
             report["docs"] = len(docs)
@@ -489,7 +545,11 @@ async def ingest_file(
                 )
             raise HTTPException(status_code=400, detail="文件解析后没有可用内容")
 
-        store = TenantAwareFactory.get_chroma_store(user.id, cfg)
+        # 知识库隔离：写入目标知识库专属的 collection
+        kb = _resolve_kb(user, cfg, kb_id)
+        for c in all_chunks:
+            c.metadata["kb_id"] = kb["id"]
+        store = TenantAwareFactory.get_chroma_store_by_name(kb["collection_name"], cfg)
 
         def _replace_and_add() -> int:
             _delete_stale_chunks(store, [str(c.metadata.get("source") or c.metadata.get("filepath") or "unknown") for c in all_chunks])
@@ -505,6 +565,10 @@ async def ingest_file(
         db = SessionLocal()
         try:
             _register_documents(db, user.id, all_chunks, report)
+            # 刷新知识库的文档数/分块数（知识库列表与详情页要展示）
+            from src.kb_service import refresh_kb_stats
+
+            refresh_kb_stats(db, user.id, kb["id"])
         finally:
             db.close()
 
@@ -519,6 +583,127 @@ async def ingest_file(
         raise
     except Exception as exc:
         logger.error("文件入库失败: %s", exc)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+class IngestURLBody(BaseModel):
+    """网页入库请求。"""
+    url: str = Field(..., min_length=4, description="网页地址（可省略协议，默认 https）")
+    title: Optional[str] = Field(None, description="自定义标题，默认取网页 <title>")
+    kb_id: Optional[str] = Field(None, description="目标知识库，缺省为默认知识库")
+    timeout: float = Field(15.0, ge=1.0, le=60.0, description="抓取超时（秒）")
+
+
+@router.post("/api/v1/ingest/url", tags=["文档"])
+async def ingest_url(
+    body: IngestURLBody,
+    current_user: User = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """抓取网页正文并入库。需要认证。
+
+    安全（SSRF 防护，实现见 ``src/web_loader.py``）：
+
+    - 仅允许 http / https 协议；
+    - **校验域名解析后的 IP**，拒绝内网 / 回环 / 链路本地 / 保留地址 ——
+      只校验域名会被 DNS rebinding（``evil.com`` → ``127.0.0.1``）绕过；
+    - 重定向**逐跳**复检，避免"公网地址 302 到内网"；
+    - 限制响应体大小与 Content-Type，拒绝二进制。
+
+    说明：以最终 URL 作为 ``source``，同一页面重复导入会覆盖旧分块而不是堆积。
+    """
+    user: User = current_user
+    try:
+        cfg = get_runtime_config()
+        url_cfg = (cfg.get("document_loader") or {}).get("url") or {}
+        allow_private = bool(url_cfg.get("allow_private", False))
+
+        from src.document_loader import Document
+        from src.web_loader import WebFetchError, fetch_and_extract
+
+        def _fetch() -> Dict[str, Any]:
+            return fetch_and_extract(
+                body.url,
+                timeout=body.timeout,
+                max_bytes=int(url_cfg.get("max_bytes", 5 * 1024 * 1024)),
+                allow_private=allow_private,
+                max_chars=int(url_cfg.get("max_chars", 200000)),
+            )
+
+        try:
+            page = await run_in_threadpool(_fetch)
+        except WebFetchError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        title = (body.title or page["title"] or page["url"]).strip()
+        source = page["final_url"] or page["url"]
+        docs = [
+            Document(
+                page=1,
+                content=page["text"],
+                metadata={
+                    "source": source,
+                    "filepath": source,
+                    "filename": title,
+                    "title": title,
+                    "ext": ".url",
+                    "url": page["url"],
+                    "final_url": source,
+                    "acl": cfg.get("data_quality", {}).get("default_acl", "*"),
+                },
+            )
+        ]
+
+        splitter = get_splitter(cfg)
+        chunks, report = await run_in_threadpool(run_data_pipeline, docs, cfg, splitter)
+        report["docs"] = len(docs)
+        if not chunks:
+            gate = report.get("gate", {})
+            if gate.get("rejected"):
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"内容未通过数据准入门：{gate.get('reasons', {})}",
+                )
+            raise HTTPException(status_code=400, detail="网页正文为空，无法入库")
+
+        # 知识库隔离：写入目标知识库专属的 collection
+        kb = _resolve_kb(user, cfg, body.kb_id)
+        for c in chunks:
+            c.metadata["kb_id"] = kb["id"]
+        store = TenantAwareFactory.get_chroma_store_by_name(kb["collection_name"], cfg)
+
+        # 配额校验：现有块数 + 新增块数 <= 套餐上限
+        existing = await run_in_threadpool(store.count)
+        check_chunk_quota(user, existing, len(chunks))
+
+        def _replace_and_add() -> int:
+            _delete_stale_chunks(store, [source])
+            return store.add_chunks(chunks)
+
+        n = await run_in_threadpool(_replace_and_add)
+
+        db = SessionLocal()
+        try:
+            _register_documents(db, user.id, chunks, report)
+            from src.kb_service import refresh_kb_stats
+
+            refresh_kb_stats(db, user.id, kb["id"])
+        finally:
+            db.close()
+
+        return {
+            "url": page["url"],
+            "final_url": source,
+            "title": title,
+            "chars": int(page["chars"]),
+            "docs": len(docs),
+            "chunks": len(chunks),
+            "ingested": n,
+            "data_quality": report,
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("网页入库失败: %s", exc)
         raise HTTPException(status_code=500, detail=str(exc))
 
 
@@ -559,6 +744,7 @@ async def ingest_directory(
                     target,
                     pdf_engine=cfg["document_loader"].get("pdf_engine", "pdfplumber"),
                     recursive=recursive,
+                    ocr_cfg=cfg.get("document_loader", {}).get("ocr") or {},
                     encoding=cfg["document_loader"].get("encoding", "utf-8"),
                 )
             chunks, report = run_data_pipeline(docs, cfg, splitter)
@@ -609,35 +795,45 @@ async def ingest_directory(
 # =========================== WebSocket Chat ===========================
 @router.websocket("/ws/chat")
 async def websocket_chat(websocket: WebSocket, token: Optional[str] = None):
-    """WebSocket 流式问答（兼容旧前端路径）。
+    """WebSocket 流式问答。
 
-    安全：必须携带有效 JWT（``?token=``），否则拒绝连接——避免匿名会话
-    落到 admin 全局知识库上。
+    认证策略与 HTTP 路径完全一致（见 :mod:`src.middleware.auth`）：
+
+    - **未启用认证（默认，单用户本地模式）**：不要求 token，直接绑定本地用户；
+    - 启用认证时：必须携带有效 **access** token（``?token=``）。
 
     P1.3：通过 ``AsyncLLMExecutor.semaphore`` 限制并发 LLM 调用，避免
     单实例下被并发 WS 流量击穿。
     """
-    from src.auth.jwt_handler import decode_token
+    from src.middleware.auth import auth_enabled, get_local_user
 
-    payload = decode_token(token) if token else None
-    if not payload or not payload.get("sub"):
-        await websocket.close(code=4401)  # 未认证
-        return
-    user_id = payload["sub"]
-
-    await websocket.accept()
-    # 加载一次用户并校验状态（配额校验需要 max_queries_per_day）
     db = SessionLocal()
     try:
-        ws_user = db.query(User).filter(User.id == user_id).first()
-        if ws_user is None or not ws_user.is_active:
-            await websocket.close(code=4403)  # 用户不存在或已禁用
-            return
+        if auth_enabled():
+            from src.auth.jwt_handler import decode_token
+
+            payload = decode_token(token) if token else None
+            # 必须同时校验 type == "access"：refresh token（7 天有效期）若能直接
+            # 建立 WS 连接，就变相绕过了 access token 的 30 分钟有效期。
+            if not payload or not payload.get("sub") or payload.get("type") != "access":
+                await websocket.close(code=4401)  # 未认证
+                return
+            # 加载一次用户并校验状态（配额校验需要 max_queries_per_day）
+            ws_user = db.query(User).filter(User.id == payload["sub"]).first()
+            if ws_user is None or not ws_user.is_active:
+                await websocket.close(code=4403)  # 用户不存在或已禁用
+                return
+        else:
+            ws_user = get_local_user(db)
+
+        user_id = ws_user.id
+        await websocket.accept()
         while True:
             data = await websocket.receive_json()
             query = data.get("query", "")
             top_k = data.get("top_k", 4)
             session_id = str(data.get("session_id") or "default")
+            kb_id = data.get("kb_id")
 
             if not query:
                 await websocket.send_json({"event": "error", "data": "query is required"})
@@ -653,9 +849,20 @@ async def websocket_chat(websocket: WebSocket, token: Optional[str] = None):
             executor = get_llm_executor()
             started = time.perf_counter()
 
+            # 指定知识库时在该库内检索（与 /api/v1/chat 行为一致）
+            kb = None
+            if kb_id:
+                try:
+                    kb = _resolve_kb(ws_user, get_runtime_config(), kb_id)
+                except HTTPException as kb_exc:
+                    await websocket.send_json(
+                        {"event": "error", "data": str(kb_exc.detail)}
+                    )
+                    continue
+
             # 长期记忆：显式"记住"指令先行落库（失败/替身缺失均不影响问答）
             try:
-                pipeline_probe: RAGPipeline = get_runtime_pipeline(user_id=user_id)
+                pipeline_probe: RAGPipeline = get_runtime_pipeline(user_id=user_id, kb=kb)
                 lt_probe = getattr(pipeline_probe, "long_term_store", None)
                 if lt_probe is not None:
                     lt_probe.maybe_remember_from_message(user_id, query)
@@ -667,7 +874,7 @@ async def websocket_chat(websocket: WebSocket, token: Optional[str] = None):
 
             # P1.3：semaphore 保护，避免并发 WS 流量击穿 LLM
             async def _run():
-                pipeline: RAGPipeline = get_runtime_pipeline(user_id=user_id)
+                pipeline: RAGPipeline = get_runtime_pipeline(user_id=user_id, kb=kb)
                 async for event in pipeline.astream_answer(
                     query,
                     top_k=top_k,
@@ -691,6 +898,20 @@ async def websocket_chat(websocket: WebSocket, token: Optional[str] = None):
                 # 回写即时记忆
                 SESSION_MEMORY.append(user_id, session_id, "user", query)
                 SESSION_MEMORY.append(user_id, session_id, "assistant", answer_buf["text"])
+
+                # 会话持久化：session_id 指向真实会话时落库（与 /api/v1/chat 对齐）
+                if session_id and session_id != "default" and answer_buf["text"]:
+                    try:
+                        from src.kb_service import KBError, append_message
+
+                        append_message(db, user_id, session_id, "user", query)
+                        append_message(
+                            db, user_id, session_id, "assistant", answer_buf["text"]
+                        )
+                    except KBError:
+                        pass
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("WS 会话消息落库失败（已忽略）: %s", exc)
                 record_usage(
                     db,
                     ws_user.id,

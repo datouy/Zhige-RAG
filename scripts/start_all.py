@@ -77,8 +77,19 @@ def kill_port(port: int) -> None:
 
 
 def main() -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="知阁 Zhige 一键启动")
+    parser.add_argument(
+        "--with-streamlit",
+        action="store_true",
+        help="额外启动 Streamlit 控制台（8501）。默认不启动 —— Web 界面已由 "
+             "FastAPI 在 8000 端口直接提供，Streamlit 已降级为开发调试工具。",
+    )
+    args = parser.parse_args()
+
     print("=" * 56)
-    print("  ChineseRAGKB 一键启动")
+    print("  知阁 Zhige 一键启动")
     print("=" * 56)
 
     # 确认 venv
@@ -123,24 +134,31 @@ def main() -> int:
         print("超时！请查看 logs\\backend.log")
 
     # 2. 前端
-    print("\n[2/4] 启动前端 Streamlit (端口 8501) ...")
-    frontend_log = LOG_DIR / "frontend.log"
-    frontend_proc = run(
-        [str(VENV_PY), "-m", "streamlit", "run", "ui/app.py",
-         "--server.port", "8501",
-         "--server.address", "0.0.0.0",
-         "--server.headless=true",
-         "--browser.gatherUsageStats=false"],
-        env=frontend_env,
-        cwd=str(ROOT),
-        stdout=open(frontend_log, "w", encoding="utf-8"),
-        stderr=subprocess.STDOUT,
-    )
-    print("  等待前端就绪 ...", end=" ", flush=True)
-    if wait_port("127.0.0.1", 8501, timeout=60):
-        print("OK")
+    #    默认只跑 Web 界面 —— 它由 FastAPI 直接挂载在 8000 端口（ui/web），
+    #    不需要额外进程。Streamlit 已降级为开发调试工具，需要时显式开启。
+    frontend_proc = None
+    if args.with_streamlit:
+        print("\n[2/4] 启动 Streamlit 控制台 (端口 8501) ...")
+        frontend_log = LOG_DIR / "frontend.log"
+        frontend_proc = run(
+            [str(VENV_PY), "-m", "streamlit", "run", "ui/app.py",
+             "--server.port", "8501",
+             "--server.address", "0.0.0.0",
+             "--server.headless=true",
+             "--browser.gatherUsageStats=false"],
+            env=frontend_env,
+            cwd=str(ROOT),
+            stdout=open(frontend_log, "w", encoding="utf-8"),
+            stderr=subprocess.STDOUT,
+        )
+        print("  等待前端就绪 ...", end=" ", flush=True)
+        if wait_port("127.0.0.1", 8501, timeout=60):
+            print("OK")
+        else:
+            print("超时！请查看 logs\\frontend.log")
     else:
-        print("超时！请查看 logs\\frontend.log")
+        print("\n[2/4] Web 界面已随 FastAPI 提供 → http://localhost:8000")
+        print("      跳过 Streamlit（需要调试界面时加 --with-streamlit）")
 
     # 3. LLM 预加载（可选：仅当 scripts/preload_llm.py 存在时执行；失败不影响主服务）
     preload_proc = None
@@ -173,18 +191,21 @@ def main() -> int:
     print("=" * 56)
     print()
     print("  本机访问 (推荐):")
-    print("    后端 API : http://localhost:8000")
+    print("    打开知阁 : http://localhost:8000")
     print("    API 文档 : http://localhost:8000/docs")
-    print("    前端 UI  : http://localhost:8501")
+    if args.with_streamlit:
+        print("    Streamlit: http://localhost:8501（调试用）")
     if lan_ip:
         print()
         print("  局域网访问 (同 WiFi / 内网):")
-        print(f"    后端 API : http://{lan_ip}:8000")
-        print(f"    前端 UI  : http://{lan_ip}:8501")
+        print(f"    打开知阁 : http://{lan_ip}:8000")
+        if args.with_streamlit:
+            print(f"    Streamlit: http://{lan_ip}:8501")
     print()
     print("  日志文件:")
     print("    logs\\backend.log")
-    print("    logs\\frontend.log")
+    if args.with_streamlit:
+        print("    logs\\frontend.log")
     print("    logs\\preload.log")
     print()
     print("  关闭方式:")
@@ -194,7 +215,7 @@ def main() -> int:
     # 自动开浏览器
     def _open_browser():
         time.sleep(3)
-        webbrowser.open("http://localhost:8501")
+        webbrowser.open("http://localhost:8000")
     threading.Thread(target=_open_browser, daemon=True).start()
 
     print("  3 秒后自动打开浏览器 ...")
@@ -204,7 +225,9 @@ def main() -> int:
         print("  按 Ctrl+C 停止所有服务 ...")
         # 等待子进程。preload 是 best-effort，失败不影响主服务；
         # 只有 backend/frontend 才是关键服务。
-        critical = [backend_proc, frontend_proc]
+        # frontend 可能未启动（默认不跑 Streamlit），必须过滤掉 None，
+        # 否则下面的 p.poll() 会直接抛 AttributeError。
+        critical = [p for p in (backend_proc, frontend_proc) if p is not None]
         while True:
             time.sleep(5)
             for p in critical:

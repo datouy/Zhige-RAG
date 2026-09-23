@@ -1,78 +1,34 @@
-﻿# ========== 核心框架 ==========
-# Python 3.11+ 推荐 (用于 Docker)
-torch>=2.0.0,<2.5.0
-transformers>=4.40.0,<4.46.0
-accelerate>=0.27.0,<0.35.0
-safetensors>=0.4.0
-tokenizers>=0.15.0
-sentencepiece>=0.2.0
+﻿# ============================================================
+# ChineseRAGKB 依赖总表
+# ============================================================
+# 本文件通过 -r 引用分组文件，是"全量安装"的入口。
+# 各分组才是依赖的唯一真实来源，避免同一份清单在多个文件里漂移。
+#
+# ⚠️ 不建议无脑全量安装 —— 光 torch 就有 2~3 GB。按需选择：
+#
+#   【最快跑起来，完全不需要 GPU】用 Ollama 或云端 API 作为模型后端
+#       pip install -r requirements-core.txt
+#       pip install -r requirements-optional.txt     # 需要解析 PDF/Word 时
+#
+#   【完全本地推理（无网 / 数据不出内网）】
+#       pip install -r requirements-core.txt -r requirements-local.txt
+#
+#   【有 NVIDIA GPU，想用 4bit 量化省显存】
+#       pip install -r requirements-gpu.txt          # 单独装，见文件内说明
+#
+#   【开发与测试】
+#       pip install -r requirements-core.txt -r requirements-dev.txt
+#
+# 装完请执行环境自检，它会直接告诉你还缺什么、模型能不能用：
+#       python scripts/doctor.py
+# ============================================================
 
-# ========== FastAPI Web 服务 ==========
-fastapi>=0.110.0
-uvicorn[standard]>=0.29.0
-websockets>=12.0
-python-multipart>=0.0.9
-aiofiles>=23.3.0
-pydantic>=2.0.0
+-r requirements-core.txt
+-r requirements-local.txt
+-r requirements-optional.txt
 
-# ========== 多租户认证 ==========
-# JWT 使用 pyjwt，密码哈希使用 bcrypt（代码中直接依赖）
-sqlalchemy>=2.0.0
-bcrypt>=4.0.0
-pyjwt>=2.8.0
-email-validator>=2.0.0
-
-# ========== 数据库迁移 ==========
-alembic>=0.9.0
-
-# ========== 量化（4bit）==========
-# Windows 上 bitsandbytes >= 0.43 支持 CUDA 11.8+；CPU-only 可跳过
-bitsandbytes>=0.43.0
-
-# ========== Embedding ==========
-sentence-transformers>=2.7.0
-# FlagEmbedding 可选（用于 Reranker）
-FlagEmbedding>=1.2.0
-
-# ========== 向量库 ==========
-chromadb>=0.4.24,<0.6.0
-# 在某些 Linux 上 chromadb 需要更新的 sqlite，可选安装
-# pysqlite3-binary; sys.modules['sqlite3'] = sys.modules.pop('pysqlite3')
-
-# ========== 中文分词（BM25 混合检索用；未安装时自动回退字符 bigram） ==========
-jieba>=0.42.1
-
-# ========== 文档解析 ==========
-pdfplumber>=0.10.0
-pypdf>=4.0.0
-python-docx>=1.1.0
-markdown>=3.6
-beautifulsoup4>=4.12.0
-lxml>=4.9.0
-
-# ========== 工具与可视化 ==========
-streamlit>=1.32.0,<1.40.0
-PyYAML>=6.0
-tiktoken>=0.5.0
-numpy>=1.24.0,<3.0.0
-python-dotenv>=1.0.0
-
-# ========== 评估（可选）==========
-rank-bm25>=0.2.2
-
-# ========== 测试 ==========
-pytest>=8.0.0
-pytest-cov>=4.1.0
-filelock>=3.12.0  # P3.3: scripts/preload_llm.py 单飞行锁
-
-# ========== Docker & Production ==========
-slowapi>=0.1.9
-
-# ========== 健康检查 / 指标 ==========
-# /api/health 依赖 psutil；未安装时健康检查直接 500，k8s 探针会全部失败
-psutil>=5.9.0
-prometheus-client>=0.19.0
-
-# ========== 指标可视化（📊 页面）==========
-plotly>=5.18,<6.0
-kaleido>=0.2.1   # 可选：导出静态图（PNG/SVG）
+# 说明：requirements-gpu.txt（bitsandbytes）未纳入本文件 ——
+# 它只在 NVIDIA CUDA 环境可用，纳入后会让大量 CPU / Windows 机器安装失败，
+# 属于"开箱即用"的硬伤。需要时显式安装：pip install -r requirements-gpu.txt
+#
+# 开发依赖（pytest / ruff）同样不纳入：pip install -r requirements-dev.txt

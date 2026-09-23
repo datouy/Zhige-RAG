@@ -174,7 +174,9 @@ async def websocket_agent(websocket: WebSocket, token: Optional[str] = None):
     from src.auth.jwt_handler import decode_token
 
     payload = decode_token(token) if token else None
-    if not payload or not payload.get("sub"):
+    # 同 chat.py：必须校验 type == "access"，否则 7 天期的 refresh token
+    # 也能直接建立 WS 连接。
+    if not payload or not payload.get("sub") or payload.get("type") != "access":
         await websocket.close(code=4401)  # 未认证
         return
     user_id = payload["sub"]

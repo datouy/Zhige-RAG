@@ -64,79 +64,33 @@ class QuestionRecord:
 # LLM 客户端
 # ----------------------------------------------------------------------
 class _LLMClient:
-    """轻量 LLM 客户端，适配本地 / OpenAI-compatible / Ollama。"""
+    """LLM 客户端薄封装 —— 统一走 :mod:`src.llm_provider`。
+
+    本类此前自己实现了一套 local / openai 分支，**ollama 分支从未实现**
+    （调用即抛"LLM 客户端未就绪"），且与主链路重复、注定逐渐漂移。
+    现在只保留一层适配：把统一的 ``chat()`` 接口包装成本脚本需要的
+    ``generate(prompt, temperature, max_tokens)`` 形式，调用方无需改动。
+    """
 
     def __init__(self, cfg: Dict[str, Any]) -> None:
-        llm_cfg = cfg.get("llm") or {}
+        from src.llm_provider import create_llm
+
         backend = (cfg.get("synthesize") or {}).get("default_backend", "local")
         self.backend = backend
+        llm_cfg = dict(cfg.get("llm") or {})
+        # 命令行 / 配置指定的后端优先；base_url、model、api_key 仍沿用 llm 段
+        llm_cfg["backend"] = backend
         self.model_name = llm_cfg.get("model_name", "")
-        self.openai_api_base = llm_cfg.get("openai_api_base", "http://localhost:11434/v1")
-        self._client = None
-        self._local_llm = None
-
-        if backend == "openai":
-            try:
-                from openai import OpenAI  # type: ignore
-
-                self._client = OpenAI(
-                    api_key=llm_cfg.get("openai_api_key") or "sk-placeholder",
-                    base_url=self.openai_api_base,
-                )
-            except Exception as exc:
-                logger.warning("OpenAI 客户端初始化失败，回退到本地模式: %s", exc)
-                self.backend = "local"
-
-        if backend == "local":
-            self._load_local(llm_cfg)
-
-    def _load_local(self, llm_cfg: Dict[str, Any]) -> None:
-        try:
-            from src.llm import LocalLLM
-
-            self._local_llm = LocalLLM(
-                model_name=self.model_name,
-                device=llm_cfg.get("device", "auto"),
-                device_map=llm_cfg.get("device_map", "auto"),
-                torch_dtype=llm_cfg.get("torch_dtype", "auto"),
-                quant=llm_cfg.get("quantization"),
-                cache_dir=llm_cfg.get("cache_dir"),
-                generation=llm_cfg.get("generation"),
-                chat_template=llm_cfg.get("chat_template", "auto"),
-                local_files_only=llm_cfg.get("local_files_only", False),
-                trust_remote_code=llm_cfg.get("trust_remote_code", False),
-            )
-        except Exception as exc:
-            logger.error("本地 LLM 初始化失败: %s", exc)
-            raise RuntimeError(f"本地 LLM 初始化失败: {exc}") from exc
+        self._llm = create_llm(llm_cfg)
 
     def generate(self, prompt: str, temperature: float = 0.1, max_tokens: int = 256) -> str:
-        if self.backend == "openai" and self._client:
-            try:
-                completion = self._client.chat.completions.create(
-                    model=self.model_name,
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                )
-                text = completion.choices[0].message.content or ""
-                return text.strip()
-            except Exception as exc:
-                logger.warning("OpenAI 接口调用失败: %s", exc)
-                if self._local_llm:
-                    return self._local_llm.chat(
-                        [{"role": "user", "content": prompt}],
-                        generation=None,
-                        stream=False,
-                    ).strip()
-                raise
-        if self._local_llm:
-            return self._local_llm.chat(
-                [{"role": "user", "content": prompt}],
-                generation=None,
-                stream=False,
-            ).strip()
-        raise RuntimeError("LLM 客户端未就绪")
+        from src.llm import GenerationConfig
+
+        gen = GenerationConfig(max_new_tokens=max_tokens, temperature=temperature)
+        result = self._llm.chat(
+            [{"role": "user", "content": prompt}], generation=gen, stream=False
+        )
+        return str(result).strip()
 
 
 # ----------------------------------------------------------------------

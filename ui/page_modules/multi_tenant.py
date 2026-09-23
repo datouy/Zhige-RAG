@@ -4,7 +4,7 @@ import streamlit as st
 from typing import Optional
 
 # 页面配置已在 app.py 的 main() 函数中统一处理
-# st.set_page_config(page_title="中文知识库 RAG - 多知识库", page_icon="📚", layout="wide")
+# st.set_page_config(page_title="知阁 · 本地知识库 - 多知识库", page_icon="📚", layout="wide")
 
 
 def init_session_state():
@@ -115,7 +115,7 @@ def render_onboarding_wizard():
     if st.session_state.get("is_logged_in") and st.session_state.get("user_kbs"):
         return  # 已完成引导
 
-    st.title("🎉 欢迎使用中文知识库 RAG 系统")
+    st.title("🎉 欢迎使用知阁 · 本地知识库 系统")
     st.markdown("---")
 
     step = st.session_state.get("onboarding_step", 1)

@@ -1,0 +1,49 @@
+# ============================================================
+# 核心依赖 —— 不装这些，服务起不来
+# ============================================================
+# 无论用哪种 LLM 后端（local / ollama / openai）都必须安装。
+# 只想最快跑起来？执行：
+#     pip install -r requirements-core.txt
+# 然后选 Ollama 或云端 API 作为后端（见 README「三种跑法」）。
+# ============================================================
+
+# ---------- Web 服务 ----------
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+websockets>=12.0
+python-multipart>=0.0.9
+aiofiles>=23.3.0
+
+# ---------- 数据校验 / ORM ----------
+pydantic>=2.0.0
+sqlalchemy>=2.0.0
+
+# ---------- 认证 ----------
+# JWT 用 pyjwt，密码哈希用 bcrypt（代码中直接依赖）
+pyjwt>=2.8.0
+bcrypt>=4.0.0
+email-validator>=2.0.0
+
+# ---------- 数据库迁移 ----------
+alembic>=0.9.0
+
+# ---------- 向量库 ----------
+chromadb>=0.4.24,<0.6.0
+# 某些 Linux 上 chromadb 需要更新的 sqlite，可选：
+# pysqlite3-binary; sys.modules['sqlite3'] = sys.modules.pop('pysqlite3')
+
+# ---------- 中文分词（BM25 混合检索）----------
+# 未安装时代码会自动回退到字符 bigram，但检索质量下降，建议安装。
+jieba>=0.42.1
+
+# ---------- 基础工具 ----------
+PyYAML>=6.0
+numpy>=1.24.0,<3.0.0
+python-dotenv>=1.0.0
+tiktoken>=0.5.0
+filelock>=3.12.0          # scripts/preload_llm.py 单飞行锁
+
+# ---------- 限流 / 健康检查 / 指标 ----------
+slowapi>=0.1.9
+psutil>=5.9.0             # /api/health 依赖；缺失会导致 k8s 探针全部失败
+prometheus-client>=0.19.0

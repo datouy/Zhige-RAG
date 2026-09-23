@@ -172,12 +172,16 @@ async def lifespan(app: FastAPI):
                 handler.flush()
 
         try:
-            from src.utils.circuit_breaker import reset_all_circuit_breakers
+            # 注意：模块已从 src/utils/circuit_breaker.py 迁移到
+            # src/circuit_breaker.py。原路径不可达——src/utils.py 是普通模块，
+            # src/utils/ 目录（无 __init__.py）会被它遮蔽，导致子模块无法导入，
+            # 这里的重置逻辑此前被 except ImportError 静默吞掉、从未执行。
+            from src.circuit_breaker import reset_all_circuit_breakers
 
             reset_all_circuit_breakers()
             logger.info("熔断器状态已重置")
-        except ImportError:
-            pass
+        except ImportError as cb_err:
+            logger.warning("熔断器模块导入失败，跳过重置: %s", cb_err)
 
         logger.info("ChineseRAGKB API 关闭完成")
         logger.info("=" * 50)
@@ -187,8 +191,8 @@ async def lifespan(app: FastAPI):
 
 # =========================== 应用实例 ===========================
 app = FastAPI(
-    title="ChineseRAGKB API",
-    description="中文知识库 RAG 系统的 FastAPI 接口，支持多租户",
+    title="知阁 Zhige API",
+    description="知阁（Zhige）—— 本地中文知识库 RAG 平台，支持多租户与多模型后端",
     version="0.3.0",
     lifespan=lifespan,
 )
@@ -223,14 +227,24 @@ app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # CORS
-_allowed_origins = os.getenv("ALLOWED_ORIGINS", "").split(",")
-if _allowed_origins == [""] or _allowed_origins == ["*"]:
-    _allowed_origins = [
+_origins = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "").split(",") if o.strip()]
+if "*" in _origins:
+    # "*" 与 allow_credentials=True 组合时，浏览器会允许任意站点携带凭证，
+    # 属高危配置。此前只处理"整个值就等于 *"的情况，写成
+    # "https://a.com,*" 会漏网。这里统一剔除通配符。
+    logger.warning(
+        "ALLOWED_ORIGINS 含通配符 '*'，与 allow_credentials=True 冲突，已剔除；"
+        "请显式列出允许的源。"
+    )
+    _origins = [o for o in _origins if o != "*"]
+if not _origins:
+    _origins = [
         "http://localhost:8501",
         "http://127.0.0.1:8501",
         "http://127.0.0.1:8000",
         "http://localhost:8000",
     ]
+_allowed_origins = _origins
 
 app.add_middleware(
     CORSMiddleware,
@@ -248,7 +262,9 @@ from api.routes import (
     chat_router,
     eval_router,
     feedback_router,
+    kb_router,
     kg_router,
+    settings_router,
     subscription_router,
     system_router,
 )
@@ -258,6 +274,8 @@ from api.routes import (
 app.include_router(auth_router)
 app.include_router(subscription_router)
 app.include_router(system_router)
+app.include_router(settings_router)
+app.include_router(kb_router)
 app.include_router(chat_router)
 app.include_router(kg_router)
 app.include_router(agent_router)

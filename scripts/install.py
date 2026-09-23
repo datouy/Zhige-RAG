@@ -28,7 +28,7 @@ def step(n: int, total: int, msg: str) -> None:
 
 def main() -> int:
     print("=" * 56)
-    print("  ChineseRAGKB 一键安装 (Windows)")
+    print("  知阁 Zhige 一键安装 (Windows)")
     print("=" * 56)
 
     # 1. Python

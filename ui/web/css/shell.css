@@ -1,0 +1,328 @@
+/* ===========================
+   知阁 · 应用外壳样式（侧边栏 + 主区 + 登录）
+   与 main.css 共用 CSS 变量；仅为新布局追加，不覆盖旧页面。
+   =========================== */
+
+/* ---------- 通用小工具 ---------- */
+.btn-block { width: 100%; }
+.btn-ghost {
+    background: transparent;
+    color: var(--text-muted);
+    border: 1px solid transparent;
+}
+.btn-ghost:hover { background: var(--border); color: var(--text); }
+.muted { color: var(--text-muted); }
+.small { font-size: 0.82rem; }
+
+/* 顶部提示条 */
+#alert-container {
+    position: fixed;
+    top: 16px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 9999;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    pointer-events: none;
+}
+#alert-container .alert {
+    pointer-events: auto;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.12);
+    max-width: 520px;
+}
+
+/* ---------- 登录 / 注册 ---------- */
+.auth-overlay {
+    position: fixed;
+    inset: 0;
+    background: linear-gradient(135deg, #eff6ff 0%, #f8fafc 60%);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 1000;
+    padding: 1rem;
+}
+.auth-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    box-shadow: 0 10px 40px rgba(15, 23, 42, 0.10);
+    padding: 2rem 1.75rem;
+    width: 100%;
+    max-width: 380px;
+}
+.auth-brand { font-size: 1.6rem; font-weight: 700; text-align: center; }
+.auth-sub {
+    text-align: center;
+    color: var(--text-muted);
+    font-size: 0.85rem;
+    margin: 0.35rem 0 1.4rem;
+}
+.auth-tabs {
+    display: flex;
+    background: var(--bg);
+    border-radius: var(--radius);
+    padding: 4px;
+    margin-bottom: 1rem;
+}
+.auth-tab {
+    flex: 1;
+    border: none;
+    background: transparent;
+    padding: 0.5rem;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 0.92rem;
+    color: var(--text-muted);
+    transition: all 0.15s;
+}
+.auth-tab.active {
+    background: var(--surface);
+    color: var(--primary);
+    font-weight: 600;
+    box-shadow: var(--shadow);
+}
+.auth-body { display: flex; flex-direction: column; gap: 0.7rem; }
+.auth-body input {
+    padding: 0.65rem 0.8rem;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    font-size: 0.95rem;
+    outline: none;
+    transition: border-color 0.15s;
+}
+.auth-body input:focus { border-color: var(--primary); }
+.auth-error {
+    color: var(--error);
+    font-size: 0.85rem;
+    min-height: 1.2rem;
+    text-align: center;
+}
+
+/* ---------- 应用布局 ---------- */
+.app-layout {
+    display: grid;
+    grid-template-columns: 260px 1fr;
+    height: 100vh;
+    overflow: hidden;
+}
+
+/* ---------- 侧边栏 ---------- */
+.sidebar {
+    background: var(--surface);
+    border-right: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+}
+.sidebar-brand {
+    padding: 1rem 1rem 0.75rem;
+    font-size: 1.05rem;
+    font-weight: 700;
+    border-bottom: 1px solid var(--border);
+}
+.sidebar-section {
+    padding: 0.75rem 0.6rem;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+}
+.sidebar-section.grow { flex: 1; overflow: hidden; }
+.section-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 0.4rem 0.5rem;
+    font-size: 0.78rem;
+    font-weight: 600;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+}
+.icon-btn {
+    border: none;
+    background: transparent;
+    color: var(--text-muted);
+    font-size: 1rem;
+    cursor: pointer;
+    line-height: 1;
+    padding: 2px 6px;
+    border-radius: 4px;
+}
+.icon-btn:hover { background: var(--bg); color: var(--primary); }
+
+.list {
+    list-style: none;
+    overflow-y: auto;
+    flex: 1;
+    min-height: 0;
+}
+.list-empty {
+    color: var(--text-muted);
+    font-size: 0.82rem;
+    padding: 0.6rem 0.5rem;
+}
+.list-item {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 0.45rem 0.5rem;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 0.88rem;
+    transition: background 0.12s;
+}
+.list-item:hover { background: var(--bg); }
+.list-item.active { background: #e0edff; color: var(--primary); font-weight: 600; }
+.item-main {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.item-meta { font-size: 0.72rem; color: var(--text-muted); }
+.item-del, .item-ren {
+    border: none;
+    background: transparent;
+    color: var(--text-muted);
+    cursor: pointer;
+    font-size: 0.85rem;
+    padding: 0 3px;
+    border-radius: 4px;
+    opacity: 0;
+    transition: opacity 0.12s;
+}
+.list-item:hover .item-del,
+.list-item:hover .item-ren { opacity: 1; }
+.item-del:hover { color: var(--error); }
+.item-ren:hover { color: var(--primary); }
+
+.sidebar-foot {
+    padding: 0.7rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.45rem;
+    border-top: 1px solid var(--border);
+}
+.sidebar-foot .btn { padding: 0.5rem; font-size: 0.88rem; }
+
+/* ---------- 主区 ---------- */
+.main {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    min-height: 0;
+    background: var(--bg);
+}
+.topbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+    padding: 0.85rem 1.25rem;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+}
+.topbar-title { display: flex; align-items: baseline; gap: 0.6rem; min-width: 0; }
+.topbar-title strong { font-size: 1rem; }
+
+/* 消息区（覆盖 main.css 的居中容器设定） */
+#messages {
+    flex: 1;
+    overflow-y: auto;
+    padding: 1.25rem;
+    max-width: 900px;
+    width: 100%;
+    margin: 0 auto;
+    min-height: 0;
+}
+
+/* 输入区 */
+.composer {
+    display: flex;
+    gap: 0.6rem;
+    padding: 0.9rem 1.25rem 1.2rem;
+    background: var(--surface);
+    border-top: 1px solid var(--border);
+    max-width: 900px;
+    width: 100%;
+    margin: 0 auto;
+}
+.composer input {
+    flex: 1;
+    padding: 0.7rem 0.9rem;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    font-size: 0.95rem;
+    outline: none;
+}
+.composer input:focus { border-color: var(--primary); }
+.composer .btn { padding: 0.7rem 1.4rem; }
+
+/* 流式回答进行中的光标提示 */
+.message.assistant.streaming .message-content::after {
+    content: '▋';
+    margin-left: 2px;
+    animation: blink 1s step-end infinite;
+    color: var(--primary);
+}
+@keyframes blink { 50% { opacity: 0; } }
+
+/* 窄屏：侧边栏收起到顶部 */
+@media (max-width: 720px) {
+    .app-layout { grid-template-columns: 1fr; grid-template-rows: auto 1fr; }
+    .sidebar { max-height: 38vh; }
+    .sidebar-section.grow { max-height: 130px; }
+}
+
+/* ---------- 模型设置面板 ---------- */
+.modal-wide { max-width: 560px; }
+.modal-wide .modal-body {
+    max-height: 72vh;
+    overflow-y: auto;
+    padding: 1rem 1.25rem 1.25rem;
+}
+.settings-hint { margin-bottom: 0.6rem; line-height: 1.7; }
+.form-title {
+    font-size: 0.92rem;
+    font-weight: 700;
+    margin: 1.1rem 0 0.5rem;
+    padding-top: 0.9rem;
+    border-top: 1px solid var(--border);
+}
+.form-title:first-of-type { border-top: none; padding-top: 0; margin-top: 0.3rem; }
+.form-label {
+    display: block;
+    font-size: 0.76rem;
+    color: var(--text-muted);
+    margin: 0.45rem 0 0.2rem;
+}
+.form-control {
+    width: 100%;
+    padding: 0.5rem 0.7rem;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    font-size: 0.9rem;
+    outline: none;
+    background: var(--surface);
+    color: var(--text);
+}
+.form-control:focus { border-color: var(--primary); }
+select.form-control { cursor: pointer; }
+.remote-fields { display: flex; flex-direction: column; }
+.btn-sm { padding: 0.35rem 0.9rem; font-size: 0.82rem; margin-top: 0.6rem; }
+.settings-result {
+    margin-top: 1rem;
+    padding: 0.65rem 0.85rem;
+    border-radius: var(--radius);
+    font-size: 0.85rem;
+    line-height: 1.65;
+}
+.settings-result:empty { display: none; }
+.settings-ok { background: #dcfce7; color: #166534; }
+.settings-err { background: #fee2e2; color: #991b1b; }
+.settings-info { background: #e0edff; color: #1e40af; }
+.form-actions { display: flex; gap: 0.6rem; margin-top: 1.2rem; }
+.form-actions .btn { flex: 1; }

@@ -29,6 +29,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -48,6 +49,21 @@ from src.kg.cypher_guard import (
 from src.utils import get_logger, resolve_path
 
 logger = get_logger("api.routes.kg")
+
+
+def _ensure_within(base: Path, target: Path) -> None:
+    """确保 target 落在 base 目录内，防止任意目录被读取/索引。
+
+    与 chat.py 中的同名 helper 语义一致：用 ``Path.is_relative_to`` 做
+    路径分隔符级比较，而不是字符串前缀（``data/raw2`` 不能冒充 ``data/raw``）。
+    """
+    base_resolved = base.resolve()
+    target_resolved = target.resolve()
+    if not target_resolved.is_relative_to(base_resolved):
+        raise HTTPException(
+            status_code=403,
+            detail=f"仅允许访问数据目录内的路径（{base_resolved}）",
+        )
 
 router = APIRouter()
 
@@ -324,6 +340,10 @@ async def kg_build(
         from scripts.build_kg import build as build_fn
 
         target = resolve_path(body.dir_path)
+        # 此前只调用 resolve_path，未做边界校验：任何登录用户都能让服务端
+        # 去索引任意目录（/etc、共享盘、其他租户的 data/raw 等）。
+        # 限定在项目 data 目录内。
+        _ensure_within(resolve_path("data"), target)
         if not target.exists():
             raise HTTPException(status_code=404, detail=f"目录不存在: {body.dir_path}")
         try:

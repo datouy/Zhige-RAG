@@ -324,7 +324,8 @@ async def readiness_check():
         logger.error("就绪检查失败: %s", exc)
         return JSONResponse(
             status_code=503,
-            content={"status": "not_ready", "error": str(exc)},
+            # 不回传 str(exc)：内部路径/驱动报错会泄露给探针调用方
+            content={"status": "not_ready", "error": "readiness check failed"},
         )
 
 
@@ -344,7 +345,7 @@ async def prometheus_metrics():
         return Response(content=metrics_output, media_type=content_type)
     except Exception as exc:
         logger.error("获取 Prometheus 指标失败: %s", exc)
-        raise HTTPException(status_code=500, detail=str(exc))
+        raise HTTPException(status_code=500, detail="获取指标失败")
 
 
 @router.get("/api/v1/metrics")
@@ -375,12 +376,19 @@ async def get_metrics(current_user: User = Depends(get_current_user)):
         }
     except Exception as exc:
         logger.error("获取指标失败: %s", exc)
-        raise HTTPException(status_code=500, detail=str(exc))
+        raise HTTPException(status_code=500, detail="获取指标失败")
 
 
 @router.get("/api/v1/config")
-async def get_user_config(current_user = Depends(get_current_user)) -> Dict[str, Any]:
-    """获取当前配置（递归脱敏）。需要认证（含管理员校验由调用方 JWT 保证）。"""
+async def get_user_config(current_user: User = Depends(get_current_user)) -> Dict[str, Any]:
+    """获取全量运行时配置（递归脱敏）。
+
+    仅管理员可读。此前 docstring 声称"含管理员校验"，但实现只挂了
+    ``get_current_user``（仅表示已登录），任何普通用户都能拉取全量配置——
+    其中包含 DB URI、模型路径、内部开关等信息。
+    """
+    if not current_user.is_admin:
+        raise HTTPException(status_code=403, detail="仅管理员可访问")
     try:
         cfg = get_runtime_config()
         return _redact(cfg)
@@ -388,4 +396,4 @@ async def get_user_config(current_user = Depends(get_current_user)) -> Dict[str,
         raise
     except Exception as exc:
         logger.error("获取配置失败: %s", exc)
-        raise HTTPException(status_code=500, detail=str(exc))
+        raise HTTPException(status_code=500, detail="获取配置失败")

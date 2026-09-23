@@ -56,11 +56,22 @@ def get_cached_config(path: str = "config/config.yaml") -> Dict[str, Any]:
     说明：
     - 同一进程内，``load_config`` 只会真正解析 YAML 一次。
     - 通过 ``apply_env_overrides`` 把环境变量叠加（不变性，所以缓存安全）。
-    - 若需强制重新加载（例如配置热更新），调用 ``_reset_cached_config()``。
+    - 再叠加**界面写入的模型设置**（``config/local_overrides.yaml``，优先级最高）——
+      这样用户在界面上切换后端后无需改 config.yaml，也不用重启进程。
+    - 若需强制重新加载（如刚保存了模型设置），调用 ``_reset_cached_config()``。
     """
+    from src.settings_service import load_overrides
+    from src.utils import merge_dict
+
     cfg = load_config(path)
-    cfg = apply_env_overrides(cfg)
-    return cfg
+    # 界面写入的模型设置覆盖 config.yaml
+    overrides = load_overrides()
+    if overrides:
+        cfg = merge_dict(cfg, overrides)
+    # 环境变量最后叠加 —— 容器 / CI 场景下部署者的意图优先，也符合 12-factor。
+    # 因此若同一项同时被环境变量与界面设置指定，以环境变量为准；
+    # src.settings_service 会在保存时检测并提醒用户。
+    return apply_env_overrides(cfg)
 
 
 def _reset_cached_config() -> None:
@@ -112,22 +123,22 @@ _vector_store: Optional[ChromaStore] = None
 _singletons_lock = Lock()
 
 
-def get_embedding() -> EmbeddingModel:
-    """获取或创建全局 Embedding 实例。"""
+def get_embedding() -> Any:
+    """获取或创建全局 Embedding 实例。
+
+    后端由 ``embedding.backend`` 决定（``local`` / ``ollama`` / ``openai``），
+    实现见 :mod:`src.embeddings_provider`。返回值只需满足
+    ``encode(texts, batch_size=...) -> ndarray`` 协议即可被 ``ChromaStore`` 使用，
+    因此不再强绑 :class:`EmbeddingModel`。
+    """
     global _embedding
     if _embedding is None:
         with _singletons_lock:
             if _embedding is None:
+                from src.embeddings_provider import create_embedding
+
                 cfg = get_runtime_config()
-                _embedding = EmbeddingModel(
-                    model_name=cfg["embedding"]["model_name"],
-                    device=cfg["embedding"].get("device", "auto"),
-                    batch_size=cfg["embedding"].get("batch_size", 32),
-                    max_seq_length=cfg["embedding"].get("max_seq_length", 512),
-                    normalize=cfg["embedding"].get("normalize_embeddings", True),
-                    cache_dir=cfg["embedding"].get("cache_dir"),
-                    local_files_only=cfg["embedding"].get("local_files_only", False),
-                )
+                _embedding = create_embedding(cfg.get("embedding", {}))
     return _embedding
 
 
@@ -139,11 +150,19 @@ def get_vector_store() -> ChromaStore:
         # 不可重入，锁内调用会同线程二次加锁死锁）
         embed = get_embedding()
         cfg = get_runtime_config()
+        from src.embeddings_provider import embedding_collection_name
+
+        # 非 local 后端会自动带上后端与模型指纹：换 Embedding 模型会改变向量
+        # 维度，复用旧 collection 会直接报错，也会让检索结果不可信。
+        collection = embedding_collection_name(
+            cfg["vector_store"].get("collection_name", "chinese_rag_kb"),
+            cfg.get("embedding", {}),
+        )
         with _singletons_lock:
             if _vector_store is None:
                 _vector_store = ChromaStore(
                     persist_directory=cfg["vector_store"]["persist_directory"],
-                    collection_name=cfg["vector_store"].get("collection_name", "chinese_rag_kb"),
+                    collection_name=collection,
                     embedding_model=embed,
                     distance_fn=cfg["vector_store"].get("distance_fn", "cosine"),
             **hybrid_kwargs(cfg.get("vector_store", {})),
@@ -197,13 +216,19 @@ def get_pipeline() -> RAGPipeline:
     return _pipeline
 
 
-def get_runtime_pipeline(user_id: Optional[str] = None) -> RAGPipeline:
-    """为指定 user 返回 ``RAGPipeline``。
+def get_runtime_pipeline(
+    user_id: Optional[str] = None,
+    kb: Optional[Dict[str, str]] = None,
+) -> RAGPipeline:
+    """为指定 user（可指定知识库）返回 ``RAGPipeline``。
 
     - ``user_id`` 为 None：直接返回全局单例。
     - ``user_id`` 不为 None：复制全局单例的 config / llm / reranker / prompts，
-      但 ``vector_store`` / ``kg_store`` 替换为该用户的隔离实例。这样既复用
+      但 ``vector_store`` / ``kg_store`` 替换为该租户的隔离实例。这样既复用
       LLM（避免重复加载），又保证检索 / 图谱按租户隔离（P1.4 关键）。
+    - ``kb`` 不为 None：``vector_store`` 进一步切换到该**知识库**的 collection
+      （多知识库隔离，见 :mod:`src.kb_service`）。参数用
+      ``{"id", "collection_name"}`` 形式的普通 dict，避免与 ORM 会话耦合。
     """
     import copy
 
@@ -214,13 +239,21 @@ def get_runtime_pipeline(user_id: Optional[str] = None) -> RAGPipeline:
     from src.factories import TenantAwareFactory
 
     cfg = dict(base.config)
-    vs = TenantAwareFactory.get_chroma_store(user_id, cfg)
+    if kb and kb.get("collection_name"):
+        vs = TenantAwareFactory.get_chroma_store_by_name(kb["collection_name"], cfg)
+    else:
+        vs = TenantAwareFactory.get_chroma_store(user_id, cfg)
     kg = TenantAwareFactory.get_kg_store(user_id, cfg)
 
     # 浅拷贝 pipeline，确保不污染全局
     tenant_pipeline = copy.copy(base)
     tenant_pipeline.vector_store = vs
+    # 注入租户专属 KG store。注意：copy.copy 是浅拷贝，base 上已经探测过的
+    # _graph_state_checked / _graph_retriever 会被一并带过来；若不重置，
+    # _get_graph_retriever 会直接返回全局图谱的检索器（跨租户数据泄露）。
     tenant_pipeline.kg_store = kg
+    tenant_pipeline._graph_state_checked = False
+    tenant_pipeline._graph_retriever = None
     return tenant_pipeline
 
 

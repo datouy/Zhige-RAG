@@ -227,6 +227,23 @@ def refresh(req: RefreshRequest, db: Session = Depends(get_db)) -> TokenResponse
     )
 
 
+@router.get("/status")
+def auth_status() -> dict:
+    """告知前端当前是否需要登录（**无需认证**即可访问）。
+
+    本地单用户模式下返回 ``auth_required=false``，前端直接进入主界面 ——
+    这就是"拉起来就能用"的关键一环。
+    """
+    from src.middleware.auth import auth_enabled
+
+    required = auth_enabled()
+    return {
+        "auth_required": required,
+        "mode": "multi_user" if required else "local_single_user",
+        "hint": "已启用多用户认证，请登录" if required else "本地模式：无需登录，数据保存在本机",
+    }
+
+
 @router.get("/me", response_model=UserResponse)
 def get_me(current_user: User = Depends(get_current_user)) -> UserResponse:
     """获取当前登录用户信息。"""

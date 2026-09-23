@@ -1,4 +1,4 @@
-"""Streamlit Web UI - 中文知识库 RAG 系统（简化版）。
+"""Streamlit Web UI - 知阁 · 本地知识库 系统（简化版）。
 
 启动命令：
     streamlit run ui/app.py --server.port 8501
@@ -20,7 +20,7 @@ import streamlit as st
 
 # ============================== 页面配置 ==============================
 st.set_page_config(
-    page_title="中文知识库 RAG",
+    page_title="知阁 · 本地知识库",
     page_icon="📚",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -121,18 +121,14 @@ def _render_feedback(turn: dict, key_prefix: str) -> None:
 
 
 @st.cache_resource(show_spinner=False)
-def get_embedding_for_ui(config_path: str) -> EmbeddingModel:
+def get_embedding_for_ui(config_path: str):
     cfg = load_config(config_path)
     cfg = apply_env_overrides(cfg)
-    return EmbeddingModel(
-        model_name=cfg["embedding"]["model_name"],
-        device=cfg["embedding"].get("device", "auto"),
-        batch_size=cfg["embedding"].get("batch_size", 32),
-        max_seq_length=cfg["embedding"].get("max_seq_length", 512),
-        normalize=cfg["embedding"].get("normalize_embeddings", True),
-        cache_dir=cfg["embedding"].get("cache_dir"),
-        local_files_only=cfg["embedding"].get("local_files_only", False),
-    )
+    # 后端由 embedding.backend 决定（local / ollama / openai）。
+    # 必须走工厂，否则 UI 侧仍会强制加载本地 sentence-transformers（依赖 torch）。
+    from src.embeddings_provider import create_embedding
+
+    return create_embedding(cfg.get("embedding", {}))
 
 
 @st.cache_resource(show_spinner=False)
@@ -198,7 +194,7 @@ def render_sidebar(config_path: str):
     store = get_vector_store(config_path, embed)
 
     with st.sidebar:
-        st.title("📚 中文知识库 RAG")
+        st.title("📚 知阁 · 本地知识库")
         
         st.markdown(f"**知识库条目**: {store.count()}")
         
@@ -365,12 +361,16 @@ def page_upload(cfg: dict, embed: EmbeddingModel, store: ChromaStore):
             dq_cfg = cfg.get("data_quality", {}) or {}
             for i, p in enumerate(saved_paths, 1):
                 progress.progress(i / (len(saved_paths) + 1), text=f"解析 {p.name}…")
-                docs = enrich_file(p, default_acl=dq_cfg.get("default_acl", "*"))
+                ocr_cfg = cfg.get("document_loader", {}).get("ocr") or {}
+                docs = enrich_file(
+                    p, default_acl=dq_cfg.get("default_acl", "*"), ocr_cfg=ocr_cfg
+                )
                 if not docs:
                     docs = load_document(
                         p,
                         pdf_engine=cfg["document_loader"].get("pdf_engine", "pdfplumber"),
                         encoding=cfg["document_loader"].get("encoding", "utf-8"),
+                        ocr_cfg=ocr_cfg,
                     )
                 chunks, _report = run_data_pipeline(docs, cfg, splitter)
                 store.delete_by_metadata({"source": p.name})

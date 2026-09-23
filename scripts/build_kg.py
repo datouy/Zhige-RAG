@@ -73,6 +73,7 @@ def build(
         target,
         pdf_engine=cfg["document_loader"].get("pdf_engine", "pdfplumber"),
         recursive=True,
+        ocr_cfg=cfg.get("document_loader", {}).get("ocr") or {},
         encoding=cfg["document_loader"].get("encoding", "utf-8"),
     )
     if limit is not None and limit > 0:
@@ -148,11 +149,10 @@ def main() -> int:
     if args.use_llm:
         cfg = load_config(args.config)
         try:
-            llm = LocalLLM(
-                model_name=cfg["llm"]["model_name"],
-                cache_dir=cfg["llm"].get("cache_dir"),
-                local_files_only=cfg["llm"].get("local_files_only", False),
-            )
+            # 走统一工厂：支持 local / ollama / openai（见 src/llm_provider.py）
+            from src.llm_provider import create_llm
+
+            llm = create_llm(cfg.get("llm", {}))
         except Exception as exc:
             logger.warning("LLM 加载失败，将跳过抽取：%s", exc)
             llm = None
@@ -160,7 +160,11 @@ def main() -> int:
     if args.print_only:
         cfg = load_config(args.config)
         target = resolve_path(args.input)
-        docs = load_directory(target, pdf_engine=cfg["document_loader"].get("pdf_engine", "pdfplumber"))
+        docs = load_directory(
+            target,
+            pdf_engine=cfg["document_loader"].get("pdf_engine", "pdfplumber"),
+            ocr_cfg=cfg.get("document_loader", {}).get("ocr") or {},
+        )
         if args.limit:
             docs = docs[: args.limit]
         summary = {

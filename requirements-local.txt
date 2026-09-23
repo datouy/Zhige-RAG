@@ -1,0 +1,22 @@
+# ============================================================
+# 本地推理依赖 —— 仅当 llm.backend = "local" 时需要
+# ============================================================
+# 安装体积大（torch 通常 2~3 GB）且首次运行还需下载模型权重。
+#
+# 如果你的机器没有 NVIDIA GPU，或只想尽快跑起来，**可以不装这组**：
+# 改用 backend: ollama（本机 Ollama 服务）或 backend: openai（任何
+# OpenAI 兼容 API），两条路都不需要 GPU，也不需要下载权重。
+#
+#     pip install -r requirements-core.txt          # 必须
+#     pip install -r requirements-local.txt         # 本组（可选）
+# ============================================================
+
+torch>=2.0.0,<2.5.0
+transformers>=4.40.0,<4.46.0
+accelerate>=0.27.0,<0.35.0
+safetensors>=0.4.0
+tokenizers>=0.15.0
+sentencepiece>=0.2.0
+
+# ---------- 本地 Embedding ----------
+sentence-transformers>=2.7.0

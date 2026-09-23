@@ -24,14 +24,15 @@ SUBSCRIPTION_TIERS: Dict[str, Dict[str, Any]] = {
         "max_queries_per_day": 50,
         "available_models": ["Qwen2.5-0.5B-Instruct"],
         "reranker": False,
-        "max_kb": 1,
+        # 免费用户给 5 个库：个人按主题分库（工作 / 学习 / 资料 / 项目…）是合理需求
+        "max_kb": 5,
     },
     "pro": {
         "max_chunks": 50000,
         "max_queries_per_day": 5000,
         "available_models": ["Qwen2.5-1.5B-Instruct", "Qwen2.5-3B-Instruct-GPTQ-Int4"],
         "reranker": True,
-        "max_kb": 5,
+        "max_kb": 20,
     },
     "enterprise": {
         "max_chunks": -1,  # 无限制
@@ -114,6 +115,8 @@ class DocumentRecord(Base):
 
     id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     user_id = Column(String(36), nullable=False, index=True)
+    # 归属的知识库；老数据留空 = 默认库（迁移时回填）
+    kb_id = Column(String(36), nullable=True, index=True)
     source = Column(String(512), nullable=False)  # 与向量库 metadata.source 一致
     title = Column(String(512), nullable=True)
     doc_status = Column(String(20), default="active", nullable=False)  # active/draft/expired
@@ -175,4 +178,78 @@ class LongTermMemory(Base):
     __table_args__ = (
         UniqueConstraint("user_id", "mem_key", name="uq_ltm_user_key"),
         Index("ix_ltm_user", "user_id"),
+    )
+
+
+# ======================== 知识库（用户可见的一等实体）========================
+
+class KnowledgeBase(Base):
+    """知识库。
+
+    此前用户直接面对底层的 Chroma collection，产品语义不清：一个用户实质
+    只有一个"库"，无法按主题（如"人事制度""产品手册"）分开管理，也没法
+    单独分享或删除。本表把"知识库"提升为用户可见的一等实体。
+
+    collection 隔离策略（``src/kb_service.py::collection_name_for``）：
+
+    - **默认库**沿用历史命名 ``{user}_{base}`` —— 保证升级不破坏已有向量数据；
+    - 新建库使用 ``{user}_{kb短id}_{base}``，与默认库互不干扰。
+    """
+    __tablename__ = "knowledge_bases"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(String(36), nullable=False, index=True)
+    name = Column(String(100), nullable=False)
+    description = Column(String(500), default="", nullable=False)
+    collection_name = Column(String(255), nullable=False)
+    doc_count = Column(Integer, default=0, nullable=False)
+    chunk_count = Column(Integer, default=0, nullable=False)
+    # 每个用户的第一个库标记为默认库：未显式指定 kb_id 的写入/检索都落到这里
+    is_default = Column(Boolean, default=False, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "name", name="uq_kb_user_name"),
+    )
+
+
+# ======================== 会话与消息 ========================
+
+class ChatSession(Base):
+    """对话会话（持久化）。
+
+    此前只有进程内的 ``SESSION_MEMORY``：重启即失、没有会话列表、也无法
+    重命名或删除。本表把会话变成可管理的实体。
+    """
+    __tablename__ = "chat_sessions"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(String(36), nullable=False, index=True)
+    kb_id = Column(String(36), nullable=True, index=True)  # 关联的知识库
+    title = Column(String(200), default="新会话", nullable=False)
+    message_count = Column(Integer, default=0, nullable=False)
+    last_message_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class ChatMessage(Base):
+    """会话消息。
+
+    保留完整的问答对（含引用来源），用于：会话列表的最后一句话预览、
+    重新打开会话时回看历史、以及把某轮对话一键反馈为 bad-case。
+    """
+    __tablename__ = "chat_messages"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    session_id = Column(String(36), nullable=False, index=True)
+    user_id = Column(String(36), nullable=False, index=True)
+    role = Column(String(20), nullable=False)  # user / assistant
+    content = Column(Text, nullable=False)
+    sources_json = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+    __table_args__ = (
+        Index("ix_msg_session_created", "session_id", "created_at"),
     )

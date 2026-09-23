@@ -131,18 +131,16 @@ def ingest_path(
                 logger.info("文档 %s 已保存版本 %s", source_name, version)
 
     # 加载 embedding & 向量库
-    embed = EmbeddingModel(
-        model_name=cfg["embedding"]["model_name"],
-        device=cfg["embedding"].get("device", "auto"),
-        batch_size=cfg["embedding"].get("batch_size", 32),
-        max_seq_length=cfg["embedding"].get("max_seq_length", 512),
-        normalize=cfg["embedding"].get("normalize_embeddings", True),
-        cache_dir=cfg["embedding"].get("cache_dir"),
-        local_files_only=cfg["embedding"].get("local_files_only", False),
-    )
+    # 必须走工厂（local / ollama / openai），否则离线入库会强制加载本地模型
+    from src.embeddings_provider import create_embedding, embedding_collection_name
+
+    embed = create_embedding(cfg.get("embedding", {}))
     store = ChromaStore(
         persist_directory=cfg["vector_store"]["persist_directory"],
-        collection_name=cfg["vector_store"].get("collection_name", "chinese_rag_kb"),
+        collection_name=embedding_collection_name(
+            cfg["vector_store"].get("collection_name", "chinese_rag_kb"),
+            cfg.get("embedding", {}),
+        ),
         embedding_model=embed,
         distance_fn=cfg["vector_store"].get("distance_fn", "cosine"),
     )

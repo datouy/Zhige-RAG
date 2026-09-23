@@ -39,19 +39,16 @@ def _get_agent_for_ui(cfg: dict):
         base_cfg.update(cfg or {})
     # embedding + vector store
     emb_cfg = base_cfg.get("embedding", {})
-    embedding = EmbeddingModel(
-        model_name=emb_cfg.get("model_name", "BAAI/bge-small-zh-v1.5"),
-        device=emb_cfg.get("device", "auto"),
-        batch_size=emb_cfg.get("batch_size", 16),
-        max_seq_length=emb_cfg.get("max_seq_length", 512),
-        normalize=emb_cfg.get("normalize_embeddings", True),
-        cache_dir=emb_cfg.get("cache_dir"),
-        local_files_only=emb_cfg.get("local_files_only", False),
-    )
+    # 必须走工厂（local / ollama / openai），否则 UI 会强制加载本地模型
+    from src.embeddings_provider import create_embedding, embedding_collection_name
+
+    embedding = create_embedding(emb_cfg)
     vs_cfg = base_cfg.get("vector_store", {})
     vs = ChromaStore(
         persist_directory=vs_cfg.get("persist_directory", "data/chroma_db"),
-        collection_name=vs_cfg.get("collection_name", "chinese_rag_kb"),
+        collection_name=embedding_collection_name(
+            vs_cfg.get("collection_name", "chinese_rag_kb"), emb_cfg
+        ),
         embedding_model=embedding,
         distance_fn=vs_cfg.get("distance_fn", "cosine"),
         **hybrid_kwargs(base_cfg.get("vector_store", {})),

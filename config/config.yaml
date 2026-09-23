@@ -9,13 +9,26 @@
 
 # ------------------ 项目基础 ------------------
 project:
-  name: "ChineseRAGKB"
-  version: "0.2.0"
-  description: "中文知识库 RAG 系统"
+  name: "知阁 Zhige"
+  version: "0.3.0"
+  description: "开箱即用的本地中文知识库 RAG 平台，面向个人开发者与中小企业"
 
 app:
-  name: "中文知识库 RAG"
-  version: "0.2.0"
+  name: "知阁"
+  version: "0.3.0"
+
+# ------------------ 认证 ------------------
+#
+# enabled: false（默认）—— **单用户本地模式**：打开就能用，不需要注册登录。
+#     所有数据归属一个固定的"本地用户"，并给予 enterprise 级额度（不受配额限制）。
+#     适合：个人开发者、单机部署、内网私有化。
+#
+# enabled: true —— 启用 JWT 认证与多租户隔离（登录后各人只看得到自己的知识库）。
+#     适合：一台服务器多人共用。
+#
+# 也可用环境变量强制覆盖（容器/临时调试很方便）：AUTH_ENABLED=1
+auth:
+  enabled: false
 
 # ------------------ 数据目录 ------------------
 paths:
@@ -39,6 +52,33 @@ document_loader:
   markdown_extensions:
     - tables
     - fenced_code
+
+  # 扫描件 OCR（可选能力，实现见 src/document_loader.py::_augment_pdf_with_ocr）
+  #
+  # 依赖：pip install -r requirements-ocr.txt
+  #       （pymupdf + rapidocr-onnxruntime，约 100~150 MB，纯 CPU 可跑，无需 poppler）
+  # 未安装时静默跳过，不影响其他功能。
+  #
+  # 工作方式：先用常规引擎提取文本，再对「文本过少」的页面**逐页** OCR 补齐 ——
+  # 因此"正文可正常提取 + 附件页是扫描图"这类混合型 PDF 也能完整入库；
+  # OCR 出来的分块 metadata 会打上 ocr=true 便于溯源。
+  ocr:
+    enabled: true          # 装上依赖后即生效；设为 false 可全局关闭
+    min_text_chars: 20     # 单页文本少于该字符数 → 视为需要 OCR
+    dpi: 200               # 渲染分辨率：越高越准也越慢（200 通常够用）
+    max_pages: 50          # 单文件最多 OCR 多少页（安全阀，防一次上传占满 CPU）
+
+  # 网页导入（实现见 src/web_loader.py，接口 POST /api/v1/ingest/url）
+  #
+  # 安全：默认拒绝内网地址。校验的是**域名解析后的 IP**，重定向逐跳复检 ——
+  # 只校验域名会被 DNS rebinding 绕过（evil.com 解析到 127.0.0.1）。
+  url:
+    timeout: 15.0
+    max_bytes: 5242880     # 单页最大 5 MB
+    max_chars: 200000      # 正文最大字符数，超出截断
+    # ⚠️ 仅在抓取内网自建服务（内部 Wiki 等）时才打开；
+    #    公网可访问的部署务必保持 false，否则等于开放 SSRF。
+    allow_private: false
 
 # ------------------ 文本分块（优化版）------------------
 # 
@@ -64,15 +104,48 @@ text_splitter:
   strip_whitespace: true
 
 # ------------------ Embedding 模型 ------------------
+#
+# backend 与 llm.backend 同理（实现见 src/embeddings_provider.py）：
+#   local  —— sentence-transformers，**需要 torch（2~3 GB）**
+#   ollama —— 本机 Ollama 的 embedding 模型，**不需要 torch**
+#   openai —— 任意 OpenAI 兼容的 /v1/embeddings（通义 DashScope、硅基流动、OpenAI…）
+#
+# ⚠️ 切换 Embedding 模型会改变向量维度。非 local 后端会自动为 collection
+#    追加"后端+模型"指纹，避免与旧向量混在同一个库里（见 embedding_collection_name）。
 embedding:
+  backend: "local"
+
+  # --- backend: ollama（不想装 torch 时首选）---
+  # 准备：ollama pull nomic-embed-text
+  ollama:
+    model: "nomic-embed-text"
+    base_url: "http://localhost:11434/v1"
+    timeout: 60.0
+    # dim: 768            # 不确定可留空，首次 encode 后自动探测并记录
+
+  # --- backend: openai（任何 OpenAI 兼容服务）---
+  # 示例：
+  #   通义千问  base_url: https://dashscope.aliyuncs.com/compatible-mode/v1   model: text-embedding-v3
+  #   硅基流动  base_url: https://api.siliconflow.cn/v1                      model: BAAI/bge-m3
+  #   OpenAI   base_url: https://api.openai.com/v1                          model: text-embedding-3-small
+  openai:
+    model: "text-embedding-3-small"
+    base_url: "https://api.openai.com/v1"
+    api_key: ${OPENAI_API_KEY:-}
+    timeout: 60.0
+
+  # --- backend: local ---
   model_name: "BAAI/bge-small-zh-v1.5"
   device: "cpu"
   batch_size: 16
   normalize_embeddings: true
   max_seq_length: 512
+  # 仅对 bge-*-zh-v1.5 系列等"查询需加指令"的本地模型生效；
+  # API embedding 一般不需要，可留空。
   query_instruction: "为这个句子生成表示以用于检索相关文章："
   use_doc_instruction: false
   cache_dir: "./models/sentence-transformers"
+  # true = 只用本地已有模型、不联网。**首次部署请改为 false** 让它自动下载（约 100 MB）。
   local_files_only: true
 
 # ------------------ 向量数据库 ------------------
@@ -137,7 +210,43 @@ reranker:
   min_relevance: 0.3             # 重排后最低相关度阈值
 
 # ------------------ 大语言模型 ------------------
+#
+# backend 决定「模型从哪来」（实现见 src/llm_provider.py）：
+#   local  —— 本地 HuggingFace 权重。需预先下载模型，无 GPU 时较慢。
+#   ollama —— 本机/内网 Ollama 服务。**无需 GPU、无需下载权重**，个人与中小企业首选。
+#   openai —— 任意 OpenAI 兼容接口（DeepSeek / 通义千问 / 智谱 / 硅基流动 /
+#             vLLM / LM Studio …）。只要 base_url + api_key，完全不需要 GPU。
+#
+# 快速切换：
+#   1) 已装 Ollama：    backend 改 "ollama"，执行 `ollama pull qwen2.5:7b`
+#   2) 用云端 API：     backend 改 "openai"，填好下方 openai 段
+#   3) 完全离线推理：   backend 保持 "local"，预先下载 model_name 指向的权重
 llm:
+  backend: "local"
+
+  # --- backend: ollama ---
+  # model 用 `ollama list` 显示的名字；Ollama 自带 OpenAI 兼容端点。
+  ollama:
+    model: "qwen2.5:7b"
+    base_url: "http://localhost:11434/v1"
+    timeout: 120.0
+    # Ollama 默认不校验密钥，留空即可；走内网网关时才需要。
+    # api_key: ${OLLAMA_API_KEY:-}
+
+  # --- backend: openai（任何 OpenAI 兼容服务）---
+  # 常用示例：
+  #   DeepSeek    base_url: https://api.deepseek.com/v1                      model: deepseek-chat
+  #   通义千问    base_url: https://dashscope.aliyuncs.com/compatible-mode/v1  model: qwen-plus
+  #   智谱清言    base_url: https://open.bigmodel.cn/api/paas/v4              model: glm-4-flash
+  #   硅基流动    base_url: https://api.siliconflow.cn/v1                     model: Qwen/Qwen2.5-7B-Instruct
+  #   vLLM/LM Studio  base_url: http://localhost:8000/v1
+  openai:
+    model: "deepseek-chat"
+    base_url: "https://api.deepseek.com/v1"
+    api_key: ${OPENAI_API_KEY:-}
+    timeout: 120.0
+
+  # --- backend: local（本地权重）---
   model_name: "./models/Qwen2.5-1.5B-Instruct"
   model_path: ""
   device: "auto"
@@ -145,6 +254,8 @@ llm:
   torch_dtype: "float16"
   cache_dir: "./models/huggingface"
   trust_remote_code: false
+  # true = 只用本地文件、不联网。首次部署请改为 false 让它自动下载，
+  # 或提前把权重放到 model_name 指定的目录。这是"开箱即用"最常见的卡点。
   local_files_only: true
   use_chat_template: true
   chat_template: "auto"
@@ -209,7 +320,7 @@ evaluation:
 
 # ------------------ Web UI ------------------
 ui:
-  title: "中文知识库 RAG"
+  title: "知阁 · 本地知识库"
   page_icon: "📚"
   theme: "light"
   default_top_k: 4

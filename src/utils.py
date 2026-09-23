@@ -380,13 +380,36 @@ def merge_dict(base: dict, override: dict) -> dict:
 #  环境变量覆盖支持
 # ---------------------------------------------------------------------
 def apply_env_overrides(cfg: dict) -> dict:
-    """根据环境变量覆盖部分常用配置。"""
+    """根据环境变量覆盖部分常用配置。
+
+    这些映射让容器化部署**不必修改 config.yaml** 就能切换模型来源，
+    只需挂环境变量即可 —— 这对 Docker / k8s 场景是刚需：
+
+        docker run -e LLM_BACKEND=ollama \\
+                   -e OLLAMA_BASE_URL=http://host.docker.internal:11434/v1 ...
+
+    注意：这里只覆盖**已存在于 mapping 中的键**，不做任意路径注入，
+    避免环境变量意外改写配置结构。
+    """
     mapping = {
         "DEVICE": ("embedding", "device"),
         "EMBEDDING_DEVICE": ("embedding", "device"),
         "LLM_DEVICE": ("llm", "device"),
         "USE_4BIT": ("llm", "quantization", "enabled"),
         "STREAMLIT_SERVER_PORT": ("ui", "server_port"),
+        # ---- 后端切换（local / ollama / openai）----
+        "LLM_BACKEND": ("llm", "backend"),
+        "EMBEDDING_BACKEND": ("embedding", "backend"),
+        # ---- Ollama ----
+        "OLLAMA_BASE_URL": ("llm", "ollama", "base_url"),
+        "OLLAMA_MODEL": ("llm", "ollama", "model"),
+        "EMBEDDING_OLLAMA_BASE_URL": ("embedding", "ollama", "base_url"),
+        "EMBEDDING_OLLAMA_MODEL": ("embedding", "ollama", "model"),
+        # ---- OpenAI 兼容 ----
+        "OPENAI_BASE_URL": ("llm", "openai", "base_url"),
+        "OPENAI_MODEL": ("llm", "openai", "model"),
+        "EMBEDDING_OPENAI_BASE_URL": ("embedding", "openai", "base_url"),
+        "EMBEDDING_OPENAI_MODEL": ("embedding", "openai", "model"),
     }
     for env_key, path in mapping.items():
         val = os.environ.get(env_key)
