@@ -22,7 +22,7 @@ from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisco
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 
-from api.deps import get_llm_executor, get_runtime_config, get_runtime_pipeline
+from api.deps import get_llm_gate, get_runtime_config, get_runtime_pipeline
 from src.db.models import User
 from src.middleware.auth import get_current_user
 from src.utils import get_logger
@@ -80,7 +80,16 @@ def _get_agent(user_id: Optional[str] = None):
                 cfg = get_runtime_config()
                 max_steps = int(cfg.get("agent", {}).get("max_steps", 5))
                 tools = _get_agent_tools(user_id)
-                _agent_by_user[cache_key] = ReActAgent(llm=llm, tools=tools, max_steps=max_steps)
+                # d1 决策工具预选（可选）：仅当 decision.tool_select.enabled 时启用
+                decision_provider = None
+                if ((cfg.get("decision", {}) or {}).get("tool_select", {}) or {}).get("enabled"):
+                    decision_provider = pipeline._get_decision_provider()
+                _agent_by_user[cache_key] = ReActAgent(
+                    llm=llm,
+                    tools=tools,
+                    max_steps=max_steps,
+                    decision_provider=decision_provider,
+                )
     return _agent_by_user[cache_key]
 
 
@@ -137,7 +146,12 @@ def agent_chat_sync(
         if body.max_steps is not None and body.max_steps != agent.max_steps:
             from src.agent.react_agent import ReActAgent
 
-            agent = ReActAgent(llm=agent.llm, tools=agent.tools, max_steps=body.max_steps)
+            agent = ReActAgent(
+                llm=agent.llm,
+                tools=agent.tools,
+                max_steps=body.max_steps,
+                decision_provider=agent.decision_provider,
+            )
         events: List[Dict[str, Any]] = []
         steps = 0
         tools_used: List[str] = []
@@ -170,14 +184,40 @@ def agent_chat_sync(
 
 @router.websocket("/api/v1/ws/agent")
 async def websocket_agent(websocket: WebSocket, token: Optional[str] = None):
-    """WebSocket 流式 Agent 调用。必须携带有效 JWT（``?token=``）。"""
-    from src.auth.jwt_handler import decode_token
+    """WebSocket 流式 Agent 调用。
 
-    payload = decode_token(token) if token else None
-    if not payload or not payload.get("sub"):
-        await websocket.close(code=4401)  # 未认证
-        return
-    user_id = payload["sub"]
+    认证策略与 HTTP 路径、``/ws/chat`` 完全一致（见 :mod:`src.middleware.auth`）：
+
+    - **未启用认证（默认，单用户本地模式）**：不要求 token，直接绑定本地用户；
+    - 启用认证时：必须携带有效 **access** token（``?token=``）。
+
+    此前这里**无条件**要求 token，与同一路由的 REST 端点（用 ``get_current_user``，
+    本地模式下放行）以及 ``/ws/chat`` 都不一致 —— 本地模式下前端拿不到 token，
+    Agent WS 实际不可用。现统一为同一套认证策略。
+    """
+    from src.db.database import SessionLocal
+    from src.middleware.auth import auth_enabled, get_local_user
+
+    db = SessionLocal()
+    try:
+        if auth_enabled():
+            from src.auth.jwt_handler import decode_token
+
+            payload = decode_token(token) if token else None
+            # 同 chat.py：必须校验 type == "access"，否则 7 天期的 refresh token
+            # 也能直接建立 WS 连接。
+            if not payload or not payload.get("sub") or payload.get("type") != "access":
+                await websocket.close(code=4401)  # 未认证
+                return
+            ws_user = db.query(User).filter(User.id == payload["sub"]).first()
+            if ws_user is None or not ws_user.is_active:
+                await websocket.close(code=4403)  # 用户不存在或已禁用
+                return
+        else:
+            ws_user = get_local_user(db)
+        user_id = ws_user.id
+    finally:
+        db.close()
 
     await websocket.accept()
     try:
@@ -188,7 +228,8 @@ async def websocket_agent(websocket: WebSocket, token: Optional[str] = None):
             if not query:
                 await websocket.send_json({"event": "error", "data": "query is required"})
                 continue
-            executor = get_llm_executor()
+            # P0-1 修复：使用 LLMConcurrencyGate 替代已删除的 AsyncLLMExecutor
+            gate = get_llm_gate()
 
             async def _run():
                 # Agent 循环内含多次阻塞 LLM 推理，放到独立线程生产事件，
@@ -209,7 +250,12 @@ async def websocket_agent(websocket: WebSocket, token: Optional[str] = None):
                         ):
                             from src.agent.react_agent import ReActAgent
 
-                            a = ReActAgent(llm=agent0.llm, tools=agent0.tools, max_steps=max_steps)
+                            a = ReActAgent(
+                                llm=agent0.llm,
+                                tools=agent0.tools,
+                                max_steps=max_steps,
+                                decision_provider=agent0.decision_provider,
+                            )
                         else:
                             a = agent0
                         for ev in a.run(query, stream=True):
@@ -230,7 +276,7 @@ async def websocket_agent(websocket: WebSocket, token: Optional[str] = None):
                     await websocket.send_json(ev)
 
             try:
-                sem = getattr(executor, "semaphore", None)
+                sem = getattr(gate, "semaphore", None)
                 if sem is not None:
                     async with sem:
                         await _run()

@@ -56,13 +56,16 @@ class VerificationResult:
     # 带引用但词面内容在所引上下文中找不到依据的句子（编造/改写的直接信号）
     unsupported_sentences: List[str] = field(default_factory=list)
     status: str = "unverified"  # verified / partial / unverified / refused
+    # d1 决策增强结果（noul 接地判定 + score 质量分级）；
+    # 仅在调用 verify_answer_with_decision 时非空，规则路径为 None。
+    decision: Optional[Dict[str, Any]] = None
 
     @property
     def verified(self) -> bool:
         return self.status == "verified"
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        d: Dict[str, Any] = {
             "refused": self.refused,
             "invalid_citations": list(self.invalid_citations),
             "cited_sentence_ratio": round(self.cited_sentence_ratio, 3),
@@ -71,6 +74,10 @@ class VerificationResult:
             "status": self.status,
             "verified": self.verified,
         }
+        # 仅在启用决策增强时追加，保持规则路径的对外字段完全不变
+        if self.decision is not None:
+            d["decision"] = self.decision
+        return d
 
 
 def _split_sentences(body: str) -> List[str]:
@@ -184,3 +191,166 @@ def verify_answer(
         len(res.unsupported_sentences),
     )
     return res
+
+
+# ======================================================================
+#  d1 决策增强校验（noul + score 原语）
+# ======================================================================
+# 质量分级阶梯（5 级，落在 d1 的 2~10 级约束内）
+DEFAULT_QUALITY_LADDER = [
+    "很差：内容错误或完全没有上下文依据",
+    "较差：存在明显无依据的表述",
+    "一般：部分内容有依据、部分存疑",
+    "较好：基本都有依据，表述完整",
+    "很好：完全有上下文依据且回答完整",
+]
+
+_GROUNDING_INSTRUCTION = (
+    "判断「答案」中的每条事实性表述是否都能在给定的「上下文」中找到依据，"
+    "不要使用任何外部知识。若答案引入了上下文里没有的信息，即视为无依据。"
+)
+
+_QUALITY_INSTRUCTION = (
+    "综合评估该「答案」的质量：是否忠实于「上下文」、是否完整回答了问题、"
+    "是否存在与上下文矛盾或无据编造的内容。"
+)
+
+# 状态严格度排序，便于"升/降一档"
+_STATUS_ORDER = ["unverified", "partial", "verified"]
+
+
+def _blend_status(
+    rule_status: str,
+    grounded: Optional[bool],
+    grounded_prob: float,
+    quality_norm: float,
+    *,
+    has_hard_defect: bool,
+    ground_yes_threshold: float = 0.7,
+    ground_no_threshold: float = 0.6,
+    low_quality: float = 0.3,
+    high_quality: float = 0.7,
+) -> str:
+    """把规则评级与 d1 决策结论融合成最终评级。
+
+    保守原则：**降级容易、升级难**。d1 说"无依据"时倾向下调；只有当 d1
+    明确说"有依据"且质量高、且规则层没有任何硬缺陷时，才允许从 partial
+    上调为 verified。
+    """
+    status = rule_status
+    if status == "refused":
+        return status
+
+    downgrade = False
+    if grounded is False and grounded_prob >= ground_no_threshold:
+        downgrade = True
+    if quality_norm < low_quality:
+        downgrade = True
+
+    if downgrade:
+        idx = _STATUS_ORDER.index(status) if status in _STATUS_ORDER else 0
+        return _STATUS_ORDER[max(0, idx - 1)]
+
+    # 升级：仅当规则无硬缺陷 + d1 明确有据 + 质量高
+    if (
+        status == "partial"
+        and not has_hard_defect
+        and grounded is True
+        and grounded_prob >= ground_yes_threshold
+        and quality_norm >= high_quality
+    ):
+        return "verified"
+    return status
+
+
+def verify_answer_with_decision(
+    answer: str,
+    context_chunks: Sequence[Dict[str, Any]],
+    provider: Optional[Any] = None,
+    fallback_answer: Optional[str] = None,
+    min_cited_ratio: float = 0.5,
+    min_grounding: float = 0.6,
+    quality_ladder: Optional[Sequence[str]] = None,
+) -> VerificationResult:
+    """在规则校验之上叠加 d1 决策校验（``noul`` 接地 + ``score`` 质量）。
+
+    规则校验（词面接地 / 事实支持）擅长抓"字面级"编造，但抓不到"换一种说法
+    的无据表述"；d1 决策恰好互补 —— 它做的是**语义级**的"是否完全有据"判断。
+    两者融合后，``status`` 更保守可信，同时报告里保留规则与决策各自的结论。
+
+    ``provider`` 为 ``None`` 时**完全等价于** :func:`verify_answer`（零行为变化）。
+
+    Args:
+        answer: 模型生成的答案全文。
+        context_chunks: 送入 prompt 的上下文块（需含 ``index``，从 1 起）。
+        provider: :class:`src.decision_provider.BaseDecisionProvider` 实例。
+        fallback_answer: 未命中拒答文案；答案与之相同 → ``refused``。
+        min_cited_ratio / min_grounding: 透传给规则校验。
+        quality_ladder: 质量分级阶梯，默认 :data:`DEFAULT_QUALITY_LADDER`。
+
+    Returns:
+        :class:`VerificationResult`；``decision`` 字段含决策层原始结论。
+    """
+    res = verify_answer(
+        answer,
+        context_chunks,
+        fallback_answer=fallback_answer,
+        min_cited_ratio=min_cited_ratio,
+        min_grounding=min_grounding,
+    )
+    if provider is None or res.refused or not (answer or "").strip():
+        return res
+
+    context_text = "\n".join(
+        f"[{c.get('index', i + 1)}] {str(c.get('content') or '')[:800]}"
+        for i, c in enumerate(context_chunks)
+    )
+    text = f"上下文：\n{context_text}\n\n答案：\n{answer.strip()}"
+    ladder = list(quality_ladder or DEFAULT_QUALITY_LADDER)
+
+    grounded_res = None
+    quality_res = None
+    try:
+        grounded_res = provider.noul(text, _GROUNDING_INSTRUCTION, key="grounded")
+        quality_res = provider.score(text, _QUALITY_INSTRUCTION, ladder, key="quality")
+    except Exception as exc:  # noqa: BLE001 - provider 已兜底，这里再保险一层
+        logger.warning("决策校验失败（沿用规则结果）: %s", exc)
+    if grounded_res is None and quality_res is None:
+        return res
+
+    grounded = None if grounded_res is None else (grounded_res.label == "yes")
+    grounded_prob = 0.0 if grounded_res is None else grounded_res.probability
+    quality_score = 0.0 if quality_res is None else quality_res.score
+    quality_norm = 0.0 if quality_res is None else quality_res.normalized
+
+    has_hard_defect = bool(res.invalid_citations) or len(res.unsupported_facts) >= 3
+    final_status = _blend_status(
+        res.status,
+        grounded,
+        grounded_prob,
+        quality_norm,
+        has_hard_defect=has_hard_defect,
+    )
+
+    res.decision = {
+        "grounded": grounded,
+        "grounded_probability": round(grounded_prob, 4),
+        "quality_score": round(quality_score, 4),
+        "quality_normalized": round(quality_norm, 4),
+        "quality_confidence": 0.0 if quality_res is None else round(quality_res.confidence, 4),
+        "quality_levels": ladder,
+        "status_rule": res.status,
+        "status_final": final_status,
+    }
+    if final_status != res.status:
+        logger.info("决策校验调整评级：%s → %s（grounded=%s q=%.2f）", res.status, final_status, grounded, quality_norm)
+    res.status = final_status
+    return res
+
+
+__all__ = [
+    "VerificationResult",
+    "verify_answer",
+    "verify_answer_with_decision",
+    "DEFAULT_QUALITY_LADDER",
+]

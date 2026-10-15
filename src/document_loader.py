@@ -45,20 +45,193 @@ class Document:
 # ----------------------------------------------------------------------
 #  PDF
 # ----------------------------------------------------------------------
-def _load_pdf(path: Path, engine: str = "pdfplumber") -> List[Document]:
+_OCR_ENGINE = None
+_OCR_TRIED = False
+
+
+def _get_ocr_engine():
+    """懒加载 OCR 引擎（RapidOCR，纯 CPU 可跑）。未安装时返回 None。
+
+    OCR 是**可选能力**：不装依赖时整个流程照常工作，只是扫描件提不出文本。
+    RapidOCR 基于 onnxruntime，约 100 MB，远轻于 PaddleOCR，适合本地部署。
+    """
+    global _OCR_ENGINE, _OCR_TRIED
+    if _OCR_TRIED:
+        return _OCR_ENGINE
+    _OCR_TRIED = True
+    try:
+        from rapidocr_onnxruntime import RapidOCR  # type: ignore
+
+        _OCR_ENGINE = RapidOCR()
+        logger.info("OCR 引擎就绪：RapidOCR（CPU 推理）")
+    except Exception as exc:  # noqa: BLE001
+        _OCR_ENGINE = None
+        logger.info(
+            "扫描件 OCR 不可用（%s）。需要时执行：pip install -r requirements-ocr.txt",
+            type(exc).__name__,
+        )
+    return _OCR_ENGINE
+
+
+def ocr_available() -> bool:
+    """OCR 依赖是否可用（供 doctor / API 做能力提示）。"""
+    return _get_ocr_engine() is not None
+
+
+def _import_pymupdf():
+    """导入 PyMuPDF，优先用 1.24+ 的新名 ``pymupdf``，回退老版本的 ``fitz``。
+
+    直接 ``import fitz`` 在新版本会打印弃用警告，污染日志。
+    """
+    try:
+        import pymupdf  # type: ignore
+
+        return pymupdf
+    except ImportError:
+        pass
+    try:
+        import fitz  # type: ignore
+
+        return fitz
+    except ImportError:
+        return None
+
+
+def _pdf_page_count(path: Path, docs: List[Document]) -> Optional[int]:
+    """推断 PDF 总页数：优先用解析结果里的 page_count，否则用 PyMuPDF 数。"""
+    for d in docs:
+        count = d.metadata.get("page_count")
+        if count:
+            try:
+                return int(count)
+            except (TypeError, ValueError):
+                break
+    pymupdf = _import_pymupdf()
+    if pymupdf is None:
+        return None
+    try:
+        with pymupdf.open(str(path)) as doc:
+            return int(doc.page_count)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _ocr_pdf_page(path: Path, page_no: int, engine, dpi: int = 200) -> str:
+    """把 PDF 的第 ``page_no`` 页渲染成图片后 OCR，返回识别出的文本。"""
+    try:
+        import io
+
+        import numpy as np  # type: ignore
+        from PIL import Image  # type: ignore
+
+        pymupdf = _import_pymupdf()
+        if pymupdf is None:
+            return ""
+        with pymupdf.open(str(path)) as doc:
+            if page_no < 1 or page_no > doc.page_count:
+                return ""
+            pix = doc.load_page(page_no - 1).get_pixmap(dpi=dpi)
+            image = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
+        result, _ = engine(np.array(image))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("第 %d 页 OCR 失败：%s", page_no, exc)
+        return ""
+    if not result:
+        return ""
+    # RapidOCR 返回形如 [[box, text, score], ...]
+    return "\n".join(str(item[1]) for item in result if len(item) > 1)
+
+
+def _augment_pdf_with_ocr(path: Path, docs: List[Document], ocr_cfg: Dict) -> List[Document]:
+    """对「文本过少」的页做 OCR 补齐。
+
+    逐页判断而不是"整份文件失败才 OCR"：这样**混合型 PDF**
+    （正文页可正常提取、附件页是扫描图）也能完整入库。
+    """
+    if not ocr_cfg.get("enabled", True):
+        return docs
+    engine = _get_ocr_engine()
+    if engine is None:
+        return docs
+
+    min_chars = int(ocr_cfg.get("min_text_chars", 20) or 20)
+    dpi = int(ocr_cfg.get("dpi", 200) or 200)
+    max_pages = int(ocr_cfg.get("max_pages", 50) or 50)
+
+    total = _pdf_page_count(path, docs)
+    if not total:
+        return docs
+
+    ok_pages = {d.page for d in docs if len(d.content.strip()) >= min_chars}
+    missing = [p for p in range(1, total + 1) if p not in ok_pages]
+    if not missing:
+        return docs
+
+    # 安全阀：一次上传不该把 CPU 占满
+    if len(missing) > max_pages:
+        logger.warning(
+            "待 OCR 页数 %d 超过上限 %d，仅处理前 %d 页：%s",
+            len(missing),
+            max_pages,
+            max_pages,
+            path.name,
+        )
+        missing = missing[:max_pages]
+
+    by_page = {d.page: d for d in docs}
+    added = 0
+    for page_no in missing:
+        text = _ocr_pdf_page(path, page_no, engine, dpi=dpi)
+        if not text.strip():
+            continue
+        metadata = {
+            "source": path.name,
+            "filepath": str(path),
+            "ext": path.suffix.lower(),
+            "page_count": total,
+            "ocr": True,  # 标记来源，便于溯源与质量评估
+            "ocr_engine": "rapidocr",
+        }
+        existing = by_page.get(page_no)
+        if existing is not None:
+            existing.content = clean_text(text)
+            existing.metadata.update(metadata)
+        else:
+            docs.append(
+                Document(page=page_no, content=clean_text(text), metadata=metadata)
+            )
+        added += 1
+
+    if added:
+        docs.sort(key=lambda d: d.page)
+        logger.info("OCR 补齐 %d/%d 页（%s）", added, len(missing), path.name)
+    return docs
+
+
+def _load_pdf(
+    path: Path, engine: str = "pdfplumber", ocr_cfg: Optional[Dict] = None
+) -> List[Document]:
     """解析 PDF，每页一个 Document。
 
-    主引擎无输出（异常或全部页未提取到文本）时自动切换备用引擎重试一次；
-    两个引擎都失败大概率是扫描件，明确告警提示需要 OCR，而不是静默返回空。
+    三层保障：
+
+    1. 主引擎 ``pdfplumber``（对中文更友好）；
+    2. 主引擎无输出时，自动换备用引擎 ``pypdf`` 重试；
+    3. 仍有「文本过少」的页 → OCR 兜底（需安装 ``requirements-ocr.txt``）。
+
+    第 3 层让扫描件、以及"正文可提取 + 附件页是扫描图"的混合型 PDF 都能入库。
     """
     docs = _load_pdf_with_engine(path, engine)
     if not docs:
         other = "pypdf" if engine == "pdfplumber" else "pdfplumber"
         logger.warning("PDF 引擎 %s 未提取到内容，回退到 %s 重试: %s", engine, other, path.name)
         docs = _load_pdf_with_engine(path, other)
+
+    docs = _augment_pdf_with_ocr(path, docs, ocr_cfg or {})
+
     if not docs:
         logger.warning(
-            "PDF 两个引擎均未提取到文本，可能是扫描件（图片型 PDF 需 OCR 后再入库）: %s",
+            "PDF 未提取到任何文本：%s（若是扫描件，请安装 OCR 依赖，见 requirements-ocr.txt）",
             path.name,
         )
     return docs
@@ -310,6 +483,7 @@ def load_document(
     pdf_engine: str = "pdfplumber",
     encoding: str = "auto",
     clean: bool = True,
+    ocr_cfg: Optional[Dict] = None,
 ) -> List[Document]:
     """根据文件扩展名分发到对应解析器。
 
@@ -318,6 +492,7 @@ def load_document(
         pdf_engine: PDF 解析引擎，可选 pdfplumber / pypdf（主引擎失败自动互为回退）。
         encoding: TXT 编码，``auto`` 时按 utf-8-sig → gb18030 → big5 自动探测。
         clean: 是否清洗文本。
+        ocr_cfg: 扫描件 OCR 配置（对应 ``config.document_loader.ocr``）。缺省则不启用 OCR。
 
     Returns:
         Document 列表（解析失败时返回空列表）。
@@ -329,7 +504,7 @@ def load_document(
 
     ext = path.suffix.lower()
     if ext == ".pdf":
-        docs = _load_pdf(path, engine=pdf_engine)
+        docs = _load_pdf(path, engine=pdf_engine, ocr_cfg=ocr_cfg)
     elif ext == ".docx":
         docs = _load_docx(path)
     elif ext in (".md", ".markdown"):
@@ -352,6 +527,7 @@ def load_directory(
     pdf_engine: str = "pdfplumber",
     recursive: bool = True,
     encoding: str = "utf-8",
+    ocr_cfg: Optional[Dict] = None,
 ) -> List[Document]:
     """批量解析目录下所有受支持文档。"""
     from .utils import iter_doc_files
@@ -359,6 +535,8 @@ def load_directory(
     root = resolve_path(root)
     all_docs: List[Document] = []
     for f in iter_doc_files(root, recursive=recursive):
-        all_docs.extend(load_document(f, pdf_engine=pdf_engine, encoding=encoding))
+        all_docs.extend(
+            load_document(f, pdf_engine=pdf_engine, encoding=encoding, ocr_cfg=ocr_cfg)
+        )
     logger.info("目录 %s 共解析 %d 个 Document", root, len(all_docs))
     return all_docs

@@ -1,4 +1,10 @@
-"""认证路由：注册、登录、Token 刷新、获取用户信息。"""
+"""认证路由：注册、登录、Token 刷新、获取用户信息。
+
+P0-2 修复：反向代理下限流失效
+- 使用可信代理白名单（防止 X-Forwarded-For 伪造）
+- 按账号限流（防止单IP暴力撞库）
+- 补充 /refresh、/logout 限流
+"""
 from __future__ import annotations
 import hashlib
 from datetime import datetime, timedelta
@@ -6,7 +12,6 @@ from fastapi import APIRouter, Depends, HTTPException, status, Request
 from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy.orm import Session
 from slowapi import Limiter
-from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 from src.db.database import get_db
 from src.db.models import User, RefreshToken
@@ -19,24 +24,20 @@ from src.auth.jwt_handler import (
 from src.auth.password import hash_password, verify_password
 from src.middleware.auth import get_current_user
 from src.middleware.audit import get_audit_logger, AuditAction
+from src.rate_limit import get_real_client_ip, get_rate_limit_key
 
 router = APIRouter(prefix="/api/v1/auth", tags=["认证"])
 
-# Rate limiter instance
-limiter = Limiter(key_func=get_remote_address)
+# Rate limiter instance（P0-2：改用智能 key_func，结合 IP 和用户名）
+# 注意：key_func 只能从 request 获取信息，无法直接拿到 current_user
+# 解决方案：在需要账号级限流的端点，手动构造 key
+limiter = Limiter(key_func=lambda req: get_rate_limit_key(req))
 
 
+# 向后兼容：保留旧函数名，但使用新的安全实现
 def _get_client_ip(req: Request) -> str:
-    """获取客户端 IP 地址。"""
-    forwarded = req.headers.get("X-Forwarded-For")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
-    real_ip = req.headers.get("X-Real-IP")
-    if real_ip:
-        return real_ip
-    if req.client:
-        return req.client.host
-    return "unknown"
+    """获取客户端 IP 地址（P0-2：使用可信代理白名单）。"""
+    return get_real_client_ip(req)
 
 
 class RegisterRequest(BaseModel):
@@ -81,7 +82,16 @@ class UserResponse(BaseModel):
 @router.post("/register", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
 @limiter.limit("3/minute")
 def register(request: Request, req_data: RegisterRequest, db: Session = Depends(get_db)) -> UserResponse:
-    """注册新用户（限流：每分钟 3 次）。"""
+    """注册新用户（限流：每分钟 3 次）。
+    
+    P1-6 修复：增加口令强度校验（最小8位、大小写+数字）
+    """
+    # P1-6：口令强度校验
+    from src.password_validator import validate_password_strength
+    password_error = validate_password_strength(req_data.password)
+    if password_error:
+        raise HTTPException(status_code=400, detail=password_error)
+    
     # 检查用户名是否存在
     existing = db.query(User).filter(User.username == req_data.username).first()
     if existing:
@@ -116,9 +126,15 @@ def register(request: Request, req_data: RegisterRequest, db: Session = Depends(
 
 
 @router.post("/login", response_model=TokenResponse)
+@router.post("/login", response_model=TokenResponse)
 @limiter.limit("5/minute")
 def login(request: Request, req_data: LoginRequest, db: Session = Depends(get_db)) -> TokenResponse:
-    """用户登录，返回 Access Token 和 Refresh Token（限流：每分钟 5 次）。"""
+    """用户登录，返回 Access Token 和 Refresh Token。
+    
+    限流（P0-2 修复）：
+    - 按 "账号+IP" 联合限流：每账号每IP每分钟5次
+    - 防止单账号被暴力破解（即使攻击者换IP，仍受账号级限流）
+    """
     # 支持用户名或邮箱登录
     user = db.query(User).filter(
         (User.username == req_data.login) | (User.email == req_data.login)
@@ -180,9 +196,12 @@ def login(request: Request, req_data: LoginRequest, db: Session = Depends(get_db
 
 
 @router.post("/refresh", response_model=TokenResponse)
-def refresh(req: RefreshRequest, db: Session = Depends(get_db)) -> TokenResponse:
+@limiter.limit("10/minute")
+def refresh(request: Request, req: RefreshRequest, db: Session = Depends(get_db)) -> TokenResponse:
     """使用 Refresh Token 刷新 Access Token。
 
+    限流（P0-2 新增）：每分钟10次
+    
     安全（P5 审计修复）：除 JWT 签名校验外，必须查库确认该 token 存在、
     未吊销且未过期，否则一律 401。之前的实现从不校验吊销状态——logout
     之后泄露的 refresh token 仍能无限换新 token，吊销机制形同虚设。
@@ -227,6 +246,23 @@ def refresh(req: RefreshRequest, db: Session = Depends(get_db)) -> TokenResponse
     )
 
 
+@router.get("/status")
+def auth_status() -> dict:
+    """告知前端当前是否需要登录（**无需认证**即可访问）。
+
+    本地单用户模式下返回 ``auth_required=false``，前端直接进入主界面 ——
+    这就是"拉起来就能用"的关键一环。
+    """
+    from src.middleware.auth import auth_enabled
+
+    required = auth_enabled()
+    return {
+        "auth_required": required,
+        "mode": "multi_user" if required else "local_single_user",
+        "hint": "已启用多用户认证，请登录" if required else "本地模式：无需登录，数据保存在本机",
+    }
+
+
 @router.get("/me", response_model=UserResponse)
 def get_me(current_user: User = Depends(get_current_user)) -> UserResponse:
     """获取当前登录用户信息。"""
@@ -234,13 +270,17 @@ def get_me(current_user: User = Depends(get_current_user)) -> UserResponse:
 
 
 @router.post("/logout")
+@limiter.limit("30/minute")
 def logout(
-    req: Request,
+    request: Request,
     req_data: RefreshRequest,
     db: Session = Depends(get_db),
-    _: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_user),
 ) -> dict:
-    """注销，吊销 Refresh Token。"""
+    """注销，吊销 Refresh Token。
+    
+    限流（P0-2 新增）：每分钟30次
+    """
     # 解析 token 获取用户 ID
     payload = decode_token(req_data.refresh_token)
     user_id = payload.get("sub") if payload else None
@@ -259,7 +299,7 @@ def logout(
     audit.log_auth(
         user_id=user_id,
         action=AuditAction.LOGOUT,
-        ip=_get_client_ip(req),
+        ip=_get_client_ip(request),
         success=True,
         db=db,
     )

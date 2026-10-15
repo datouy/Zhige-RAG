@@ -287,17 +287,22 @@ def run_data_pipeline(
     docs: Sequence[Document],
     cfg: Dict[str, Any],
     splitter: Any,
+    decision_provider: Optional[Any] = None,
 ) -> Tuple[List[Any], Dict[str, Any]]:
-    """数据层统一管线：深度清洗 → 文档去重 → 准入门 → 分块 → 分块去重。
+    """数据层统一管线：深度清洗 → 文档去重 → 准入门 → 分块 → 分块去重 → 决策门禁。
 
     Args:
         docs: ``document_meta.enrich_file/enrich_directory`` 产出的小节文档。
         cfg:  全局配置（读取 ``data_quality`` 段）。
         splitter: 已构造的文本分块器（``build_splitter`` 产物）。
+        decision_provider: 可选的 d1 决策 provider。仅在
+            ``data_quality.ingest_guard.enabled`` 打开时启用语义级质量分级与
+            合规判定（见 :mod:`src.ingest_guard`）；为 ``None`` 时该步骤整体跳过，
+            行为与不做门禁完全一致。
 
     Returns:
-        (chunks, report_dict) — report_dict 含 gate / dedup 统计，供入库方
-        写入 DocumentRecord 并在 API 响应中返回，保证数据层可审计。
+        (chunks, report_dict) — report_dict 含 gate / dedup / ingest_guard 统计，
+        供入库方写入 DocumentRecord 并在 API 响应中返回，保证数据层可审计。
     """
     dq_cfg = cfg.get("data_quality", {}) or {}
     report: Dict[str, Any] = {}
@@ -330,6 +335,20 @@ def run_data_pipeline(
     # 5. 分块级去重
     chunks, chunk_dups = dedup_chunks(chunks, near_dup_threshold=float(dq_cfg.get("near_dup_threshold", 0.0) or 0.0))
 
+    # 5.5 d1 决策门禁（可选）：语义级质量分级 + 合规判定。
+    #     放在 breadcrumb 前缀注入**之前**——前缀会污染内容、影响质量判定。
+    #     默认 action=flag（只打标不删内容），配 action=drop 才拦截低质/可疑块。
+    guard_cfg = dq_cfg.get("ingest_guard", {}) or {}
+    guard_report: Dict[str, Any] = {}
+    if guard_cfg.get("enabled") and decision_provider is not None:
+        from .ingest_guard import guard_chunks
+
+        guard = guard_chunks(chunks, decision_provider, guard_cfg)
+        chunks = guard.kept
+        guard_report = guard.report
+        if guard.flagged:
+            guard_report = {**guard_report, "flagged_sample": guard.flagged[:50]}
+
     # 6. breadcrumb 前缀注入（保留章节语境，检索命中时块自带出处层级）。
     #    优先使用短版 chunk_prefix（末级章节名），缺失时回退完整 breadcrumb。
     if add_breadcrumb:
@@ -340,6 +359,8 @@ def run_data_pipeline(
                 ck.text = f"【{prefix}】\n{ck.text}"
 
     report["chunk_dedup_dropped"] = chunk_dups
+    if guard_report:
+        report["ingest_guard"] = guard_report
     report["chunks"] = len(chunks)
 
     return chunks, report

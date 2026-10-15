@@ -73,7 +73,10 @@ class TestSubmitFeedback:
         resp = client.post("/api/v1/feedback", json={"query": "q", "rating": "meh"})
         assert resp.status_code == 422
 
-    def test_requires_auth(self, client):
+    def test_requires_auth(self, client, monkeypatch):
+        # 默认是本地单用户模式（匿名请求落到本地用户 → 200）。
+        # 本用例验证的是"启用认证后"的拒绝路径，故显式开启认证。
+        monkeypatch.setenv("AUTH_ENABLED", "1")
         # 仅移除认证覆盖（保留 DB 覆盖），真实 get_current_user 会因无 token 拒绝
         client.extra_override.pop(_get_current_user)
         resp = client.post("/api/v1/feedback", json={"query": "q", "rating": "helpful"})

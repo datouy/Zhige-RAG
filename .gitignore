@@ -109,3 +109,9 @@ e2e_*.txt
 *.egg-info/
 build/
 dist/
+
+# 工作台项目记忆/中间数据（不应进仓库）
+.workbuddy/
+
+# 界面写入的本地模型设置（个性化，不进仓库）
+config/local_overrides.yaml

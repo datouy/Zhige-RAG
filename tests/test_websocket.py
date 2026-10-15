@@ -104,28 +104,35 @@ def test_websocket_chat_rejects_empty_query(client):
         assert "required" in msg.get("data", "")
 
 
-def test_websocket_chat_rejects_invalid_token(client):
-    """token 无效时 WS 应拒绝连接（4401），不再匿名落到全局知识库。"""
+def test_websocket_chat_rejects_invalid_token(client, monkeypatch):
+    """启用认证时，token 无效的 WS 连接应被拒绝（4401）。
+
+    默认是本地单用户模式（不校验 token，匿名落到本地用户），
+    因此这里显式开启认证来测拒绝路径。
+    """
     from starlette.testclient import WebSocketDisconnect
 
+    monkeypatch.setenv("AUTH_ENABLED", "1")
     with pytest.raises(WebSocketDisconnect):
         with client.websocket_connect("/ws/chat?token=garbage"):
             pass
 
 
-def test_websocket_agent_rejects_invalid_token(client):
-    """Agent WS 同样拒绝无效 token。"""
+def test_websocket_agent_rejects_invalid_token(client, monkeypatch):
+    """Agent WS 同样拒绝无效 token（认证策略与 /ws/chat 保持一致）。"""
     from starlette.testclient import WebSocketDisconnect
 
+    monkeypatch.setenv("AUTH_ENABLED", "1")
     with pytest.raises(WebSocketDisconnect):
         with client.websocket_connect("/api/v1/ws/agent?token=garbage"):
             pass
 
 
-def test_websocket_chat_no_token_param_rejected(client):
-    """不带 token 参数也应被拒绝（不再允许匿名会话）。"""
+def test_websocket_chat_no_token_param_rejected(client, monkeypatch):
+    """启用认证时，不带 token 参数也应被拒绝。"""
     from starlette.testclient import WebSocketDisconnect
 
+    monkeypatch.setenv("AUTH_ENABLED", "1")
     with pytest.raises(WebSocketDisconnect):
         with client.websocket_connect("/ws/chat"):
             pass
@@ -153,3 +160,56 @@ def test_websocket_chat_valid_token_then_empty_query(client):
         msg = ws.receive_json()
         assert msg.get("event") == "error"
         assert "required" in msg.get("data", "")
+
+
+# ----------------------------------------------------------------------
+#  Agent WS：与 /ws/chat 的认证策略保持一致
+# ----------------------------------------------------------------------
+
+
+class _FakeAgent:
+    """假 Agent：不加载 LLM，直接产出流式事件。"""
+
+    max_steps = 5
+    llm = None
+    tools: list = []
+    decision_provider = None
+
+    def run(self, query, stream=True):
+        yield {"event": "token", "data": "ok"}
+        yield {"event": "done", "data": []}
+
+
+def test_websocket_agent_allows_local_mode(client):
+    """本地单用户模式（默认）下，Agent WS 不要求 token —— 与 /ws/chat 一致。
+
+    回归防护：此前 agent WS 无条件要求 token，本地模式下前端拿不到 token，
+    连接会被 4401 直接拒绝，Agent 功能形同不可用。
+    """
+    with client.websocket_connect("/api/v1/ws/agent") as ws:
+        ws.send_json({"query": ""})
+        msg = ws.receive_json()
+        assert msg.get("event") == "error"
+        assert "required" in msg.get("data", "")
+
+
+def test_websocket_agent_streams_without_nameerror(client, monkeypatch):
+    """有效消息应正常产出事件（并发闸代码路径可走通）。
+
+    回归防护：P0-1 删除了 AsyncLLMExecutor，但路由里残留 ``executor`` 引用，
+    导致首条消息即 NameError。此处用假 Agent 走通那段代码。
+    """
+    import api.routes.agent as agent_module
+
+    monkeypatch.setattr(agent_module, "_get_agent", lambda user_id=None: _FakeAgent())
+    with client.websocket_connect("/api/v1/ws/agent") as ws:
+        ws.send_json({"query": "你好"})
+        events = []
+        while True:
+            ev = ws.receive_json()
+            events.append(ev)
+            if ev.get("event") in ("done", "error"):
+                break
+        types = [e.get("event") for e in events]
+        assert "error" not in types, f"不应出现 error 事件：{events}"
+        assert "done" in types

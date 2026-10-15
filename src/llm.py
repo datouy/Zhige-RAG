@@ -293,6 +293,10 @@ class LocalLLM:
     def _generate_with_timeout(self, prompt: str, gen_cfg: GenerationConfig, timeout: float) -> str:
         """带超时的生成方法。
 
+        P1-5 修复：超时度量不准确
+        - 问题：future.result(timeout) 把排队时间计入超时
+        - 方案：在任务开始时记录时刻，只度量真正的生成耗时
+        
         说明：之前这里用 ``signal.alarm/SIGALRM`` 实现，但 Windows 上根本没有
         ``alarm``，且 signal 处理器只能在主线程生效（FastAPI 的同步端点跑在
         线程池里），因此跨平台一律改为线程池 + ``future.result(timeout)``。
@@ -300,13 +304,34 @@ class LocalLLM:
         中断，作为 daemon 线程随进程退出。
         """
         pool = _get_timeout_pool()
+        
+        # P1-5 修复：使用队列传递开始时间，排除排队延迟
+        import queue
+        start_queue: queue.Queue = queue.Queue(maxsize=1)
 
         def _run() -> str:
+            # 任务真正开始时记录时刻
+            start_queue.put(time.time())
             return self._generate_with_retry(prompt, gen_cfg)
 
+        submit_time = time.time()
         future = pool.submit(_run)
+        
         try:
-            return future.result(timeout=max(0.1, float(timeout)))
+            # 等待任务开始（最多等 timeout）
+            try:
+                actual_start = start_queue.get(timeout=timeout)
+                # 计算剩余超时时间（排除排队时间）
+                elapsed_queue = actual_start - submit_time
+                remaining_timeout = max(0.1, timeout - elapsed_queue)
+            except queue.Empty:
+                # 排队超时
+                future.cancel()
+                logger.warning("LLM 任务排队超时（%.1f 秒）", timeout)
+                raise TimeoutError(f"LLM 任务排队超时（{timeout}s）") from None
+            
+            # 等待实际生成完成（只计生成时间）
+            return future.result(timeout=remaining_timeout)
         except FuturesTimeoutError:
             future.cancel()
             logger.warning("LLM 生成超时（%.1f 秒）", timeout)

@@ -1,0 +1,15 @@
+# ============================================================
+# NVIDIA GPU 量化依赖 —— 完全可选
+# ============================================================
+# bitsandbytes 提供 4bit/8bit 量化（对应 config.yaml 的 llm.quantization）。
+#
+# ⚠️ 它**只在 NVIDIA CUDA 环境可用**（>=0.43 需 CUDA 11.8+）。
+#    Windows 上若 torch 是 CPU 版、或机器没有 NVIDIA 显卡，安装会失败 ——
+#    这正是把它从默认依赖中移出的原因（否则 `pip install -r requirements.txt`
+#    会在大量机器上直接报错，属于"开箱即用"的硬伤）。
+#
+# 确认有 NVIDIA GPU 时再装：
+#     pip install -r requirements-gpu.txt
+# ============================================================
+
+bitsandbytes>=0.43.0

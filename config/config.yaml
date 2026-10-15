@@ -9,13 +9,26 @@
 
 # ------------------ 项目基础 ------------------
 project:
-  name: "ChineseRAGKB"
-  version: "0.2.0"
-  description: "中文知识库 RAG 系统"
+  name: "知阁 Zhige"
+  version: "0.3.0"
+  description: "开箱即用的本地中文知识库 RAG 平台，面向个人开发者与中小企业"
 
 app:
-  name: "中文知识库 RAG"
-  version: "0.2.0"
+  name: "知阁"
+  version: "0.3.0"
+
+# ------------------ 认证 ------------------
+#
+# enabled: false（默认）—— **单用户本地模式**：打开就能用，不需要注册登录。
+#     所有数据归属一个固定的"本地用户"，并给予 enterprise 级额度（不受配额限制）。
+#     适合：个人开发者、单机部署、内网私有化。
+#
+# enabled: true —— 启用 JWT 认证与多租户隔离（登录后各人只看得到自己的知识库）。
+#     适合：一台服务器多人共用。
+#
+# 也可用环境变量强制覆盖（容器/临时调试很方便）：AUTH_ENABLED=1
+auth:
+  enabled: false
 
 # ------------------ 数据目录 ------------------
 paths:
@@ -39,6 +52,33 @@ document_loader:
   markdown_extensions:
     - tables
     - fenced_code
+
+  # 扫描件 OCR（可选能力，实现见 src/document_loader.py::_augment_pdf_with_ocr）
+  #
+  # 依赖：pip install -r requirements-ocr.txt
+  #       （pymupdf + rapidocr-onnxruntime，约 100~150 MB，纯 CPU 可跑，无需 poppler）
+  # 未安装时静默跳过，不影响其他功能。
+  #
+  # 工作方式：先用常规引擎提取文本，再对「文本过少」的页面**逐页** OCR 补齐 ——
+  # 因此"正文可正常提取 + 附件页是扫描图"这类混合型 PDF 也能完整入库；
+  # OCR 出来的分块 metadata 会打上 ocr=true 便于溯源。
+  ocr:
+    enabled: true          # 装上依赖后即生效；设为 false 可全局关闭
+    min_text_chars: 20     # 单页文本少于该字符数 → 视为需要 OCR
+    dpi: 200               # 渲染分辨率：越高越准也越慢（200 通常够用）
+    max_pages: 50          # 单文件最多 OCR 多少页（安全阀，防一次上传占满 CPU）
+
+  # 网页导入（实现见 src/web_loader.py，接口 POST /api/v1/ingest/url）
+  #
+  # 安全：默认拒绝内网地址。校验的是**域名解析后的 IP**，重定向逐跳复检 ——
+  # 只校验域名会被 DNS rebinding 绕过（evil.com 解析到 127.0.0.1）。
+  url:
+    timeout: 15.0
+    max_bytes: 5242880     # 单页最大 5 MB
+    max_chars: 200000      # 正文最大字符数，超出截断
+    # ⚠️ 仅在抓取内网自建服务（内部 Wiki 等）时才打开；
+    #    公网可访问的部署务必保持 false，否则等于开放 SSRF。
+    allow_private: false
 
 # ------------------ 文本分块（优化版）------------------
 # 
@@ -64,15 +104,52 @@ text_splitter:
   strip_whitespace: true
 
 # ------------------ Embedding 模型 ------------------
+#
+# backend 与 llm.backend 同理（实现见 src/embeddings_provider.py）：
+#   local  —— sentence-transformers，**需要 torch（2~3 GB）**
+#   ollama —— 本机 Ollama 的 embedding 模型，**不需要 torch** ← 开箱即用推荐
+#   openai —— 任意 OpenAI 兼容的 /v1/embeddings（通义 DashScope、硅基流动、OpenAI…）
+#
+# ⚠️ 切换 Embedding 模型会改变向量维度。非 local 后端会自动为 collection
+#    追加"后端+模型"指纹，避免与旧向量混在同一个库里（见 embedding_collection_name）。
+# 
+# 【开箱即用推荐配置】
+#   LLM_BACKEND=ollama && EMBEDDING_BACKEND=ollama
+#   不需要 torch，不需要 GPU，不需要下载权重
 embedding:
+  backend: "ollama"
+
+  # --- backend: ollama（不想装 torch 时首选）---
+  # 准备：ollama pull nomic-embed-text
+  ollama:
+    model: "nomic-embed-text"
+    base_url: "http://localhost:11434/v1"
+    timeout: 60.0
+    # dim: 768            # 不确定可留空，首次 encode 后自动探测并记录
+
+  # --- backend: openai（任何 OpenAI 兼容服务）---
+  # 示例：
+  #   通义千问  base_url: https://dashscope.aliyuncs.com/compatible-mode/v1   model: text-embedding-v3
+  #   硅基流动  base_url: https://api.siliconflow.cn/v1                      model: BAAI/bge-m3
+  #   OpenAI   base_url: https://api.openai.com/v1                          model: text-embedding-3-small
+  openai:
+    model: "text-embedding-3-small"
+    base_url: "https://api.openai.com/v1"
+    api_key: ${OPENAI_API_KEY:-}
+    timeout: 60.0
+
+  # --- backend: local ---
   model_name: "BAAI/bge-small-zh-v1.5"
   device: "cpu"
   batch_size: 16
   normalize_embeddings: true
   max_seq_length: 512
+  # 仅对 bge-*-zh-v1.5 系列等"查询需加指令"的本地模型生效；
+  # API embedding 一般不需要，可留空。
   query_instruction: "为这个句子生成表示以用于检索相关文章："
   use_doc_instruction: false
   cache_dir: "./models/sentence-transformers"
+  # true = 只用本地已有模型、不联网。**首次部署请改为 false** 让它自动下载（约 100 MB）。
   local_files_only: true
 
 # ------------------ 向量数据库 ------------------
@@ -102,6 +179,23 @@ data_quality:
     expiry_days: 0
     reject_multi_group_acl: true
 
+  # 入库内容质检门禁（d1 决策原语；需 decision.enabled=true）
+  #
+  # 规则式 DataGate 只能按"状态/权限/过期"过滤，抓不到语义级问题。本门禁用
+  #   score 原语 —— 质量分级：乱码/页眉页脚/目录残片/断裂表格 → 低质；
+  #   noul  原语 —— 合规判定：涉黄涉暴/违法/极端仇恨 → 可疑。
+  # 两个判断在同一次决策调用里完成。实现见 src/ingest_guard.py。
+  #
+  # action=flag：只给低质/可疑块打 metadata 标记（_guard_low_quality /
+  #              _guard_suspicious），内容照常入库 —— 默认，非破坏性；
+  # action=drop：低质/可疑块直接拦截不入库（保守部署可选）。
+  ingest_guard:
+    enabled: false
+    action: "flag"
+    max_chunks: 200                # 单文件最多检查多少块（成本护栏）
+    min_quality_score: 0.3         # 归一化质量分低于此 → 判为低质
+    compliance_min_probability: 0.7 # P(违规) ≥ 此值 → 判为可疑
+
 # ------------------ 检索参数（优化版）------------------
 #
 # 推荐配置：
@@ -124,20 +218,137 @@ retrieval:
 # 用 cross-encoder 重排模型（如 bge-reranker）对候选结果重新打分
 # 只把真正相关的 Top-3~5 喂给大模型
 #
+# backend 决定"用什么重排"：
+#   bge  —— bge-reranker 交叉编码器（精度高、CPU 上偏慢，需 FlagEmbedding）
+#   d1   —— d1 决策模型 score 原语（毫秒级、0 输出 token，见下方 decision 段）
+#   auto —— 优先 d1，不可用时回落 bge
+#
 # ⚡ 速度优化：如需更快响应，可关闭 reranker (enabled: false)
 # 🎯 精度优先：保持开启状态
 #
 reranker:
   enabled: false                   # 默认关闭以提升速度，需要更精准时设为 true
+  backend: "bge"                   # bge | d1 | auto
   model_name: "./models/bge-reranker-base"
   device: "cpu"
   top_n: 3                        # 最终返回数
   max_length: 256
   cache_dir: "./models/huggingface"
   min_relevance: 0.3             # 重排后最低相关度阈值
+  max_candidates: 24             # backend=d1 时最多重排多少个候选（成本护栏）
+
+# ------------------ d1 决策层（Decision Primitives）------------------
+#
+# 参考 Liquid AI d1 决策模型：不做逐 token 生成，而是**单次前向**直接输出决策，
+# 毫秒级、0 输出 token、无格式崩塌。定义三种原语：
+#   noul   是/否判定（输出 0~1 校准概率）
+#   choice 多选一分类（输出各选项概率分布 + 最高置信项）
+#   score  有序梯度评分（2~10 级，输出期望分值 + 置信度）
+#
+# 本配置把决策层接到七个环节（各自独立开关，默认全关 → 行为与改造前一致）：
+#   rerank                检索重排     —— score 原语（配合 reranker.backend=d1）
+#   query_route           意图路由     —— choice 原语（叠加在正则规则之上）
+#   tool_select           Agent 工具调度 —— choice 原语（替代脆弱的 Action 文本解析）
+#   verify                答案校验     —— noul（语义接地）+ score（质量分级）
+#   retrieval_sufficiency 检索充分性   —— noul 原语（不足则跳过生成直接拒答）
+#   feedback_route        差评自动分流 —— choice 原语（对应"工单分流到业务组"）
+#   ingest_guard（见 data_quality 段）入库质检/合规 —— score + noul 原语
+#
+# backend 决定"决策模型从哪来"（实现见 src/decision_provider.py）：
+#   llm  —— 用项目已有的 LLM（本地 Qwen / Ollama / OpenAI 兼容）模拟三种原语。
+#           **不装 torch、不下载新权重**，与上面的 llm.backend 共用配置。
+#   d1   —— 原生加载 LiquidAI/d1-3B（transformers>=5.14 + torch，见
+#           requirements-d1.txt）。真正的单次前向，最快最稳。
+#   auto —— 先试 d1，权重不可用则自动回落 llm。
+#   none —— 关闭决策层。
+#
+# 【推荐】先按 backend: "llm" 用你现有的本地 Qwen 跑通；有 GPU 再换 "d1"。
+decision:
+  enabled: false                  # 总开关：false 时以下所有环节均不生效
+  backend: "llm"                  # llm | d1 | auto | none
+  model_name: "LiquidAI/d1-3B"    # backend=d1 时使用
+  device: "auto"
+  cache_dir: "./models/huggingface"
+  local_files_only: true          # 只用本地已有权重、不联网
+  dtype: ""                       # 留空自动（CPU→float32，其它→bfloat16）
+  max_new_tokens: 256             # backend=llm 时限制决策输出长度，降低延迟
+
+  rerank:                         # 用 d1 score 重排（需 reranker.enabled=true）
+    enabled: false
+    relevance_ladder:             # 相关度阶梯（由低到高，2~10 级）
+      - "完全不相关"
+      - "基本无关"
+      - "弱相关"
+      - "部分相关"
+      - "较为相关"
+      - "高度相关"
+      - "完全相关"
+
+  query_route:                    # 用 d1 choice 增强意图路由
+    enabled: false
+    min_confidence: 0.6           # 一般改判所需置信度
+    chitchat_min_confidence: 0.75 # 改判为寒暄（会跳过检索）要求更严
+
+  tool_select:                    # 用 d1 choice 预选 Agent 工具
+    enabled: false
+    min_confidence: 0.5
+
+  verify:                         # 用 d1 noul + score 增强答案校验
+    enabled: false
+
+  retrieval_sufficiency:          # 用 d1 noul 判定"检索是否足以回答"
+    enabled: false                # 明显不足 → 跳过生成直接拒答（省一次 LLM 调用）
+    min_probability: 0.25         # P(充分) 低于此值才判为不足（保守，避免误伤）
+    max_chunks: 5                 # 判定时最多喂多少片段
+
+  feedback_route:                 # 用 d1 choice 给差评自动分流到处理环节
+    enabled: false                # 自动填充 FeedbackRecord.question_type
+    min_confidence: 0.5
+
 
 # ------------------ 大语言模型 ------------------
+#
+# backend 决定「模型从哪来」（实现见 src/llm_provider.py）：
+#   local  —— 本地 HuggingFace 权重。需预先下载模型，无 GPU 时较慢。
+#   ollama —— 本机/内网 Ollama 服务。**无需 GPU、无需下载权重**。← 开箱即用推荐
+#   openai —— 任意 OpenAI 兼容接口（DeepSeek / 通义千问 / 智谱 / 硅基流动 /
+#             vLLM / LM Studio …）。只要 base_url + api_key，完全不需要 GPU。
+#
+# 【开箱即用推荐配置】
+#   LLM_BACKEND=ollama && EMBEDDING_BACKEND=ollama
+#   不需要 torch，不需要 GPU，不需要下载权重，一条命令启动：
+#   ollama pull qwen2.5:7b && ollama pull nomic-embed-text && python scripts/quickstart.py
+#
+# 快速切换：
+#   1) 已装 Ollama：    backend 改 "ollama"，执行 `ollama pull qwen2.5:7b`
+#   2) 用云端 API：     backend 改 "openai"，填好下方 openai 段
+#   3) 完全离线推理：   backend 保持 "local"，预先下载 model_name 指向的权重
 llm:
+  backend: "ollama"
+
+  # --- backend: ollama ---
+  # model 用 `ollama list` 显示的名字；Ollama 自带 OpenAI 兼容端点。
+  ollama:
+    model: "qwen2.5:7b"
+    base_url: "http://localhost:11434/v1"
+    timeout: 120.0
+    # Ollama 默认不校验密钥，留空即可；走内网网关时才需要。
+    # api_key: ${OLLAMA_API_KEY:-}
+
+  # --- backend: openai（任何 OpenAI 兼容服务）---
+  # 常用示例：
+  #   DeepSeek    base_url: https://api.deepseek.com/v1                      model: deepseek-chat
+  #   通义千问    base_url: https://dashscope.aliyuncs.com/compatible-mode/v1  model: qwen-plus
+  #   智谱清言    base_url: https://open.bigmodel.cn/api/paas/v4              model: glm-4-flash
+  #   硅基流动    base_url: https://api.siliconflow.cn/v1                     model: Qwen/Qwen2.5-7B-Instruct
+  #   vLLM/LM Studio  base_url: http://localhost:8000/v1
+  openai:
+    model: "deepseek-chat"
+    base_url: "https://api.deepseek.com/v1"
+    api_key: ${OPENAI_API_KEY:-}
+    timeout: 120.0
+
+  # --- backend: local（本地权重）---
   model_name: "./models/Qwen2.5-1.5B-Instruct"
   model_path: ""
   device: "auto"
@@ -145,6 +356,8 @@ llm:
   torch_dtype: "float16"
   cache_dir: "./models/huggingface"
   trust_remote_code: false
+  # true = 只用本地文件、不联网。首次部署请改为 false 让它自动下载，
+  # 或提前把权重放到 model_name 指定的目录。这是"开箱即用"最常见的卡点。
   local_files_only: true
   use_chat_template: true
   chat_template: "auto"
@@ -209,7 +422,7 @@ evaluation:
 
 # ------------------ Web UI ------------------
 ui:
-  title: "中文知识库 RAG"
+  title: "知阁 · 本地知识库"
   page_icon: "📚"
   theme: "light"
   default_top_k: 4

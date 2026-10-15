@@ -52,6 +52,15 @@ DEFAULT_MAX_RETRIES = 2
 # 强词面命中可达 0.7+，不会被误伤；阈值取保守值，只拦截明显无关的查询。
 DEFAULT_MIN_SCORE = 0.25
 
+# d1 决策"检索充分性"判定指令（noul 原语）。生成前先问一句"这些片段够不够回答"，
+# 不够就跳过生成直接拒答——用一次毫秒级决策省掉一次自回归生成，也从源头掐掉
+# "没检索到却硬编"的幻觉。这是文章"单次前向决策替代逐 token 生成"的直接落地。
+RETRIEVAL_SUFFICIENCY_INSTRUCTION = (
+    "判断给出的「候选片段」是否包含足以回答「问题」的信息。"
+    "只有当片段确实涵盖了回答问题所需的关键内容时才回答“是”；"
+    "若片段只是沾边、缺失关键信息，或与问题无关，应回答“否”。"
+)
+
 
 def normalize_query(query: str) -> str:
     """查询归一化：全角字母/数字/符号 → 半角（NFKC），合并空白。
@@ -98,6 +107,9 @@ class RAGPipeline:
         llm: LocalLLM 实例。
         reranker: 可选 BgeReranker 实例。
         prompts: PromptTemplate 实例。
+        long_term_store: 可选长期记忆存储（默认自建 SQLite）。
+        kg_store: 可选知识图谱存储。多租户场景由调用方注入用户专属实例；
+            为 ``None`` 时 ``_get_graph_retriever`` 会按配置就地创建。
     """
 
     def __init__(
@@ -109,12 +121,18 @@ class RAGPipeline:
         reranker: Optional[BgeReranker] = None,
         prompts: Optional[PromptTemplate] = None,
         long_term_store: Optional[Any] = None,
+        kg_store: Optional[Any] = None,
+        decision_provider: Optional[Any] = None,
     ) -> None:
         self.config = config
         self.embedding = embedding
         self.vector_store = vector_store
         self.llm = llm
         self.reranker = reranker
+        # d1 决策层（可选）：驱动重排 / 路由 / 校验三处增强。
+        # 显式注入优先；未注入时 _get_decision_provider 按配置懒加载。
+        self.decision_provider = decision_provider
+        self._decision_state_checked = False
         self.prompts = prompts or PromptTemplate.from_yaml(
             config.get("rag", {}).get("system_prompt_file", "config/prompts.yaml")
         )
@@ -131,9 +149,99 @@ class RAGPipeline:
                 self.long_term_store = None
         else:
             self.long_term_store = long_term_store
+        # 知识图谱存储：多租户场景由调用方注入用户专属实例
+        # （见 api/deps.py::get_runtime_pipeline）；为 None 时
+        # _get_graph_retriever 按配置就地创建（单租户 / 离线脚本路径）。
+        self.kg_store: Optional[Any] = kg_store
         # GraphRAG 懒加载状态（_get_graph_retriever 首次调用时探测）
         self._graph_state_checked = False
         self._graph_retriever: Optional[Any] = None
+
+    # ------------------------------------------------------------------
+    def _get_decision_provider(self) -> Optional[Any]:
+        """懒加载 d1 决策 provider（未启用 / 构造失败时返回 None）。
+
+        与 GraphRAG 的懒加载同构：决策层是"锦上添花"，配置没开或后端不可用
+        时静默跳过，绝不阻塞正常问答。显式注入（``__init__`` 的
+        ``decision_provider``）优先，避免重复加载。
+        """
+        if self._decision_state_checked:
+            return self.decision_provider
+        self._decision_state_checked = True
+        if self.decision_provider is not None:
+            return self.decision_provider
+        dcfg = self.config.get("decision", {}) or {}
+        if not dcfg.get("enabled"):
+            return None
+        try:
+            from .decision_provider import create_decision_provider
+
+            self.decision_provider = create_decision_provider(
+                dcfg, llm=self.llm, llm_cfg=self.config.get("llm")
+            )
+            if self.decision_provider is not None:
+                logger.info("决策层已就绪：%s", getattr(self.decision_provider, "name", "?"))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("决策层初始化失败（已跳过）: %s", exc)
+            self.decision_provider = None
+        return self.decision_provider
+
+    def _classify(self, question: str):
+        """意图路由：规则打底，配置开启时叠加 d1 ``choice`` 决策。"""
+        base = classify_query(question)
+        dcfg = self.config.get("decision", {}) or {}
+        if not (dcfg.get("query_route", {}) or {}).get("enabled"):
+            return base
+        provider = self._get_decision_provider()
+        if provider is None:
+            return base
+        from .query_router import classify_query_with_decision
+
+        return classify_query_with_decision(question, provider, base=base)
+
+    # ------------------------------------------------------------------
+    def _assess_retrieval_sufficiency(
+        self, question: str, hits: List[Hit]
+    ) -> Optional[bool]:
+        """用 d1 ``noul`` 原语判定"检索到的片段是否足以回答"。
+
+        返回三态：``True`` 充分 / ``False`` 明显不充分 / ``None`` 不判断。
+        仅在 ``decision.retrieval_sufficiency.enabled`` 打开且 provider 可用时
+        才做判断，其余情况一律返回 ``None``（调用方保持原行为）。
+
+        保守性：阈值 ``min_probability`` 取得较低——只有当决策模型相当确信"这些
+        片段答不了"时才走拒答，避免误伤边界查询。
+        """
+        dcfg = (self.config.get("decision", {}) or {}).get("retrieval_sufficiency", {}) or {}
+        if not dcfg.get("enabled") or not hits:
+            return None
+        provider = self._get_decision_provider()
+        if provider is None:
+            return None
+
+        max_chunks = max(1, int(dcfg.get("max_chunks", 5)))
+        ctx = "\n".join(
+            f"[{i + 1}] {str(h.text or '')[:600]}" for i, h in enumerate(hits[:max_chunks])
+        )
+        text = f"问题：{question}\n候选片段：\n{ctx}"
+        try:
+            res = provider.noul(text, RETRIEVAL_SUFFICIENCY_INSTRUCTION, key="sufficient")
+        except Exception as exc:  # noqa: BLE001 - provider 已兜底，这里再保险一层
+            logger.warning("检索充分性决策失败（沿用原流程）: %s", exc)
+            return None
+        if res is None:
+            return None
+
+        threshold = float(dcfg.get("min_probability", 0.25))
+        sufficient = res.probability >= threshold
+        if not sufficient:
+            logger.info(
+                "决策判定检索不足：P(充分)=%.2f < %.2f，问题「%s」",
+                res.probability,
+                threshold,
+                (question or "")[:30],
+            )
+        return sufficient
 
     # ------------------------------------------------------------------
     def _relevance_hint(self, hits: List[Hit]) -> str:
@@ -240,14 +348,31 @@ class RAGPipeline:
         return hits
 
     def _verify(self, answer: str, context_chunks: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-        """可验证性校验（可经 rag.verification.enabled 关闭）。"""
+        """可验证性校验（可经 rag.verification.enabled 关闭）。
+
+        ``decision.verify.enabled`` 打开且决策 provider 可用时，叠加 d1 的
+        ``noul``（语义接地）与 ``score``（质量分级）增强；否则与改造前完全一致。
+        """
         if not self.config.get("rag", {}).get("verification", {"enabled": True}).get("enabled", True):
             return None
-        from .verifier import verify_answer
+        from .verifier import verify_answer, verify_answer_with_decision
 
         fallback = self.config.get("rag", {}).get("fallback_answer", FALLBACK_NO_HIT_ANSWER)
         min_ratio = float(self.config.get("rag", {}).get("verification", {}).get("min_cited_ratio", 0.5))
         min_grounding = float(self.config.get("rag", {}).get("verification", {}).get("min_grounding", 0.6))
+
+        provider = None
+        if (self.config.get("decision", {}) or {}).get("verify", {}).get("enabled"):
+            provider = self._get_decision_provider()
+        if provider is not None:
+            return verify_answer_with_decision(
+                answer,
+                context_chunks,
+                provider,
+                fallback_answer=fallback,
+                min_cited_ratio=min_ratio,
+                min_grounding=min_grounding,
+            ).to_dict()
         return verify_answer(
             answer,
             context_chunks,
@@ -289,7 +414,14 @@ class RAGPipeline:
         try:
             from .kg import GraphRetriever, create_kg_store
 
-            store = create_kg_store(kg_cfg)
+            # 优先使用调用方注入的租户专属 store；否则按配置就地创建
+            # （全局/单租户路径）。此前无论如何都 create_kg_store(kg_cfg)，
+            # 导致多租户下每个租户都在读全局 data/kg.db。
+            store = (
+                self.kg_store
+                if self.kg_store is not None
+                else create_kg_store(kg_cfg)
+            )
             counts = store.count() or {}
             if int(counts.get("entities", 0) or 0) <= 0:
                 logger.info(
@@ -383,32 +515,20 @@ class RAGPipeline:
 
     # ------------------------------------------------------------------
     @staticmethod
-    def _build_llm_from_cfg(llm_cfg: Dict[str, Any]) -> "LocalLLM":
-        """根据 ``cfg.llm`` 子 dict 构造 ``LocalLLM`` 实例。
+    def _build_llm_from_cfg(llm_cfg: Dict[str, Any]) -> Any:
+        """根据 ``cfg.llm`` 子 dict 构造 LLM 实例（多后端分派）。
 
-        P1.4: ``from_config`` 与 ``ensure_llm`` 共用同一构造逻辑，避免字段
-        漂移（device_map / torch_dtype / 量化参数等）。
+        这是全项目 LLM 构造的**唯一入口** —— ``from_config`` / ``ensure_llm`` /
+        ``api/deps.get_pipeline`` 都经由这里，所以在此处做后端分派，即可让
+        FastAPI、Streamlit UI、离线脚本统一支持 Ollama 与 OpenAI 兼容服务。
+
+        后端由 ``llm.backend`` 决定（``local`` / ``ollama`` / ``openai``），
+        实现见 :mod:`src.llm_provider`。返回值只需满足 ``chat()`` 协议，
+        不再强绑 :class:`LocalLLM`。
         """
-        gen_cfg = llm_cfg.get("generation", {})
-        return LocalLLM(
-            model_name=llm_cfg.get("model_name", "Qwen/Qwen2.5-1.5B-Instruct"),
-            device=llm_cfg.get("device", "auto"),
-            device_map=llm_cfg.get("device_map", "auto"),
-            torch_dtype=llm_cfg.get("torch_dtype", "auto"),
-            quant=llm_cfg.get("quantization"),
-            cache_dir=llm_cfg.get("cache_dir"),
-            generation=GenerationConfig(
-                max_new_tokens=gen_cfg.get("max_new_tokens", 512),
-                temperature=gen_cfg.get("temperature", 0.7),
-                top_p=gen_cfg.get("top_p", 0.8),
-                repetition_penalty=gen_cfg.get("repetition_penalty", 1.05),
-                do_sample=gen_cfg.get("do_sample", True),
-            ),
-            chat_template=llm_cfg.get("chat_template", "auto"),
-            local_files_only=llm_cfg.get("local_files_only", False),
-            trust_remote_code=llm_cfg.get("trust_remote_code", False),
-            max_retries=llm_cfg.get("max_retries", DEFAULT_MAX_RETRIES),
-        )
+        from src.llm_provider import create_llm
+
+        return create_llm(llm_cfg)
 
     # ------------------------------------------------------------------
     @classmethod
@@ -433,21 +553,20 @@ class RAGPipeline:
 
         cfg = apply_env_overrides(cfg)
 
-        # 1. Embedding
-        embedding = EmbeddingModel(
-            model_name=cfg["embedding"]["model_name"],
-            device=cfg["embedding"].get("device", "auto"),
-            batch_size=cfg["embedding"].get("batch_size", 32),
-            max_seq_length=cfg["embedding"].get("max_seq_length", 512),
-            normalize=cfg["embedding"].get("normalize_embeddings", True),
-            cache_dir=cfg["embedding"].get("cache_dir"),
-            local_files_only=cfg["embedding"].get("local_files_only", False),
-        )
+        # 1. Embedding（后端由 embedding.backend 决定：local / ollama / openai）
+        # 必须走工厂：直接构造 EmbeddingModel 会强制加载本地 sentence-transformers
+        from src.embeddings_provider import create_embedding, embedding_collection_name
+
+        embedding = create_embedding(cfg.get("embedding", {}))
 
         # 2. Vector Store
         vs = ChromaStore(
             persist_directory=cfg["vector_store"]["persist_directory"],
-            collection_name=cfg["vector_store"].get("collection_name", "chinese_rag_kb"),
+            # 非 local 后端追加"后端+模型"指纹，避免换模型后与旧向量混库
+            collection_name=embedding_collection_name(
+                cfg["vector_store"].get("collection_name", "chinese_rag_kb"),
+                cfg.get("embedding", {}),
+            ),
             embedding_model=embedding,
             distance_fn=cfg["vector_store"].get("distance_fn", "cosine"),
             **hybrid_kwargs(cfg.get("vector_store", {})),
@@ -458,19 +577,34 @@ class RAGPipeline:
         if not lazy_llm:
             llm = cls._build_llm_from_cfg(cfg.get("llm", {}))
 
-        # 4. Reranker（可选）
+        # 4. 决策层（可选）：d1 原语 provider，驱动重排 / 路由 / 校验
+        decision_provider = None
+        if (cfg.get("decision", {}) or {}).get("enabled"):
+            try:
+                from .decision_provider import create_decision_provider
+
+                decision_provider = create_decision_provider(
+                    cfg.get("decision"), llm=llm, llm_cfg=cfg.get("llm")
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("决策层初始化失败（已忽略）: %s", exc)
+
+        # 5. Reranker（可选；backend: bge | d1）
         reranker = None
         if cfg.get("reranker", {}).get("enabled"):
-            reranker = BgeReranker(
-                model_name=cfg["reranker"]["model_name"],
-                device=cfg["reranker"].get("device", "auto"),
-                cache_dir=cfg["reranker"].get("cache_dir", cfg["embedding"].get("cache_dir")),
+            from .reranker import create_reranker
+
+            reranker = create_reranker(
+                cfg,
+                decision_provider=decision_provider,
+                llm=llm,
+                llm_cfg=cfg.get("llm"),
             )
 
-        # 5. Prompts
+        # 6. Prompts
         prompts = PromptTemplate.from_yaml(cfg.get("rag", {}).get("system_prompt_file", "config/prompts.yaml"))
 
-        return cls(cfg, embedding, vs, llm, reranker, prompts)
+        return cls(cfg, embedding, vs, llm, reranker, prompts, decision_provider=decision_provider)
 
     # ------------------------------------------------------------------
     def ensure_llm(self) -> None:
@@ -630,7 +764,7 @@ class RAGPipeline:
         history = history or []
 
         # 意图路由：寒暄/身份类直接模板回应，不花检索与生成资源（也无需加载 LLM）
-        decision = classify_query(question)
+        decision = self._classify(question)
         if decision.intent == "chitchat" and not is_aggregate_query(question):
             reply = self._render_chitchat(decision.reply or "")
             if stream:
@@ -670,6 +804,20 @@ class RAGPipeline:
                     return RAGResult(answer=_fb, sources=[], raw_hits=[], timings={})
                 return _empty_gen()
             result = RAGResult(answer=fallback, sources=[], raw_hits=[])
+            result.verification = self._verify(fallback, [])
+            return result
+
+        # 决策：检索充分性 —— 候选片段明显答不了这个问题时，跳过生成直接拒答。
+        # 这正是 d1 的思路：用一次"单次前向决策"省掉一次昂贵的自回归生成，
+        # 同时从源头避免"检索不到却硬编"（宁可不答，也不编）。
+        if self._assess_retrieval_sufficiency(question, hits) is False:
+            fallback = rag_cfg.get("fallback_answer", FALLBACK_NO_HIT_ANSWER)
+            if stream:
+                def _insufficient_gen(_fb=fallback, _h=hits):
+                    yield _fb
+                    return RAGResult(answer=_fb, sources=[], raw_hits=_h, timings={"llm_total_ms": 0.0})
+                return _insufficient_gen()
+            result = RAGResult(answer=fallback, sources=[], raw_hits=hits)
             result.verification = self._verify(fallback, [])
             return result
 
@@ -778,7 +926,7 @@ class RAGPipeline:
         history = history or []
 
         # 意图路由：寒暄/身份类直接模板回应（不加载 LLM，延迟≈0）
-        decision = classify_query(question)
+        decision = self._classify(question)
         if decision.intent == "chitchat":
             reply = self._render_chitchat(decision.reply or "")
             return RAGResult(
@@ -813,6 +961,23 @@ class RAGPipeline:
                 answer=fallback,
                 sources=[],
                 raw_hits=[],
+                timings={
+                    "llm_total_ms": 0.0,
+                    "ttft_ms": None,
+                    "tokens_generated": 0,
+                    "tokens_per_sec": None,
+                },
+            )
+            result.verification = self._verify(fallback, [])
+            return result
+
+        # 决策：检索充分性（与 answer() 保持一致）——片段明显答不了就跳过生成
+        if self._assess_retrieval_sufficiency(question, hits) is False:
+            fallback = rag_cfg.get("fallback_answer", FALLBACK_NO_HIT_ANSWER)
+            result = RAGResult(
+                answer=fallback,
+                sources=[],
+                raw_hits=hits,
                 timings={
                     "llm_total_ms": 0.0,
                     "ttft_ms": None,
@@ -925,7 +1090,7 @@ class RAGPipeline:
         history = history or []
 
         # 意图路由：寒暄/身份类直接模板回应（不加载 LLM）
-        decision = classify_query(question)
+        decision = self._classify(question)
         if decision.intent == "chitchat":
             reply = self._render_chitchat(decision.reply or "")
             yield {"event": "hits", "data": []}
@@ -960,6 +1125,16 @@ class RAGPipeline:
         yield {"event": "hits", "data": cites}
 
         if not hits:
+            fallback = self.config.get("rag", {}).get(
+                "fallback_answer",
+                FALLBACK_NO_HIT_ANSWER,
+            )
+            yield {"event": "token", "data": fallback}
+            yield {"event": "done", "data": cites, "verification": self._verify(fallback, [])}
+            return
+
+        # 决策：检索充分性（与 answer() 保持一致）——片段明显答不了就跳过生成
+        if self._assess_retrieval_sufficiency(question, hits) is False:
             fallback = self.config.get("rag", {}).get(
                 "fallback_answer",
                 FALLBACK_NO_HIT_ANSWER,
@@ -1009,10 +1184,38 @@ class RAGPipeline:
         整个 FastAPI 事件循环卡住。
         """
         import asyncio
+        import concurrent.futures
+        import threading
 
         loop = asyncio.get_running_loop()
         queue: asyncio.Queue = asyncio.Queue(maxsize=256)
         _SENTINEL = object()
+        # 消费端提前退出（客户端断连 / 生成器被 close / 任务取消）时置位。
+        # 生产者据此停止投递，避免永久阻塞在 queue.put —— 那会泄漏线程，
+        # 并且该线程始终持有 LLM 推理资源。
+        cancelled = threading.Event()
+
+        def _post(item: Any) -> bool:
+            """把事件投递到事件循环；返回 True 表示已入队。
+
+            队列满时轮询等待而不是无限阻塞：一旦 ``cancelled`` 置位立即放弃。
+            """
+            if cancelled.is_set():
+                return False
+            try:
+                fut = asyncio.run_coroutine_threadsafe(queue.put(item), loop)
+            except RuntimeError:
+                return False  # 事件循环已关闭
+            while True:
+                try:
+                    fut.result(timeout=0.5)
+                    return True
+                except concurrent.futures.TimeoutError:
+                    if cancelled.is_set():
+                        fut.cancel()
+                        return False
+                except Exception:  # noqa: BLE001
+                    return False
 
         def _produce() -> None:
             try:
@@ -1023,21 +1226,28 @@ class RAGPipeline:
                     user_id=user_id,
                     allowed_groups=allowed_groups,
                 ):
-                    asyncio.run_coroutine_threadsafe(queue.put(event), loop).result()
+                    if not _post(event):
+                        return
             except Exception as exc:  # noqa: BLE001
-                asyncio.run_coroutine_threadsafe(
-                    queue.put({"event": "error", "data": str(exc)}), loop
-                ).result()
+                _post({"event": "error", "data": str(exc)})
             finally:
-                asyncio.run_coroutine_threadsafe(queue.put(_SENTINEL), loop).result()
-
-        import threading
+                _post(_SENTINEL)
 
         producer = threading.Thread(target=_produce, daemon=True)
         producer.start()
 
-        while True:
-            item = await queue.get()
-            if item is _SENTINEL:
-                break
-            yield item
+        try:
+            while True:
+                item = await queue.get()
+                if item is _SENTINEL:
+                    break
+                yield item
+        finally:
+            # 无论正常结束、客户端断连还是被取消，都要放行生产者：
+            # 置取消标志 + 排空队列，让阻塞中的 put 立刻返回。
+            cancelled.set()
+            try:
+                while not queue.empty():
+                    queue.get_nowait()
+            except Exception:  # noqa: BLE001
+                pass

@@ -14,10 +14,19 @@
 - **黑名单**：拒绝任何写关键字（大小写无关、字边界匹配）。
 - **剥注释/字符串**：在关键字匹配前先去掉 ``// ...``、``/* ... */``、
   ``'...'``、``"..."``，避免 ``// DELETE me`` 这种伪装。
-- **LIMIT 注入**：如果用户没有写 LIMIT，自动追加 ``LIMIT <max_limit>``，作为
-  上限（调用方仍可再次切片）。
-- **Neo4j 只读事务**：调用方在拿到通过校验的 cypher 后，应当用
+- **LIMIT 封顶**：用户没写 LIMIT 时自动追加；写了但超过 ``max_limit`` 时强制
+  改写为 ``max_limit``（调用方仍可再次切片）。
+- **Neo4j 只读事务**：调用方在拿到通过校验的 cypher 后，**必须**用
   ``session.execute_read(...)`` 包装（本模块只负责文本校验）。
+
+残余风险（重要）
+----------------
+本模块采用「正则剥离 + 关键字黑名单」，属于**纵深防御的一层，不是安全边界**。
+Cypher 语法复杂（嵌套注释、字符串转义、``CALL {}`` 子查询等），纯文本分析
+无法保证完备。真正的写保护必须依赖后端能力：
+
+- Neo4j：只读事务（``execute_read``）+ 只读账号 + 禁用 apoc 写过程；
+- SQLite 后端：只走手写的 ``MATCH ... RETURN`` 子集解析，不执行任意 Cypher。
 
 公开 API
 --------
@@ -86,23 +95,50 @@ class ValidatedCypher:
 
 
 def _strip_noise(text: str) -> str:
-    """去掉注释与字符串字面量，便于关键字扫描。"""
-    text = _LINE_COMMENT_RE.sub(" ", text)
-    text = _BLOCK_COMMENT_RE.sub(" ", text)
+    """去掉字符串字面量与注释，便于关键字扫描。
+
+    顺序很关键：**必须先剥字符串、再剥注释**。
+
+    反过来（先剥注释）时，字符串里出现的 ``/*`` ``*/`` 会被当成注释定界符，
+    把它们之间的真实写操作一并"吞掉"，从而绕过写关键字黑名单。例如：
+
+        MATCH (n) WHERE n.x='/*' CREATE (m:E) SET m.y='*/' RETURN m
+
+    先剥注释会把 ``/*' CREATE (m:E) SET m.y='*/`` 整段当作块注释删除，
+    扫描剩余 ``MATCH (n) WHERE n.x=' ' RETURN m`` 判定为只读；但
+    ``_inject_limit`` 返回的是**原文**（含 CREATE/SET），后端照此执行。
+    先剥字符串则 ``'/*'``、``'*/'`` 会先变成空字面量，注释定界符随之消失，
+    CREATE/SET 就能被正常扫出来。
+    """
     text = _SINGLE_QUOTED_RE.sub("''", text)
     text = _DOUBLE_QUOTED_RE.sub('""', text)
+    text = _LINE_COMMENT_RE.sub(" ", text)
+    text = _BLOCK_COMMENT_RE.sub(" ", text)
     return text
 
 
-_LIMIT_RE = re.compile(r"\bLIMIT\s+\d+", re.IGNORECASE)
+_LIMIT_RE = re.compile(r"\bLIMIT\s+(\d+)", re.IGNORECASE)
 
 
 def _inject_limit(text: str, max_limit: int) -> str:
-    """如果文本里没有 LIMIT 子句，在末尾追加 ``LIMIT <max_limit>``。"""
-    if _LIMIT_RE.search(text):
-        return text
-    sep = "" if text.rstrip().endswith(";") else ""
-    return f"{text.rstrip()}{sep} LIMIT {max_limit}".rstrip()
+    """确保最终查询带一个不超过 ``max_limit`` 的 LIMIT。
+
+    三种情况：
+
+    - 没有 LIMIT：追加 ``LIMIT max_limit``。
+    - 有 LIMIT 但大于 ``max_limit``：改写为 ``LIMIT max_limit``。
+      只判断"有没有 LIMIT"是不够的——客户端自带 ``LIMIT 99999`` 时若原样放行，
+      行数上限形同虚设，可用于拖垮服务。
+    - 有 LIMIT 且不超过上限：保持原样。
+
+    注意：本函数只在文本层面削峰，不是安全边界（见模块 docstring 的残余风险）。
+    """
+    m = _LIMIT_RE.search(text)
+    if m is None:
+        return f"{text.rstrip()} LIMIT {max_limit}".rstrip()
+    if int(m.group(1)) > max_limit:
+        return f"{text[: m.start()]}LIMIT {max_limit}{text[m.end():]}"
+    return text
 
 
 def validate_readonly_cypher(cypher: str, max_limit: int = 200) -> ValidatedCypher:

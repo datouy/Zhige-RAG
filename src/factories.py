@@ -12,7 +12,7 @@
 from __future__ import annotations
 import hashlib
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set
 from threading import Lock
 
 from src.utils import get_logger
@@ -49,20 +49,22 @@ class TenantAwareFactory:
     _embedding: Optional[EmbeddingModel] = None
 
     @classmethod
-    def get_embedding(cls, config: dict) -> EmbeddingModel:
-        """获取全局共享的 Embedding 模型（只加载一次）。"""
+    def get_embedding(cls, config: dict) -> Any:
+        """获取全局共享的 Embedding 实例（只创建一次）。
+
+        后端由 ``embedding.backend`` 决定（local / ollama / openai），
+        见 :mod:`src.embeddings_provider`。
+
+        **必须经由工厂创建**：直接构造 ``EmbeddingModel`` 会强制加载本地
+        sentence-transformers（依赖 torch 2~3 GB），使 ollama / openai 后端
+        形同虚设 —— 而多租户 API 走的正是这条路径。
+        """
         if cls._embedding is None:
             with cls._lock:
                 if cls._embedding is None:
-                    cls._embedding = EmbeddingModel(
-                        model_name=config["embedding"]["model_name"],
-                        device=config["embedding"].get("device", "auto"),
-                        batch_size=config["embedding"].get("batch_size", 32),
-                        max_seq_length=config["embedding"].get("max_seq_length", 512),
-                        normalize=config["embedding"].get("normalize_embeddings", True),
-                        cache_dir=config["embedding"].get("cache_dir"),
-                        local_files_only=config["embedding"].get("local_files_only", False),
-                    )
+                    from src.embeddings_provider import create_embedding
+
+                    cls._embedding = create_embedding(config.get("embedding", {}))
         return cls._embedding
 
     @classmethod
@@ -73,7 +75,14 @@ class TenantAwareFactory:
         例如：u1a2b3c4d5e6f7g8h_chinese_rag_kb
         """
         safe_uid = _sanitize_user_id(user_id)
-        collection_name = f"{safe_uid}_{config['vector_store']['collection_name']}"
+        base_name = f"{safe_uid}_{config['vector_store']['collection_name']}"
+        # 非 local 的 Embedding 后端会追加"后端+模型"指纹：换模型即换向量维数，
+        # 与旧向量混在同一个 collection 里会直接报错，检索结果也不可信。
+        from src.embeddings_provider import embedding_collection_name
+
+        collection_name = embedding_collection_name(
+            base_name, config.get("embedding", {})
+        )
 
         # 注意：get_embedding 内部会再次获取 _lock，而 threading.Lock 不可重入，
         # 必须在锁外调用，否则同线程二次加锁直接死锁。

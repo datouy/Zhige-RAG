@@ -59,7 +59,7 @@ from pathlib import Path
 from fastapi import Depends, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.exc import SQLAlchemyError
 from slowapi import _rate_limit_exceeded_handler
@@ -152,32 +152,24 @@ async def lifespan(app: FastAPI):
         close_db()
         logger.info("数据库连接池已关闭")
 
-        from api.deps import get_llm_executor
-
-        executor = get_llm_executor()
-        # P5 审计修复：AsyncLLMExecutor 只有 stop()，之前 hasattr 检查的
-        # close/shutdown 都不存在，后台循环任务从不停止。
-        stop = getattr(executor, "stop", None)
-        if stop is not None:
-            try:
-                await asyncio.wait_for(executor.stop(), timeout=5.0)
-                logger.info("LLM 执行器已关闭")
-            except asyncio.TimeoutError:
-                logger.warning("LLM 执行器关闭超时")
-            except Exception as llm_err:
-                logger.warning("LLM 执行器关闭时出错: %s", llm_err)
+        # P0-1 修复：原 AsyncLLMExecutor 是死代码（已删除），
+        # 现在的 LLMConcurrencyGate 是无状态的 semaphore 包装，无需清理
 
         for handler in logger.handlers:
             if hasattr(handler, "flush"):
                 handler.flush()
 
         try:
-            from src.utils.circuit_breaker import reset_all_circuit_breakers
+            # 注意：模块已从 src/utils/circuit_breaker.py 迁移到
+            # src/circuit_breaker.py。原路径不可达——src/utils.py 是普通模块，
+            # src/utils/ 目录（无 __init__.py）会被它遮蔽，导致子模块无法导入，
+            # 这里的重置逻辑此前被 except ImportError 静默吞掉、从未执行。
+            from src.circuit_breaker import reset_all_circuit_breakers
 
             reset_all_circuit_breakers()
             logger.info("熔断器状态已重置")
-        except ImportError:
-            pass
+        except ImportError as cb_err:
+            logger.warning("熔断器模块导入失败，跳过重置: %s", cb_err)
 
         logger.info("ChineseRAGKB API 关闭完成")
         logger.info("=" * 50)
@@ -187,8 +179,8 @@ async def lifespan(app: FastAPI):
 
 # =========================== 应用实例 ===========================
 app = FastAPI(
-    title="ChineseRAGKB API",
-    description="中文知识库 RAG 系统的 FastAPI 接口，支持多租户",
+    title="知阁 Zhige API",
+    description="知阁（Zhige）—— 本地中文知识库 RAG 平台，支持多租户与多模型后端",
     version="0.3.0",
     lifespan=lifespan,
 )
@@ -223,14 +215,24 @@ app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # CORS
-_allowed_origins = os.getenv("ALLOWED_ORIGINS", "").split(",")
-if _allowed_origins == [""] or _allowed_origins == ["*"]:
-    _allowed_origins = [
+_origins = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "").split(",") if o.strip()]
+if "*" in _origins:
+    # "*" 与 allow_credentials=True 组合时，浏览器会允许任意站点携带凭证，
+    # 属高危配置。此前只处理"整个值就等于 *"的情况，写成
+    # "https://a.com,*" 会漏网。这里统一剔除通配符。
+    logger.warning(
+        "ALLOWED_ORIGINS 含通配符 '*'，与 allow_credentials=True 冲突，已剔除；"
+        "请显式列出允许的源。"
+    )
+    _origins = [o for o in _origins if o != "*"]
+if not _origins:
+    _origins = [
         "http://localhost:8501",
         "http://127.0.0.1:8501",
         "http://127.0.0.1:8000",
         "http://localhost:8000",
     ]
+_allowed_origins = _origins
 
 app.add_middleware(
     CORSMiddleware,
@@ -248,7 +250,9 @@ from api.routes import (
     chat_router,
     eval_router,
     feedback_router,
+    kb_router,
     kg_router,
+    settings_router,
     subscription_router,
     system_router,
 )
@@ -258,6 +262,8 @@ from api.routes import (
 app.include_router(auth_router)
 app.include_router(subscription_router)
 app.include_router(system_router)
+app.include_router(settings_router)
+app.include_router(kb_router)
 app.include_router(chat_router)
 app.include_router(kg_router)
 app.include_router(agent_router)
@@ -266,32 +272,72 @@ app.include_router(feedback_router)
 
 
 # =========================== 异常处理器 ===========================
+# P1-7 修复：异常信息脱敏，防止内部实现细节外泄
+
+def _sanitize_validation_errors(errors: list) -> list:
+    """脱敏验证错误（隐藏内部字段路径细节）。"""
+    sanitized = []
+    for err in errors:
+        # 保留 type 和 msg，但简化 loc（位置）信息
+        loc = err.get("loc", [])
+        # 只保留最后一级字段名，隐藏嵌套路径
+        simplified_loc = [loc[-1]] if loc else []
+        sanitized.append({
+            "field": simplified_loc[0] if simplified_loc else "unknown",
+            "message": err.get("msg", "验证失败"),
+        })
+    return sanitized
+
+
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    """P1-7：脱敏验证错误，只返回字段名和友好提示。"""
+    request_id = getattr(request.state, "request_id", "N/A")
+    logger.warning("请求验证失败 [request_id=%s]: %s", request_id, exc.errors())
+    
     return JSONResponse(
         status_code=422,
-        content={"error": "Validation Error", "detail": exc.errors()},
+        content={
+            "error": "Validation Error",
+            "message": "请求参数验证失败",
+            "details": _sanitize_validation_errors(exc.errors()),
+            "request_id": request_id,
+        },
     )
 
 
 @app.exception_handler(SQLAlchemyError)
 async def database_exception_handler(request: Request, exc: SQLAlchemyError):
-    logger.error("数据库错误: %s", exc)
+    """P1-7：隐藏数据库错误细节（表名、SQL等）。"""
+    request_id = getattr(request.state, "request_id", "N/A")
+    # 记录完整错误到日志（含堆栈）
+    logger.error("数据库错误 [request_id=%s]: %s", request_id, exc, exc_info=True)
+    
+    # 返回通用提示，不暴露数据库结构
     return JSONResponse(
         status_code=500,
-        content={"error": "Database Error", "message": "数据库操作失败，请稍后重试"},
+        content={
+            "error": "Database Error",
+            "message": "数据库操作失败，请稍后重试",
+            "request_id": request_id,
+        },
     )
 
 
 @app.exception_handler(Exception)
 async def general_exception_handler(request: Request, exc: Exception):
-    request_id = getattr(request.state, "request_id", None)
-    logger.error("未处理异常 [request_id=%s]: %s", request_id, exc)
+    """P1-7：通用异常处理，完全隐藏内部错误。"""
+    request_id = getattr(request.state, "request_id", "N/A")
+    # 记录完整堆栈到日志
+    logger.error("未处理异常 [request_id=%s]: %s", request_id, exc, exc_info=True)
+    
+    # 返回通用错误，不泄露任何实现细节
     return JSONResponse(
         status_code=500,
         content={
             "error": "Internal Server Error",
-            "message": "发生未知错误，请联系管理员",
+            "message": "服务暂时不可用，请稍后重试",
+            "request_id": request_id,
         },
     )
 
@@ -299,6 +345,14 @@ async def general_exception_handler(request: Request, exc: Exception):
 # =========================== 根路径 ===========================
 @app.get("/")
 async def root():
+    """直接返回聊天界面，不做 307 跳转。
+
+    原先返回 ``RedirectResponse("/index.html")``，会让部分内置预览面板 /
+    无跳转的客户端拿不到页面（307 不是 200）。直接吐文件最稳。
+    """
+    index = ROOT / "ui" / "web" / "index.html"
+    if index.exists():
+        return FileResponse(str(index))
     return RedirectResponse(url="/index.html")
 
 

@@ -1,0 +1,30 @@
+# ============================================================
+# 可选能力依赖 —— 按需安装
+# ============================================================
+# 不装也能启动服务，只是对应的功能不可用（见每节说明）。
+# ============================================================
+
+# ---------- 文档解析 ----------
+# 不装：只能处理 .txt / .md，无法上传 PDF / Word。
+# 模块名与 pip 名不一致：python-docx -> docx，beautifulsoup4 -> bs4
+pdfplumber>=0.10.0
+pypdf>=4.0.0
+python-docx>=1.1.0
+markdown>=3.6
+beautifulsoup4>=4.12.0
+lxml>=4.9.0
+
+# ---------- Streamlit 界面 ----------
+# 不装：只能用 Web 前端 + REST API（ui/web/），无法使用 Streamlit 版界面。
+streamlit>=1.32.0,<1.40.0
+plotly>=5.18,<6.0
+# kaleido 用于把图表导出为静态图片，需要本机有 Chrome，体积不小；
+# 只在需要导出 PNG/SVG 时安装。
+kaleido>=0.2.1
+
+# ---------- 检索质量增强 ----------
+# rank-bm25：纯 Python 的 BM25 实现，用于离线评估脚本。
+rank-bm25>=0.2.2
+# FlagEmbedding：bge-reranker 重排模型（config.yaml 的 reranker.enabled）。
+# 依赖较重，且需要另行下载 reranker 权重；不装时 reranker 自动跳过。
+FlagEmbedding>=1.2.0

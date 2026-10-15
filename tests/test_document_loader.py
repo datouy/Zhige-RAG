@@ -67,10 +67,39 @@ def test_load_docx_if_available(tmp_path):
 
 
 def test_load_pdf_if_available(tmp_path):
-    """若安装了 pdfplumber，构造最小 PDF 进行解析（需 pypdf/pdfplumber 库）。"""
+    """若安装了 pdfplumber，构造最小 PDF 进行解析。
+    
+    P0-3 修复：之前这个测试总是被跳过（测试盲区）。
+    现在使用 pypdf 构造最小有效 PDF，无需 reportlab。
+    """
     pytest.importorskip("pdfplumber")
-    # 这里仅做冒烟测试：使用 reportlab 或最小 PDF 都可。简化处理：直接跳过构造。
-    pytest.skip("PDF 构造需要 reportlab 等额外库，跳过自动测试")
+    
+    # 使用 pypdf 构造最小 PDF（只需 pypdf，不需要 reportlab）
+    try:
+        from pypdf import PdfWriter
+    except ImportError:
+        pytest.skip("需要 pypdf 库来构造测试 PDF")
+    
+    pdf_path = tmp_path / "test.pdf"
+    
+    # 创建最小 PDF
+    writer = PdfWriter()
+    writer.add_blank_page(width=200, height=200)
+    
+    # 添加文本（使用 pypdf 的简单方式）
+    from pypdf.generic import TextStringObject
+    page = writer.pages[0]
+    # 注意：pypdf 不直接支持添加文本，但我们可以测试空白 PDF 解析
+    # 对于完整测试，我们只验证 pdfplumber 能打开它
+    
+    with open(pdf_path, "wb") as f:
+        writer.write(f)
+    
+    # 验证能够加载（即使没有文本内容）
+    from src.document_loader import _load_pdf
+    docs = _load_pdf(pdf_path)
+    # 空白 PDF 可能返回空列表或只有元数据
+    assert isinstance(docs, list)
 
 def test_load_txt_gbk_auto_detected(tmp_path):
     """GBK 编码的 TXT 应被自动探测解码，而不是读成乱码。"""

@@ -32,6 +32,35 @@ logger = get_logger("api.routes.feedback")
 router = APIRouter()
 
 
+def _auto_route_feedback(body: "FeedbackBody"):
+    """差评自动分流：用 d1 ``choice`` 原语把反馈归因到处理环节。
+
+    仅在 ``decision.enabled`` 且 ``decision.feedback_route.enabled`` 打开时生效；
+    未启用 / 决策失败 / 置信度不足时返回 ``None``，调用方保持"未分类"原行为。
+    """
+    try:
+        from api.deps import get_decision_provider, get_runtime_config
+
+        dcfg = (get_runtime_config().get("decision", {}) or {}).get("feedback_route", {}) or {}
+        if not dcfg.get("enabled"):
+            return None
+        provider = get_decision_provider()
+        if provider is None:
+            return None
+        from src.feedback_router import classify_feedback
+
+        return classify_feedback(
+            body.query,
+            body.answer,
+            body.correction,
+            provider,
+            min_confidence=float(dcfg.get("min_confidence", 0.5)),
+        )
+    except Exception as exc:  # noqa: BLE001 - 分流失败绝不能影响反馈提交
+        logger.warning("反馈自动分流失败（已跳过）: %s", exc)
+        return None
+
+
 class FeedbackBody(BaseModel):
     """POST /api/v1/feedback 请求体。"""
 
@@ -59,6 +88,16 @@ def submit_feedback(
     if rating not in {"helpful", "not_helpful"}:
         raise HTTPException(status_code=422, detail="rating 必须是 helpful 或 not_helpful")
 
+    # 差评自动分流（d1 choice 原语）：前端没填 question_type 时自动归因，
+    # 让 /feedback/stats 的"差评按类型归因"真正可用；失败静默跳过。
+    question_type: Optional[str] = (body.question_type or "").strip()[:50] or None
+    auto_route: Optional[Dict[str, Any]] = None
+    if question_type is None and rating == "not_helpful":
+        route = _auto_route_feedback(body)
+        if route is not None:
+            question_type = route.category[:50]
+            auto_route = route.to_dict()
+
     rec = FeedbackRecord(
         user_id=user.id,
         query=body.query.strip()[:4000],
@@ -66,13 +105,16 @@ def submit_feedback(
         sources_json=(body.sources_json or "")[:8000],
         rating=rating,
         correction=(body.correction or "").strip()[:8000] or None,
-        question_type=(body.question_type or "").strip()[:50] or None,
+        question_type=question_type,
     )
     db.add(rec)
     db.commit()
     db.refresh(rec)
-    logger.info("反馈已记录 user=%s rating=%s id=%s", user.id, rating, rec.id)
-    return {"id": rec.id, "status": "ok"}
+    logger.info("反馈已记录 user=%s rating=%s id=%s type=%s", user.id, rating, rec.id, question_type)
+    resp: Dict[str, Any] = {"id": rec.id, "status": "ok", "question_type": question_type}
+    if auto_route is not None:
+        resp["auto_route"] = auto_route
+    return resp
 
 
 @router.get("/api/v1/feedback", tags=["反馈"])

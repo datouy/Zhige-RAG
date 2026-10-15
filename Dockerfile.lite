@@ -1,0 +1,75 @@
+# ============================================================
+# ChineseRAGKB Dockerfile.lite —— 轻量部署（不安装 torch）
+# ============================================================
+# 与 Dockerfile（全量）的唯一区别：**不安装 requirements-local.txt**。
+# 也就是不打进 torch（2~3 GB），镜像体积从 ~10 GB 降到 ~1 GB 量级。
+#
+# 适用场景：
+#   - LLM 与 Embedding 都走 Ollama 或云端 API（不需要容器内本地推理）
+#   - 中小企业和个人最常见的部署方式
+#
+# 需要完全离线本地推理时，请改用全量 Dockerfile。
+#
+# 启动示例：
+#   docker build -f Dockerfile.lite -t chineseragkb:lite .
+#   docker run -p 8000:8000 \
+#     -e JWT_SECRET=<32位随机串> \
+#     -e OLLAMA_BASE_URL=http://host.docker.internal:11434/v1 \
+#     chineseragkb:lite
+#
+# ⚠️ 容器内的 localhost 指向容器自身。Ollama 跑在宿主机时必须用
+#    host.docker.internal（Linux 下需加 --add-host=host.docker.internal:host-gateway，
+#    docker-compose.yml 已配置）。
+# ============================================================
+
+# ---- Stage 1: Builder ----
+FROM python:3.11-slim AS builder
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# 只装核心 + 可选能力依赖，不含 torch
+COPY requirements-core.txt requirements-optional.txt ./
+RUN pip install --no-cache-dir --user -r requirements-core.txt -r requirements-optional.txt
+
+# ---- Stage 2: Runtime ----
+FROM python:3.11-slim
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgomp1 \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --create-home --shell /bin/bash appuser
+
+COPY --from=builder /root/.local /home/appuser/.local
+COPY --chown=appuser:appuser . .
+
+RUN mkdir -p /app/data/chroma /app/logs /app/data/raw \
+    && chown -R appuser:appuser /app
+
+USER appuser
+
+# 默认后端为 Ollama —— lite 镜像内没有 torch，本地推理不可用，
+# 把它设为默认可以让"起来就能用"成为默认体验。
+# 用云端 API 时覆盖：-e LLM_BACKEND=openai -e EMBEDDING_BACKEND=openai -e OPENAI_API_KEY=sk-...
+ENV PATH=/home/appuser/.local/bin:$PATH \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    LLM_BACKEND=ollama \
+    EMBEDDING_BACKEND=ollama \
+    OLLAMA_BASE_URL=http://host.docker.internal:11434/v1 \
+    EMBEDDING_OLLAMA_BASE_URL=http://host.docker.internal:11434/v1 \
+    OLLAMA_MODEL=qwen2.5:7b \
+    EMBEDDING_OLLAMA_MODEL=nomic-embed-text \
+    HF_ENDPOINT=https://hf-mirror.com
+
+EXPOSE 8000
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health')" || exit 1
+
+CMD ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000"]

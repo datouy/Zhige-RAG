@@ -40,10 +40,11 @@ from src.embeddings import EmbeddingModel
 from src.kg import GraphRAG, GraphRetriever, KGExtractor, create_kg_store
 from src.llm import LocalLLM
 from src.rag_pipeline import RAGPipeline
-from src.reranker import BgeReranker
 from src.text_splitter import ChineseTextSplitter, RecursiveTextSplitter
-from src.utils import apply_env_overrides, load_config, merge_dict
+from src.utils import apply_env_overrides, get_logger, load_config, merge_dict
 from src.vector_store import ChromaStore, hybrid_kwargs
+
+logger = get_logger("api.deps")
 
 
 # =====================================================================
@@ -56,11 +57,22 @@ def get_cached_config(path: str = "config/config.yaml") -> Dict[str, Any]:
     说明：
     - 同一进程内，``load_config`` 只会真正解析 YAML 一次。
     - 通过 ``apply_env_overrides`` 把环境变量叠加（不变性，所以缓存安全）。
-    - 若需强制重新加载（例如配置热更新），调用 ``_reset_cached_config()``。
+    - 再叠加**界面写入的模型设置**（``config/local_overrides.yaml``，优先级最高）——
+      这样用户在界面上切换后端后无需改 config.yaml，也不用重启进程。
+    - 若需强制重新加载（如刚保存了模型设置），调用 ``_reset_cached_config()``。
     """
+    from src.settings_service import load_overrides
+    from src.utils import merge_dict
+
     cfg = load_config(path)
-    cfg = apply_env_overrides(cfg)
-    return cfg
+    # 界面写入的模型设置覆盖 config.yaml
+    overrides = load_overrides()
+    if overrides:
+        cfg = merge_dict(cfg, overrides)
+    # 环境变量最后叠加 —— 容器 / CI 场景下部署者的意图优先，也符合 12-factor。
+    # 因此若同一项同时被环境变量与界面设置指定，以环境变量为准；
+    # src.settings_service 会在保存时检测并提醒用户。
+    return apply_env_overrides(cfg)
 
 
 def _reset_cached_config() -> None:
@@ -74,33 +86,71 @@ def get_runtime_config() -> Dict[str, Any]:
 
 
 # =====================================================================
-#  LLM 执行器（P1.3）
+#  决策层 provider（d1 原语；可选）
 # =====================================================================
-_llm_executor: Optional[Any] = None
-_llm_executor_lock = Lock()
+_decision_provider: Optional[Any] = None
+_decision_provider_checked = False
+_decision_provider_lock = Lock()
 
 
-def get_llm_executor():
-    """获取或创建全局 LLM 执行器（异步 + 限流）。"""
-    global _llm_executor
-    if _llm_executor is None:
-        with _llm_executor_lock:
-            if _llm_executor is None:
-                from src.executor.llm_executor import AsyncLLMExecutor
+def get_decision_provider() -> Optional[Any]:
+    """获取（或创建）全局决策层 provider（d1 原语）。
 
-                _llm_executor = AsyncLLMExecutor(
-                    max_concurrent=int(os.getenv("LLM_MAX_CONCURRENT", "3")),
-                    free_rate=float(os.getenv("LLM_FREE_RATE", "2.0")),
-                    pro_rate=float(os.getenv("LLM_PRO_RATE", "20.0")),
-                    enterprise_rate=float(os.getenv("LLM_ENTERPRISE_RATE", "100.0")),
-                )
-    return _llm_executor
+    与 :func:`get_pipeline` 解耦：反馈自动分流这类"轻量旁路"不该为了拿一个
+    provider 就把整条 Pipeline（embedding + Chroma）建起来。provider 同样是
+    进程级单例，读的是同一份配置，行为与 Pipeline 内部一致。
+
+    ``decision.enabled`` 为假 / 创建失败 / 后端为 none 时返回 ``None``，
+    调用方据此保持原有（未分类 / 不判断）行为。
+    """
+    global _decision_provider, _decision_provider_checked
+    if _decision_provider_checked:
+        return _decision_provider
+    with _decision_provider_lock:
+        if _decision_provider_checked:
+            return _decision_provider
+        _decision_provider_checked = True
+        cfg = get_runtime_config()
+        if not (cfg.get("decision", {}) or {}).get("enabled"):
+            return None
+        try:
+            from src.decision_provider import create_decision_provider
+
+            _decision_provider = create_decision_provider(
+                cfg.get("decision"), llm_cfg=cfg.get("llm")
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("决策层 provider 初始化失败（已忽略）: %s", exc)
+            _decision_provider = None
+    return _decision_provider
 
 
-def reset_llm_executor() -> None:
-    """清空执行器引用（测试 / 关闭时使用）。"""
-    global _llm_executor
-    _llm_executor = None
+# =====================================================================
+#  LLM 并发控制（P0-1 修复：删除死代码 AsyncLLMExecutor）
+# =====================================================================
+_llm_gate: Optional[Any] = None
+_llm_gate_lock = Lock()
+
+
+def get_llm_gate():
+    """获取或创建全局 LLM 并发闸。
+    
+    替代原 AsyncLLMExecutor（死代码，调用的方法在 LocalLLM 上不存在）。
+    只保留 semaphore 并发限制功能。
+    """
+    global _llm_gate
+    if _llm_gate is None:
+        with _llm_gate_lock:
+            if _llm_gate is None:
+                from src.llm_concurrency import create_llm_gate
+                _llm_gate = create_llm_gate()
+    return _llm_gate
+
+
+def reset_llm_gate() -> None:
+    """清空并发闸引用（测试 / 关闭时使用）。"""
+    global _llm_gate
+    _llm_gate = None
 
 
 # =====================================================================
@@ -112,22 +162,22 @@ _vector_store: Optional[ChromaStore] = None
 _singletons_lock = Lock()
 
 
-def get_embedding() -> EmbeddingModel:
-    """获取或创建全局 Embedding 实例。"""
+def get_embedding() -> Any:
+    """获取或创建全局 Embedding 实例。
+
+    后端由 ``embedding.backend`` 决定（``local`` / ``ollama`` / ``openai``），
+    实现见 :mod:`src.embeddings_provider`。返回值只需满足
+    ``encode(texts, batch_size=...) -> ndarray`` 协议即可被 ``ChromaStore`` 使用，
+    因此不再强绑 :class:`EmbeddingModel`。
+    """
     global _embedding
     if _embedding is None:
         with _singletons_lock:
             if _embedding is None:
+                from src.embeddings_provider import create_embedding
+
                 cfg = get_runtime_config()
-                _embedding = EmbeddingModel(
-                    model_name=cfg["embedding"]["model_name"],
-                    device=cfg["embedding"].get("device", "auto"),
-                    batch_size=cfg["embedding"].get("batch_size", 32),
-                    max_seq_length=cfg["embedding"].get("max_seq_length", 512),
-                    normalize=cfg["embedding"].get("normalize_embeddings", True),
-                    cache_dir=cfg["embedding"].get("cache_dir"),
-                    local_files_only=cfg["embedding"].get("local_files_only", False),
-                )
+                _embedding = create_embedding(cfg.get("embedding", {}))
     return _embedding
 
 
@@ -139,11 +189,19 @@ def get_vector_store() -> ChromaStore:
         # 不可重入，锁内调用会同线程二次加锁死锁）
         embed = get_embedding()
         cfg = get_runtime_config()
+        from src.embeddings_provider import embedding_collection_name
+
+        # 非 local 后端会自动带上后端与模型指纹：换 Embedding 模型会改变向量
+        # 维度，复用旧 collection 会直接报错，也会让检索结果不可信。
+        collection = embedding_collection_name(
+            cfg["vector_store"].get("collection_name", "chinese_rag_kb"),
+            cfg.get("embedding", {}),
+        )
         with _singletons_lock:
             if _vector_store is None:
                 _vector_store = ChromaStore(
                     persist_directory=cfg["vector_store"]["persist_directory"],
-                    collection_name=cfg["vector_store"].get("collection_name", "chinese_rag_kb"),
+                    collection_name=collection,
                     embedding_model=embed,
                     distance_fn=cfg["vector_store"].get("distance_fn", "cosine"),
             **hybrid_kwargs(cfg.get("vector_store", {})),
@@ -170,15 +228,27 @@ def get_pipeline() -> RAGPipeline:
             # P1.4：与 RAGPipeline.from_config / ensure_llm 共用同一构造逻辑
             llm = RAGPipeline._build_llm_from_cfg(cfg.get("llm", {}))
 
-        reranker: Optional[BgeReranker] = None
-        if cfg.get("reranker", {}).get("enabled"):
-            reranker = BgeReranker(
-                model_name=cfg["reranker"]["model_name"],
-                device=cfg["reranker"].get("device", "auto"),
-                cache_dir=cfg["reranker"].get(
-                    "cache_dir", cfg["embedding"].get("cache_dir")
-                ),
-            )
+        # 决策层（可选）：d1 原语 provider，驱动重排 / 路由 / 校验
+        decision_provider = None
+        if (cfg.get("decision", {}) or {}).get("enabled"):
+            try:
+                from src.decision_provider import create_decision_provider
+
+                decision_provider = create_decision_provider(
+                    cfg.get("decision"), llm=llm, llm_cfg=cfg.get("llm")
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("决策层初始化失败（已忽略）: %s", exc)
+
+        # 重排器（可选；backend: bge | d1）
+        from src.reranker import create_reranker
+
+        reranker = create_reranker(
+            cfg,
+            decision_provider=decision_provider,
+            llm=llm,
+            llm_cfg=cfg.get("llm"),
+        )
 
         prompts = PromptTemplate.from_yaml(
             str(resolve_path(cfg.get("rag", {}).get("system_prompt_file", "config/prompts.yaml")))
@@ -193,17 +263,24 @@ def get_pipeline() -> RAGPipeline:
                     llm=llm,
                     reranker=reranker,
                     prompts=prompts,
+                    decision_provider=decision_provider,
                 )
     return _pipeline
 
 
-def get_runtime_pipeline(user_id: Optional[str] = None) -> RAGPipeline:
-    """为指定 user 返回 ``RAGPipeline``。
+def get_runtime_pipeline(
+    user_id: Optional[str] = None,
+    kb: Optional[Dict[str, str]] = None,
+) -> RAGPipeline:
+    """为指定 user（可指定知识库）返回 ``RAGPipeline``。
 
     - ``user_id`` 为 None：直接返回全局单例。
     - ``user_id`` 不为 None：复制全局单例的 config / llm / reranker / prompts，
-      但 ``vector_store`` / ``kg_store`` 替换为该用户的隔离实例。这样既复用
+      但 ``vector_store`` / ``kg_store`` 替换为该租户的隔离实例。这样既复用
       LLM（避免重复加载），又保证检索 / 图谱按租户隔离（P1.4 关键）。
+    - ``kb`` 不为 None：``vector_store`` 进一步切换到该**知识库**的 collection
+      （多知识库隔离，见 :mod:`src.kb_service`）。参数用
+      ``{"id", "collection_name"}`` 形式的普通 dict，避免与 ORM 会话耦合。
     """
     import copy
 
@@ -214,13 +291,21 @@ def get_runtime_pipeline(user_id: Optional[str] = None) -> RAGPipeline:
     from src.factories import TenantAwareFactory
 
     cfg = dict(base.config)
-    vs = TenantAwareFactory.get_chroma_store(user_id, cfg)
+    if kb and kb.get("collection_name"):
+        vs = TenantAwareFactory.get_chroma_store_by_name(kb["collection_name"], cfg)
+    else:
+        vs = TenantAwareFactory.get_chroma_store(user_id, cfg)
     kg = TenantAwareFactory.get_kg_store(user_id, cfg)
 
     # 浅拷贝 pipeline，确保不污染全局
     tenant_pipeline = copy.copy(base)
     tenant_pipeline.vector_store = vs
+    # 注入租户专属 KG store。注意：copy.copy 是浅拷贝，base 上已经探测过的
+    # _graph_state_checked / _graph_retriever 会被一并带过来；若不重置，
+    # _get_graph_retriever 会直接返回全局图谱的检索器（跨租户数据泄露）。
     tenant_pipeline.kg_store = kg
+    tenant_pipeline._graph_state_checked = False
+    tenant_pipeline._graph_retriever = None
     return tenant_pipeline
 
 
@@ -462,6 +547,7 @@ def reset_all_singletons() -> None:
     """清空所有进程级单例。供测试与运维热重启使用。"""
     global _pipeline, _embedding, _vector_store, _kg_store
     global _kg_retriever, _kg_extractor, _graph_rag
+    global _decision_provider, _decision_provider_checked
     with _singletons_lock, _kg_lock:
         _pipeline = None
         _embedding = None
@@ -470,6 +556,8 @@ def reset_all_singletons() -> None:
         _kg_retriever = None
         _kg_extractor = None
         _graph_rag = None
-    reset_llm_executor()
+        _decision_provider = None
+        _decision_provider_checked = False
+    reset_llm_gate()
     _reset_cached_config()
     invalidate_health_cache()

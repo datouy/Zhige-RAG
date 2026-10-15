@@ -324,6 +324,7 @@ def enrich_file(
     path: str | Path,
     default_acl: str = "*",
     default_status: str = "active",
+    ocr_cfg: Optional[Dict] = None,
 ) -> List[Document]:
     """解析单个文件并产出带完整元数据的小节 Document 列表。
 
@@ -331,6 +332,11 @@ def enrich_file(
     - MD/DOCX 按标题切分为多个小节（每节自带 heading_path）
     - 统一补齐 title / breadcrumb / updated_at / acl / doc_status / department
     - MD frontmatter 中的 status / permissions / valid_until 参与判定
+
+    Args:
+        ocr_cfg: 扫描件 OCR 配置（对应 ``config.document_loader.ocr``）。
+            **必须在此透传**：PDF 入库走的是本函数而不是直接调 ``load_document``，
+            漏传会让扫描件静默提不出文本 —— 用户只看到"入库成功但搜不到"。
     """
     p = Path(path)
     if not p.exists():
@@ -368,7 +374,7 @@ def enrich_file(
         # 无书签则退化为按页平铺、无章节路径。
         from .document_loader import load_document
 
-        docs = load_document(p, clean=True)
+        docs = load_document(p, clean=True, ocr_cfg=ocr_cfg)
         outline = _pdf_outline_paths(p) if ext == ".pdf" else {}
         sections: List[Tuple[List[str], str, str]] = []
         for d in docs:

@@ -25,6 +25,8 @@
 +-----------+---------------------------+---------------------------+
 | event     | data 类型                  | 说明                      |
 +===========+===========================+===========================+
+| decision  | {"tool": str, "confidence": float} | d1 决策预选工具（可选）|
++-----------+---------------------------+---------------------------+
 | thought   | str                        | LLM 思考文本（Thought）   |
 +-----------+---------------------------+---------------------------+
 | action    | {"tool": str, "input": dict}| 工具调用（Action+Input）  |
@@ -37,6 +39,19 @@
 +-----------+---------------------------+---------------------------+
 | error     | str                        | 异常信息                  |
 +-----------+---------------------------+---------------------------+
+
+d1 决策工具预选
+================
+
+ReAct 依赖 LLM 严格输出 ``Action: 工具名`` 再正则解析，小参数量模型极易
+输出不合法工具名或干脆不输出。若构造时传入 ``decision_provider``（见
+:mod:`src.decision_provider`），则在进入循环前用 d1 的 ``choice`` 原语
+**先选一次工具**（单次前向、毫秒级）：
+
+- 高置信命中 → 作为"建议工具"写进 scratchpad，引导 LLM 少走弯路；
+- 若 LLM 该轮没有给出合法 Action，则直接执行建议工具兜底，避免空转。
+
+provider 为 ``None`` 时行为与改造前**完全一致**。
 """
 
 from __future__ import annotations
@@ -196,6 +211,8 @@ class ReActAgent:
         llm: Any,
         tools: ToolRegistry,
         max_steps: int = 5,
+        decision_provider: Optional[Any] = None,
+        tool_select_min_confidence: float = 0.5,
     ) -> None:
         if llm is None:
             raise ValueError("llm 不能为空")
@@ -204,7 +221,53 @@ class ReActAgent:
         self.llm = llm
         self.tools = tools
         self.max_steps = max(1, int(max_steps))
+        # 可选 d1 决策 provider：用于工具预选（None → 行为同改造前）
+        self.decision_provider = decision_provider
+        self.tool_select_min_confidence = float(tool_select_min_confidence)
         self.history: List[Dict[str, Any]] = []
+
+    # ------------------------------------------------------------------
+    #  d1 决策工具预选（choice 原语）
+    # ------------------------------------------------------------------
+    _TOOL_SELECT_INSTRUCTION = (
+        "根据用户问题，判断应当调用哪一个工具。若无需任何工具即可直接回答，"
+        "选择「__none__」。只依据问题本身与各工具描述判断。"
+    )
+    _NO_TOOL_OPTION = "__none__"
+
+    def _select_tool_by_decision(self, query: str) -> Optional[Any]:
+        """用 d1 ``choice`` 原语预选一个工具。
+
+        Returns:
+            :class:`~src.decision_provider.ChoiceResult`；未启用 / 工具不足 2 个 /
+            置信度不足 / 决策失败时返回 ``None``。
+        """
+        if self.decision_provider is None:
+            return None
+        names = self.tools.list_names()
+        if len(names) < 2:
+            return None
+        criteria: Dict[str, str] = {}
+        for t in self.tools.list_tools():
+            criteria[t.name] = (t.description or t.name).strip()[:160]
+        criteria[self._NO_TOOL_OPTION] = "不需要任何工具，可以直接回答"
+        try:
+            res = self.decision_provider.choice(
+                f"用户问题：{query.strip()}",
+                self._TOOL_SELECT_INSTRUCTION,
+                criteria,
+                key="tool",
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("决策工具预选失败（忽略）: %s", exc)
+            return None
+        if res is None:
+            return None
+        if res.label == self._NO_TOOL_OPTION or res.label not in names:
+            return None
+        if res.confidence < self.tool_select_min_confidence:
+            return None
+        return res
 
     # ------------------------------------------------------------------
     def _build_system_prompt(self) -> str:
@@ -279,6 +342,21 @@ class ReActAgent:
             "ActionInput: {}\n"
         )
 
+        # d1 决策工具预选（可选）：单次前向先选一次工具，作为引导与兜底
+        suggested_tool: Optional[str] = None
+        suggestion = self._select_tool_by_decision(query)
+        if suggestion is not None:
+            suggested_tool = suggestion.label
+            yield {
+                "event": "decision",
+                "data": {"tool": suggested_tool, "confidence": round(suggestion.confidence, 4)},
+            }
+            scratchpad += (
+                f"Thought: 决策层建议优先使用工具 {suggested_tool}"
+                f"（置信度 {suggestion.confidence:.2f}）。\n"
+            )
+        suggested_consumed = False
+
         final_answer: Optional[str] = None
 
         for step_idx in range(self.max_steps):
@@ -333,12 +411,22 @@ class ReActAgent:
             # 3) Action —— 验证是否在白名单
             action = parsed.action
             if action is None:
-                # Agent 自评：没想用工具也没产出 Final Answer，提示它产出结论
-                scratchpad += (
-                    f"\nThought: 我暂时不需要工具，但还没给出最终回答。"
-                    f"请直接给出 Final Answer。\n"
-                )
-                continue
+                # d1 决策兜底：LLM 没给出合法 Action 时，若决策层已高置信预选工具，
+                # 直接执行该工具，避免白白空转一轮（小模型常见失败模式）。
+                if suggested_tool and not suggested_consumed:
+                    action = suggested_tool
+                    suggested_consumed = True
+                    yield {
+                        "event": "thought",
+                        "data": f"决策层建议使用工具 {action}，直接执行。",
+                    }
+                else:
+                    # Agent 自评：没想用工具也没产出 Final Answer，提示它产出结论
+                    scratchpad += (
+                        f"\nThought: 我暂时不需要工具，但还没给出最终回答。"
+                        f"请直接给出 Final Answer。\n"
+                    )
+                    continue
 
             if action not in tool_names:
                 obs_text = f"未知工具 '{action}'，可用工具：{tool_names}"

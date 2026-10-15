@@ -1,0 +1,33 @@
+# ============================================================
+# d1 决策模型依赖 —— 仅当 decision.backend = "d1" 时需要
+# ============================================================
+# 原生加载 LiquidAI/d1-3B 做单次前向决策（重排 / 路由 / 工具调度 / 校验）。
+#
+# ⚠️ 这是**可选**依赖：
+#   - decision.backend = "llm"（默认）不需要本文件 —— 用你现有的本地
+#     Qwen / Ollama / OpenAI 兼容模型模拟三种原语即可；
+#   - 只有想跑"真·单次前向、8ms 级、0 输出 token"的原生 d1 才需要安装。
+#
+# 安装：
+#     pip install -r requirements-core.txt
+#     pip install -r requirements-d1.txt
+#
+# 首次运行会从 HuggingFace 拉取约 6 GB 权重（d1-3B）。想离线部署请提前
+# 下载好权重并把 decision.local_files_only 设为 true、model_name 指向本地目录。
+#
+# 硬件：有 NVIDIA GPU 最快（官方 4090 约 8ms/次）；纯 CPU 也能跑，延迟更高
+# 但通常仍快于同机的 bge-reranker 交叉编码。
+#
+# 授权提醒（重要）：d1 使用 Liquid AI 自家的 LFM Open License v1.0 ——
+# 年营收 1000 万美元以下的团队可免费商用；达到或超过该门槛需另行取得商业许可。
+# 详见 https://huggingface.co/LiquidAI/d1-3B
+# ============================================================
+
+# d1 需要较新的 transformers（system_one 决策接口）
+torch>=2.0.0
+transformers>=5.14
+accelerate>=0.27.0
+safetensors>=0.4.0
+tokenizers>=0.15.0
+sentencepiece>=0.2.0
+pillow>=10.0.0
