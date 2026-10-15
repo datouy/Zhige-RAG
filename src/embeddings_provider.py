@@ -275,6 +275,16 @@ def _build_remote_embedding(emb_cfg: Dict[str, Any], backend: str):
 def _build_local_embedding(emb_cfg: Dict[str, Any]):
     from src.embeddings import EmbeddingModel
 
+    if not emb_cfg.get("local_files_only", False):
+        # 模型已在本地时这一项会让每次加载都先去联网校验（走 HF_ENDPOINT），
+        # 网络慢就是十几秒起步。默认配置是 true，被 config/local_overrides.yaml
+        # 覆盖掉时很难自查，这里主动提醒一句。
+        logger.warning(
+            "embedding.local_files_only=false：每次加载都会联网校验模型元数据。"
+            "权重已下好请改回 true（界面的覆盖文件 config/local_overrides.yaml "
+            "优先级更高，别忘了看它）。"
+        )
+
     return EmbeddingModel(
         model_name=emb_cfg.get("model_name", "BAAI/bge-small-zh-v1.5"),
         device=emb_cfg.get("device", "auto"),

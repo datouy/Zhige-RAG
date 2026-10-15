@@ -259,6 +259,12 @@ def build_generation_config(gen_cfg: Optional[Dict[str, Any]]) -> GenerationConf
 
 
 def _build_local_llm(llm_cfg: Dict[str, Any], gen: GenerationConfig) -> LocalLLM:
+    if not llm_cfg.get("local_files_only", False):
+        logger.warning(
+            "llm.local_files_only=false：每次加载都会联网校验模型元数据。"
+            "权重已就位请改回 true（注意 config/local_overrides.yaml 优先级更高）。"
+        )
+
     return LocalLLM(
         model_name=llm_cfg.get("model_name", "Qwen/Qwen2.5-1.5B-Instruct"),
         device=llm_cfg.get("device", "auto"),

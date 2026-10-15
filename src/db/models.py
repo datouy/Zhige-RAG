@@ -1,6 +1,10 @@
 """数据库模型。
 
-包含 User、RefreshToken、UsageLog 模型及订阅层配置。
+包含 User、UsageLog 模型及订阅层配置。
+
+说明：本服务不需要登录，因此 ``User`` 表里没有口令相关字段，
+也不存在 refresh token 表 —— 全服务只有一个固定的"本地用户"
+（见 :mod:`src.middleware.identity`），它的作用是标记数据归属。
 
 四层架构补充表：
 - DocumentRecord  ：数据层文档登记表（来源/状态/权限/更新时间/内容哈希）
@@ -52,13 +56,19 @@ def get_tier_limits(tier: str) -> Dict[str, Any]:
 # ======================== 数据模型 ========================
 
 class User(Base):
-    """用户模型。"""
+    """用户模型。
+
+    服务不提供注册 / 登录，这个表实际只有一行：固定的本地用户。
+    保留它是因为文档、知识库、会话等数据都要记录 ``user_id``。
+
+    历史库里的 ``password_hash`` 列会在启动时被 ``init_db`` 自动删除
+    （见 :mod:`src.db.database` 的 ``_LEGACY_COLUMN_CLEANUP``）。
+    """
     __tablename__ = "users"
 
     id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     username = Column(String(50), unique=True, nullable=False, index=True)
     email = Column(String(255), unique=True, nullable=False, index=True)
-    password_hash = Column(String(255), nullable=False)
     subscription_tier = Column(String(20), default="free")  # free / pro / enterprise
     max_chunks = Column(Integer, default=1000)
     max_queries_per_day = Column(Integer, default=50)
@@ -69,18 +79,6 @@ class User(Base):
     is_admin = Column(Boolean, default=False)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-
-
-class RefreshToken(Base):
-    """Refresh Token 模型。"""
-    __tablename__ = "refresh_tokens"
-
-    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
-    user_id = Column(String(36), nullable=False, index=True)
-    token_hash = Column(String(255), nullable=False)
-    expires_at = Column(DateTime, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    revoked = Column(Boolean, default=False)
 
 
 class UsageLog(Base):

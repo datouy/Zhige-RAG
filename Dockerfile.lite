@@ -13,7 +13,6 @@
 # 启动示例：
 #   docker build -f Dockerfile.lite -t chineseragkb:lite .
 #   docker run -p 8000:8000 \
-#     -e JWT_SECRET=<32位随机串> \
 #     -e OLLAMA_BASE_URL=http://host.docker.internal:11434/v1 \
 #     chineseragkb:lite
 #

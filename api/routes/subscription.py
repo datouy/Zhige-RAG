@@ -5,7 +5,7 @@ from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from src.db.database import get_db
 from src.db.models import SUBSCRIPTION_TIERS, User
-from src.middleware.auth import get_current_user
+from src.middleware.identity import get_current_user
 from src.utils import get_logger
 
 from api.quota import CHAT_ENDPOINT, queries_today

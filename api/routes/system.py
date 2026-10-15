@@ -20,7 +20,7 @@ from api.deps import (
     get_runtime_config,
     invalidate_health_cache,
 )
-from src.middleware.auth import get_current_user
+from src.middleware.identity import get_current_user
 from src.utils import get_logger, resolve_path
 from sqlalchemy import text as _sa_text
 
@@ -350,11 +350,7 @@ async def prometheus_metrics():
 
 @router.get("/api/v1/metrics")
 async def get_metrics(current_user: User = Depends(get_current_user)):
-    """JSON 格式指标端点。需要认证。
-
-    P5 审计修复：docstring 与 main.py 文档一直声称需要认证，但实现漏掉了
-    ``Depends(get_current_user)``，实际向匿名访客暴露系统指标。
-    """
+    """JSON 格式指标端点。"""
     try:
         from src.monitoring.metrics import metrics_collector, PROMETHEUS_AVAILABLE
 
@@ -383,12 +379,9 @@ async def get_metrics(current_user: User = Depends(get_current_user)):
 async def get_user_config(current_user: User = Depends(get_current_user)) -> Dict[str, Any]:
     """获取全量运行时配置（递归脱敏）。
 
-    仅管理员可读。此前 docstring 声称"含管理员校验"，但实现只挂了
-    ``get_current_user``（仅表示已登录），任何普通用户都能拉取全量配置——
-    其中包含 DB URI、模型路径、内部开关等信息。
+    这是本地单用户服务：读取者就是本机使用者，不做额外的权限判定；
+    配置里的敏感键（密码 / 密钥 / token）由 ``_redact`` 统一替换为 ``***``。
     """
-    if not current_user.is_admin:
-        raise HTTPException(status_code=403, detail="仅管理员可访问")
     try:
         cfg = get_runtime_config()
         return _redact(cfg)

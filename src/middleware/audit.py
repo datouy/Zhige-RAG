@@ -1,7 +1,6 @@
 """审计日志中间件，记录敏感操作的审计跟踪。
 
 用于满足合规性要求，记录：
-- 认证操作（登录、注册、登出）
 - 数据访问（文档检索、KG 操作）
 - 文件上传/下载
 - 配置变更
@@ -24,13 +23,6 @@ logger = get_logger("audit")
 
 class AuditAction(str, Enum):
     """审计动作枚举。"""
-    # 认证相关
-    LOGIN_SUCCESS = "login_success"
-    LOGIN_FAILED = "login_failed"
-    REGISTER = "register"
-    LOGOUT = "logout"
-    TOKEN_REFRESH = "token_refresh"
-    
     # 数据访问相关
     DOCUMENT_LIST = "document_list"
     DOCUMENT_SEARCH = "document_search"
@@ -203,25 +195,6 @@ class AuditLogger:
             success,
             ip,
             resource,
-        )
-
-    def log_auth(
-        self,
-        user_id: Optional[str],
-        action: AuditAction,
-        ip: Optional[str] = None,
-        success: bool = True,
-        error_message: Optional[str] = None,
-        db: Optional[Session] = None,
-    ) -> None:
-        """记录认证操作审计日志。"""
-        self.log(
-            action=action,
-            user_id=user_id,
-            ip=ip,
-            success=success,
-            error_message=error_message,
-            db=db,
         )
 
     def log_data_access(

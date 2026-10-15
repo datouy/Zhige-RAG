@@ -71,6 +71,7 @@ class BgeReranker:
                     devices=[self.device],
                 )
             self._backend = "flag"
+            self._verify_flag_backend(model_name)
         except Exception as exc:
             logger.info("FlagEmbedding 不可用（%s），回退到 sentence-transformers CrossEncoder", exc)
             try:
@@ -86,6 +87,31 @@ class BgeReranker:
                 raise ImportError(
                     "未安装 FlagEmbedding 或 sentence-transformers，无法加载 Reranker"
                 ) from exc2
+
+    # ------------------------------------------------------------------
+    def _verify_flag_backend(self, model_name: str) -> None:
+        """自检 FlagEmbedding 打分是不是真能用，坏了立刻换成 CrossEncoder。
+
+        背景：FlagEmbedding 与较新的 transformers 不兼容时，``compute_score`` 会
+        直接抛 ``XLMRobertaTokenizer has no attribute prepare_for_model``。而这个
+        异常只在 :meth:`rerank` 里被捕获并**静默降级为初检顺序** —— 于是
+        ``reranker.enabled: true`` 看起来开着，实际一次都没重排过（实测同一条
+        查询下重排结果与向量初检顺序逐条一致，才发现它根本没跑）。
+
+        代价：加载时多做一次两个词的打分。换来的是"打开就一定生效"。
+        """
+        try:
+            self.model.compute_score([("测试", "测试")], normalize=True)
+            return
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "FlagEmbedding 打分不可用（%s），改用 sentence-transformers CrossEncoder",
+                exc,
+            )
+        from sentence_transformers import CrossEncoder  # type: ignore
+
+        self.model = CrossEncoder(model_name, max_length=self.max_length, device=self.device)
+        self._backend = "cross_encoder"
 
     # ------------------------------------------------------------------
     def rerank(

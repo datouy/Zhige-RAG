@@ -46,10 +46,9 @@
 | **引文可验证** | 答案标注来源片段，并校验引用覆盖率与接地性 |
 | **多轮记忆** | 会话内短期记忆 + 跨会话长期记忆（支持显式"记住…"） |
 | **Agent** | 内置 ReAct 多步推理与工具调用 |
-| **多租户** | 按用户隔离向量库与图谱库，互不可见 |
 | **多模型后端** | `local` / `ollama` / `openai`，LLM 与 Embedding 各自独立配置 |
 | **双界面** | Web 前端（`ui/web`）+ Streamlit 控制台（`ui/`），共用同一套 REST API |
-| **生产配套** | JWT 认证、限流、审计日志、配额、Prometheus 指标、k8s 清单 |
+| **生产配套** | 限流、审计日志、配额、Prometheus 指标、k8s 清单 |
 
 ---
 
@@ -63,7 +62,7 @@
                                         │
                     ┌───────────────────▼──────────────────────┐
                     │  FastAPI（api/）                          │
-                    │  认证 · 限流 · 审计 · 配额 · 多租户隔离    │
+                    │  限流 · 审计 · 身份（本地固定用户）        │
                     └───────────────────┬──────────────────────┘
                                         │
         ┌───────────────────────────────▼───────────────────────────────┐
@@ -221,16 +220,16 @@ python scripts/start_all.py      # Windows 也可双击 start.bat
 
 ## 界面
 
-**默认无需登录** —— 拉起来就能用。知阁是本地工具，不该拿注册登录挡人。
+**无需登录** —— 拉起来就能用。知阁是本地工具，不该拿注册登录挡人。
 
 - **地址**：http://localhost:8000
 - **能力**：多知识库切换 · 会话列表与历史回看 · 文件上传 · 网页导入 ·
   **界面上切换模型** · 流式问答与引用溯源（点引用看原文分块）
 - 数据默认归属一个固定的「本地用户」，并给予不限额度 —— 这是你自己的机器。
 
-> 需要"一台服务器多人共用"时，把 `config/config.yaml` 的 `auth.enabled` 设为 `true`
-> （或设环境变量 `AUTH_ENABLED=1`），即启用登录注册与租户隔离：
-> 各人只能看到自己的知识库。默认是**关闭**的。
+> **本服务不提供登录与注册**：所有请求自动归属固定的「本地用户」，
+> 不需要账号，也不做多用户隔离。要"一台服务器多人共用"得另行接入认证，
+> 本项目刻意不带这些，见 `src/middleware/identity.py`。
 
 ### 在界面上换模型
 
@@ -294,6 +293,12 @@ data_quality:
 
 > 详细设计、取舍与授权提醒见 **[DECISION_OPTIMIZATION.md](./DECISION_OPTIMIZATION.md)**。
 
+> **开启前值得知道的一点**：`backend: llm` 是用生成式模型**模拟**决策，它本身仍是
+> 一次自回归调用 —— 加一处决策就多一次生成的等待。所以默认全关是有意为之。
+> 想真正拿到 d1 的毫秒级收益，要么用 `backend: d1`（需自备权重），要么只开那些
+> **能省掉一次生成**的环节（`retrieval_sufficiency`、`query_route`）—— 这两处是
+> 「多花一次短决策、少花一次长生成」，净赚。
+
 ## 关键配置
 
 `config/config.yaml` 中改动最频繁的项：
@@ -334,10 +339,8 @@ OPENAI_BASE_URL=https://api.deepseek.com/v1
 
 ```bash
 cp .env.example .env
-# 必填两项：
-#   JWT_SECRET=<32 位随机串>
+# 必填一项：
 #   POSTGRES_PASSWORD=<强口令>
-python -c "import secrets; print(secrets.token_urlsafe(32))"
 
 docker compose up -d
 ```
@@ -346,8 +349,8 @@ compose 默认配置为 `LLM_BACKEND=ollama` + `EMBEDDING_BACKEND=ollama`，
 并通过 `OLLAMA_BASE_URL=http://host.docker.internal:11434/v1` 访问**宿主机上的 Ollama**
 （容器内的 `localhost` 指向容器自身，这是最常见的踩坑点）。
 
-生产环境请务必设置强 `JWT_SECRET`：容器内已启用 `REQUIRE_STRONG_JWT=1`，
-密钥缺失、短于 32 字符、或仍是模板占位符时会**拒绝启动**（有意设计，防止用默认弱密钥上线）。
+数据库口令通过 `POSTGRES_PASSWORD` 注入：未设置时 compose 会直接报错退出，
+而不是静默用弱口令启动。
 
 Kubernetes 清单见 `k8s/`。
 
@@ -448,6 +451,72 @@ rag/
 ---
 
 ## 最近更新
+
+### 2026-10-16：修掉"回答跑偏"的三个真因（检索串味 / 重排失效 / 相似度丢失）
+
+现象：上传论文后问"用的是什么模型 完成的是什么功能？"，回答只复读了标题，
+引用里还混进 Spring 面试题和一段通用 RAG 介绍。逐条查证后：
+
+**1. 混合检索里关键词那一侧绕过了过滤（`src/vector_store.py`）**
+BM25 只按自己的索引召回，**完全没应用 `where`**，于是被 `doc_status` / `acl`
+排除的文档会从这条路溜回结果（越权 + 串味）。实测同样一条限定 `source` 的查询：
+关掉混合是 6/6 命中本文档，开启混合后 3/6 越界。现在关键词侧用
+`_metadata_matches` 做同条件过滤，认不出的算子一律保守排除。
+
+**2. 关键词分数被当成"相似度"，还把无关文档顶到最前**
+中文分词是 unigram+bigram 累加、没有查询长度归一，长文档极易拿高分：
+一条 Node.js 面试题对上述提问的关键词分折算后 0.903，**压过真正相关片段的
+0.546**。现在 BM25 分数带 `_score_kind=keyword` 标记不再冒充相似度，权重由
+`vector_store.hybrid.bm25_weight` 控制（默认 0.5，只做召回补充）。
+修复后该提问的 4 条引用**全部来自本文档**。
+
+**3. 重排器一直在"假装工作"（`src/reranker.py`）**
+FlagEmbedding 与当前 transformers 不兼容，`compute_score` 抛
+`XLMRobertaTokenizer has no attribute prepare_for_model`，而异常被捕获后**静默
+降级成初检顺序** —— `enabled: true` 开着却一次都没重排过。现在加载时自检一次，
+坏了立刻切到 sentence-transformers 的 CrossEncoder（同一份本地权重）。
+
+**顺带修好的：** 引用里相似度恒为 `—`（只取了 `_rerank_score`，未开重排时是
+None）；顶栏"0 文档 / 0 分块"（前端一直拿着旧的知识库对象）；`min_relevance=0.3`
+按 FlagEmbedding 的分数量程校准，换到 CrossEncoder 后会误杀候选，改为 0.05
+（实测相关 ≥0.087、无关 ≤0.001）。
+
+**效果（本机实测，同一提问）**：
+
+| | 修复前 | 修复后 |
+|---|---|---|
+| 引用 | 2 条本文档 + Spring 面试题 + 通用 RAG 介绍 | 4 条全部来自本文档 |
+| 回答 | 「用的是RAG技术完成的是基于本地化部署的中文RAG知识库系统的研究工作」（复读标题） | 「用的是 Qwen2.5-1.5B-Instruct…1.5B 参数 4bit 量化后约 1.2GB…」 |
+
+新增 `scripts/kb_doctor.py`：体检"界面上的台账"与"检索真正搜到的 collection"
+是否一致（默认只读，`--apply` 补登记、`--delete` 清理某个来源）。本机默认知识库
+体检结果就是台账 1 文档/156 块、实际 9 文档/717 块 —— 那 8 份看不见的历史文档
+正是串味的来源。
+
+### 2026-10-15：本地冷启动与重复加载优化（不动模型，只改项目）
+
+按「能复用就不重算」的思路把项目侧的固定开销清掉。实测数据来自本机
+（Qwen2.5-1.5B + bge-small-zh，单卡 4bit）：
+
+**1. 模型不再每问重载**（`src/rag_pipeline.py`）
+多租户 / 多知识库路径用 `copy.copy` 复制全局 pipeline，而懒加载让副本的 `llm` 也是
+`None`，于是**每个请求各自加载一遍权重**。实测连续 3 个请求加载 3 次模型。现在模型
+实例放在所有副本共享的 `_llm_holder` 里，并加锁保证并发首问也只加载一次。
+→ 每个问答省 **3.5s**。
+
+**2. 权重就位后不再联网校验**（`config/local_overrides.yaml`）
+界面「模型设置」把 `local_files_only` 写成了 `false`，导致**每次加载模型都先联网校验**
+（走 `HF_ENDPOINT` 镜像），而权重其实早就在本地。改回 `true` 后：Embedding 首次加载
+**26.5s → 0.2s**，租户工厂那次 **14.2s → 0.09s**。
+
+**3. 启动期预热**（`api/main.py::_warm_up_models`）
+把 `torch` / `transformers` / `sentence-transformers` 的导入、Embedding 模型、向量库与
+pipeline 的初始化放到启动**后台线程**里做完（不阻塞服务就绪）。
+→ 第一个检索请求 **7.78s → 0.86s**（约 9 倍）。`RAG_PRELOAD_LLM=1` 可连 LLM 一起预热。
+
+**4. `RAG_LAZY_LLM=0` 真正生效**（`api/deps.py`）
+原来写成 `bool(os.getenv(...))`，而字符串 `0` 在 Python 里是真值 —— 开关按了没反应。
+已改用统一的 `env_flag()` 解析。
 
 ### 2026-10-15：d1 决策层扩展（再接入三处：充分性 / 分流 / 入库质检）
 

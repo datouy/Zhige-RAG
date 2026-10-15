@@ -1,7 +1,9 @@
 """FastAPI Web 服务 - 中文知识库 RAG 系统.
 
 提供 REST API + WebSocket 流式问答，逐步替代 Streamlit 交互界面。
-支持多租户认证和用户隔离。
+
+本服务**不需要登录**：所有请求自动归属唯一的本地用户（见
+``src/middleware/identity.py``），因此没有任何注册 / 登录端点。
 
 启动命令：
     uvicorn api.main:app --reload --host 0.0.0.0 --port 8000
@@ -18,12 +20,7 @@
 
 ## ChineseRAGKB 企业知识库系统
 
-### Authentication
-所有认证相关端点无需认证，其他受保护端点需要 `Authorization: Bearer <token>` header。
-
 ### Rate Limiting
-- 认证端点: 5 requests/minute
-- 注册端点: 3 requests/minute
 - 查询端点: 60 requests/minute
 - 其他端点: 120 requests/minute
 
@@ -31,7 +28,7 @@
 | Code | Description |
 |------|-------------|
 | 400 | Bad Request - 请求参数错误 |
-| 401 | Unauthorized - 未认证或 Token 无效 |
+| 401 | Unauthorized - 请求被拒绝 |
 | 403 | Forbidden - 无权限访问 |
 | 422 | Validation Error - 请求验证失败 |
 | 429 | Rate Limit Exceeded - 请求频率超限 |
@@ -39,11 +36,11 @@
 | 503 | Service Unavailable - 服务不可用 |
 
 ### Monitoring Endpoints
-- GET /api/health - 健康检查（无需认证，5s TTL 缓存）
-- GET /api/ready - Kubernetes 就绪探针（无需认证）
-- GET /api/metrics - Prometheus 格式指标（无需认证）
-- GET /api/v1/metrics - JSON 格式指标（需要认证）
-- GET /api/health/invalidate - 失效健康缓存（无需认证）
+- GET /api/health - 健康检查（5s TTL 缓存）
+- GET /api/ready - Kubernetes 就绪探针
+- GET /api/metrics - Prometheus 格式指标
+- GET /api/v1/metrics - JSON 格式指标
+- GET /api/health/invalidate - 失效健康缓存
 """
 
 from __future__ import annotations
@@ -51,6 +48,7 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -72,8 +70,6 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from src.db.database import init_db
-from src.db.models import User
-from src.middleware.auth import get_current_user
 from src.middleware.logging import (
     PerformanceMonitorMiddleware,
     RequestLoggingMiddleware,
@@ -94,6 +90,42 @@ class RequestIDMiddleware(BaseHTTPMiddleware):
         return response
 
 
+def _warmup_enabled() -> bool:
+    """是否启用启动期预热（``RAG_WARMUP=0`` 可关闭）。"""
+    return os.getenv("RAG_WARMUP", "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def _warm_up_models() -> None:
+    """后台预热：把"第一次请求才付"的固定成本挪到启动期。
+
+    冷启动最贵的其实不是推理，而是**惰性 import + 模型首次加载**：
+    ``torch`` / ``transformers`` / ``sentence-transformers`` 三个导入就要
+    6 秒上下，再加上 Chroma 客户端、prompt 模板与分块器的初始化。这些开销
+    与用户问了什么无关，却全部压在那个"恰好第一个提问"的请求上（实测首个
+    ``/api/v1/search`` 要 17 秒、首个 ``/api/v1/chat`` 要 37 秒）。
+
+    这里把它们放到启动后台线程里做一遍，用户打开页面时已经是热的。
+
+    刻意用后台线程而不是 await：不拖慢服务就绪，k8s 探针与 ``/api/health``
+    立刻可应答。LLM 是否一并预热由 ``RAG_PRELOAD_LLM`` 决定（默认关，避免
+    启动即占显存）；置 1 则首个问题连权重加载都省掉。
+    """
+    try:
+        from api.deps import get_embedding, get_pipeline, get_vector_store
+
+        get_embedding()
+        get_vector_store()
+        pipeline = get_pipeline()
+        logger.info("预热完成：Embedding / 向量库 / Pipeline 已就绪")
+
+        if os.getenv("RAG_PRELOAD_LLM", "0").strip().lower() in ("1", "true", "yes", "on"):
+            started = time.perf_counter()
+            pipeline.ensure_llm()
+            logger.info("预热完成：LLM 已加载（%.1fs）", time.perf_counter() - started)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("后台预热失败（不影响服务，首次请求时会自行加载）: %s", exc)
+
+
 # =========================== 应用生命周期 ===========================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -102,6 +134,7 @@ async def lifespan(app: FastAPI):
     Startup:
         - 初始化数据库
         - 验证配置
+        - 后台预热模型（不阻塞就绪）
         - 记录启动日志
 
     Shutdown:
@@ -134,6 +167,13 @@ async def lifespan(app: FastAPI):
             logger.info("配置验证通过")
         except Exception as config_err:
             logger.warning("配置验证失败（继续启动）: %s", config_err)
+
+        # 冷启动预热：放后台线程，服务立刻可应答（见 _warm_up_models）
+        if _warmup_enabled():
+            threading.Thread(
+                target=_warm_up_models, name="rag-warmup", daemon=True
+            ).start()
+            logger.info("已在后台开始预热（embedding / 向量库 / pipeline）")
 
         logger.info("ChineseRAGKB API 启动完成")
         logger.info("=" * 50)
@@ -180,7 +220,7 @@ async def lifespan(app: FastAPI):
 # =========================== 应用实例 ===========================
 app = FastAPI(
     title="知阁 Zhige API",
-    description="知阁（Zhige）—— 本地中文知识库 RAG 平台，支持多租户与多模型后端",
+    description="知阁（Zhige）—— 本地中文知识库 RAG 平台，无需登录，支持多模型后端",
     version="0.3.0",
     lifespan=lifespan,
 )
@@ -208,8 +248,8 @@ from api.middleware import SecurityHeadersMiddleware
 
 app.add_middleware(SecurityHeadersMiddleware)
 
-# 速率限制器（auth 路由共享）
-from api.routes.auth import limiter
+# 速率限制器（全局限流中间件与各路由共用同一个实例）
+from src.rate_limit import limiter
 
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
@@ -246,7 +286,6 @@ app.add_middleware(
 # =========================== 路由挂载 ===========================
 from api.routes import (
     agent_router,
-    auth_router,
     chat_router,
     eval_router,
     feedback_router,
@@ -257,9 +296,8 @@ from api.routes import (
     system_router,
 )
 
-# 直接使用子路由里写明的 ``Depends(get_current_user)``：每个受保护端点
-# 在路由函数声明处显式依赖认证，P1 阶段无需 ``dependency_overrides`` hack。
-app.include_router(auth_router)
+# 直接使用子路由里写明的 ``Depends(get_current_user)``：每个端点都要拿
+# 当前用户身份（本地单用户），P1 阶段无需 ``dependency_overrides`` hack。
 app.include_router(subscription_router)
 app.include_router(system_router)
 app.include_router(settings_router)

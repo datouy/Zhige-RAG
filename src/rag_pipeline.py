@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import re
+import threading
 import time
 import unicodedata
 from dataclasses import dataclass, field
@@ -128,6 +129,18 @@ class RAGPipeline:
         self.embedding = embedding
         self.vector_store = vector_store
         self.llm = llm
+        # 进程内共享的 LLM 持有槽。
+        #
+        # 多租户 / 多知识库路径用 ``copy.copy`` 浅拷贝本 pipeline
+        # （见 ``api/deps.get_runtime_pipeline``）。浅拷贝会共享下面这个
+        # **同一个 dict 对象**，因此副本与全局单例始终拿到同一个模型实例。
+        #
+        # 修复前：``get_pipeline()`` 默认懒加载（``llm=None``），浅拷贝后
+        # 每个副本的 ``llm`` 也是 None，``ensure_llm`` 于是各自把权重加载
+        # 一遍 —— 实测连续 3 个请求加载了 3 次模型（每个问题多出数秒）。
+        self._llm_holder: Dict[str, Any] = {"llm": llm}
+        # 懒加载只允许一个线程真正动手，其余等待复用，避免并发首问各自加载。
+        self._llm_load_lock = threading.Lock()
         self.reranker = reranker
         # d1 决策层（可选）：驱动重排 / 路由 / 校验三处增强。
         # 显式注入优先；未注入时 _get_decision_provider 按配置懒加载。
@@ -608,11 +621,29 @@ class RAGPipeline:
 
     # ------------------------------------------------------------------
     def ensure_llm(self) -> None:
-        """按需加载 LLM。"""
+        """按需加载 LLM（**全进程只加载一次**）。
+
+        懒加载的意图是"没人问就不占显存"，不是"每问一次加载一次"。
+        模型实例存在共享的 ``_llm_holder`` 里：任何副本加载完成后，其它
+        副本（以及后续请求新建的副本）直接复用，不再重复读权重 / 重新量化。
+        """
         if self.llm is not None:
             return
-        # P1.4：与 from_config 共用构造逻辑，避免字段漂移
-        self.llm = self._build_llm_from_cfg(self.config.get("llm", {}))
+        holder = getattr(self, "_llm_holder", None)
+        if holder is None:
+            # 兼容极早期构造出来的实例（没有 holder）：退化为原行为
+            # P1.4：与 from_config 共用构造逻辑，避免字段漂移
+            self.llm = self._build_llm_from_cfg(self.config.get("llm", {}))
+            return
+        lock = getattr(self, "_llm_load_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._llm_load_lock = lock
+        with lock:
+            if holder.get("llm") is None:
+                # P1.4：与 from_config 共用构造逻辑，避免字段漂移
+                holder["llm"] = self._build_llm_from_cfg(self.config.get("llm", {}))
+            self.llm = holder["llm"]
 
     def _apply_query_instruction(self, query: str) -> str:
         """按配置给查询拼接 BGE 检索指令。
@@ -708,7 +739,24 @@ class RAGPipeline:
                 break
             if len(content) > budget:
                 content = content[: max(0, budget - 1)] + "…"
-            chunks.append({"index": i, "title": title, "content": content, "metadata": h.metadata})
+            # 分数要跟着走：引用列表得如实告诉用户"这条到底有多相关"。
+            # 关键词召回给的不是余弦相似度，用 score_kind 区分开，别混着展示。
+            if meta.get("_rerank_score") is not None:
+                score: Optional[float] = float(meta["_rerank_score"])
+                score_kind = "rerank"
+            else:
+                score = float(h.score)
+                score_kind = "keyword" if meta.get("_score_kind") == "keyword" else "dense"
+            chunks.append(
+                {
+                    "index": i,
+                    "title": title,
+                    "content": content,
+                    "metadata": h.metadata,
+                    "score": score,
+                    "score_kind": score_kind,
+                }
+            )
             budget -= len(content)
         return chunks, "\n\n".join(c["content"] for c in chunks)
 
@@ -729,7 +777,10 @@ class RAGPipeline:
                     "title": c["title"],
                     "source": meta.get("source"),
                     "page": meta.get("page"),
-                    "score": meta.get("_rerank_score"),
+                    # 之前只取 _rerank_score：没开重排器时恒为 None，界面上
+                    # 四条来源全是"相似度 —"。现在带上真实分数与类型。
+                    "score": c.get("score", meta.get("_rerank_score")),
+                    "score_kind": c.get("score_kind", "dense"),
                     "snippet": c["content"][:200],
                 }
             )

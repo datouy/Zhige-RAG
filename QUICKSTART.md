@@ -74,19 +74,6 @@ python scripts\quickstart.py
 
 或者在界面中点击左下角 **"模型设置"** 进行配置。
 
-### 开启多用户模式（需要登录）
-
-默认是**本地单用户模式**（无需登录）。如果需要多人共用一台服务器：
-
-```bash
-# 方式一：环境变量
-$env:AUTH_ENABLED = "1"
-python scripts\quickstart.py
-
-# 方式二：修改 config/config.yaml
-# 找到 auth.enabled，把 false 改成 true
-```
-
 ---
 
 ## 🔧 常见问题
@@ -108,17 +95,9 @@ pip install -r requirements-core.txt
 # 确保后端正在运行（看到 "Uvicorn running on http://0.0.0.0:8000"）
 ```
 
-### Q: 看到登录界面怎么办？
-- 默认是**无需登录**的本地模式
-- 如果看到登录界面，说明你可能访问了旧的缓存
-- **强制刷新**: `Ctrl + Shift + R` (Windows) 或 `Cmd + Shift + R` (Mac)
-- 或者清除浏览器缓存后重试
-
-### Q: 如何确认当前是本地模式？
-```bash
-# 运行检查脚本
-python check_auth_mode.py
-```
+### Q: 需要登录吗？
+- 不需要。本服务没有任何登录 / 注册入口，打开就能用
+- 所有数据归属固定的「本地用户」，保存在本机
 
 ---
 
@@ -155,7 +134,6 @@ ChineseRAGKB/
 
 - 查看完整文档: `README.md`
 - 诊断问题: `python scripts/doctor.py`
-- 检查认证模式: `python check_auth_mode.py`
 
 ---
 

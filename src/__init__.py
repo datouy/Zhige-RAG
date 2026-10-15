@@ -14,7 +14,7 @@
 
 # 统一加载项目根目录的 .env。
 # 所有入口（api/main.py、scripts/*.py、ui/app.py）都会导入 src 包，
-# 在此处 load_dotenv 可保证 .env 中的 JWT_SECRET / DB_PATH / HF_ENDPOINT 等配置生效。
+# 在此处 load_dotenv 可保证 .env 中的 DB_PATH / HF_ENDPOINT / LLM_BACKEND 等配置生效。
 # override=False：真实环境变量（Docker / K8s 注入）优先级高于 .env 文件。
 try:  # pragma: no cover - 环境相关的兜底，dotenv 缺失或 .env 不存在时静默跳过
     from pathlib import Path as _Path

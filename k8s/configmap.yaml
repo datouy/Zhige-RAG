@@ -40,7 +40,6 @@ data:
   ALLOWED_ORIGINS: "https://app.example.com,https://admin.example.com"
 
   # Rate limiting
-  RATE_LIMIT_AUTH: "5/minute"
   RATE_LIMIT_QUERY: "60/minute"
   RATE_LIMIT_DEFAULT: "120/minute"
 

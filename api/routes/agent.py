@@ -24,7 +24,7 @@ from pydantic import BaseModel, Field
 
 from api.deps import get_llm_gate, get_runtime_config, get_runtime_pipeline
 from src.db.models import User
-from src.middleware.auth import get_current_user
+from src.middleware.identity import get_current_user
 from src.utils import get_logger
 
 logger = get_logger("api.routes.agent")
@@ -183,38 +183,18 @@ def agent_chat_sync(
 
 
 @router.websocket("/api/v1/ws/agent")
-async def websocket_agent(websocket: WebSocket, token: Optional[str] = None):
+async def websocket_agent(websocket: WebSocket):
     """WebSocket 流式 Agent 调用。
 
-    认证策略与 HTTP 路径、``/ws/chat`` 完全一致（见 :mod:`src.middleware.auth`）：
-
-    - **未启用认证（默认，单用户本地模式）**：不要求 token，直接绑定本地用户；
-    - 启用认证时：必须携带有效 **access** token（``?token=``）。
-
-    此前这里**无条件**要求 token，与同一路由的 REST 端点（用 ``get_current_user``，
-    本地模式下放行）以及 ``/ws/chat`` 都不一致 —— 本地模式下前端拿不到 token，
-    Agent WS 实际不可用。现统一为同一套认证策略。
+    服务不需要登录：连接建立后直接绑定本地用户（见 :mod:`src.middleware.identity`），
+    与同路由的 REST 端点及 ``/ws/chat`` 行为一致。
     """
     from src.db.database import SessionLocal
-    from src.middleware.auth import auth_enabled, get_local_user
+    from src.middleware.identity import get_local_user
 
     db = SessionLocal()
     try:
-        if auth_enabled():
-            from src.auth.jwt_handler import decode_token
-
-            payload = decode_token(token) if token else None
-            # 同 chat.py：必须校验 type == "access"，否则 7 天期的 refresh token
-            # 也能直接建立 WS 连接。
-            if not payload or not payload.get("sub") or payload.get("type") != "access":
-                await websocket.close(code=4401)  # 未认证
-                return
-            ws_user = db.query(User).filter(User.id == payload["sub"]).first()
-            if ws_user is None or not ws_user.is_active:
-                await websocket.close(code=4403)  # 用户不存在或已禁用
-                return
-        else:
-            ws_user = get_local_user(db)
+        ws_user = get_local_user(db)
         user_id = ws_user.id
     finally:
         db.close()

@@ -39,7 +39,7 @@ from pydantic import BaseModel, Field
 from api.deps import get_kg_extractor, get_runtime_config, get_runtime_pipeline
 from src.db.models import User
 from src.factories import TenantAwareFactory
-from src.middleware.auth import get_current_user
+from src.middleware.identity import get_current_user
 from src.kg import GraphRAG, GraphRetriever
 from src.kg.cypher_guard import (
     CypherValidationError,

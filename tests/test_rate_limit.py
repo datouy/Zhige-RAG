@@ -57,14 +57,14 @@ def test_real_ip_from_untrusted_source():
 
 
 def test_rate_limit_key_by_user():
-    """测试按账号限流。"""
+    """测试限流键：给了用户名就用 user:，否则用 ip:。"""
     req = MockRequest(client_host="203.0.113.5")
-    
-    # 已认证用户
+
+    # 显式传入用户名
     key = get_rate_limit_key(req, username="alice")
     assert key == "user:alice"
-    
-    # 未认证用户
+
+    # 未传用户名
     key = get_rate_limit_key(req, username=None)
     assert key == "ip:203.0.113.5"
 

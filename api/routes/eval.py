@@ -7,7 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException
 
 from api.deps import get_runtime_config, get_runtime_pipeline
 from src.db.models import User
-from src.middleware.auth import get_current_user
+from src.middleware.identity import get_current_user
 from src.utils import get_logger, resolve_path
 
 logger = get_logger("api.routes.eval")

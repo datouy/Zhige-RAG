@@ -1,10 +1,12 @@
-"""测试异常信息脱敏（P1-7）。"""
+"""测试异常信息脱敏（P1-7）。
+
+服务不需要登录，所有请求直接打业务端点。
+"""
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
-from unittest.mock import MagicMock
 
 from api.main import app
 from src.db.database import get_db
@@ -15,10 +17,10 @@ from src.db.models import Base
 def client():
     """创建带 SQLite in-memory DB 的测试客户端。"""
     # 禁用 rate limiter
-    from api.routes import auth as auth_module
-    if hasattr(auth_module, "limiter"):
-        auth_module.limiter.enabled = False
-    
+    from src.rate_limit import limiter
+
+    limiter.enabled = False
+
     # 创建内存数据库
     engine = create_engine(
         "sqlite:///:memory:",
@@ -39,7 +41,7 @@ def client():
 
     with TestClient(app) as test_client:
         yield test_client
-    
+
     app.dependency_overrides.clear()
 
 
@@ -48,25 +50,24 @@ class TestExceptionSanitization:
 
     def test_validation_error_sanitized(self, client):
         """验证错误应脱敏（不暴露内部字段路径）。"""
-        # 发送格式错误的注册请求
+        # top_k 应为整数，传字符串触发校验失败
         response = client.post(
-            "/api/v1/auth/register",
-            json={"username": "ab", "password": "short", "email": "invalid"},
+            "/api/v1/chat", json={"query": "你好", "top_k": "not-an-int"}
         )
         assert response.status_code == 422
         data = response.json()
-        
+
         # 应包含通用错误信息
         assert "error" in data
         assert data["error"] == "Validation Error"
         assert "message" in data
-        
+
         # 应包含 request_id
         assert "request_id" in data
-        
+
         # 不应直接暴露 Pydantic 的原始错误结构
         assert "detail" not in data or isinstance(data.get("details"), list)
-        
+
         # 如果有 details，应该是简化后的格式
         if "details" in data:
             for err in data["details"]:
@@ -77,84 +78,61 @@ class TestExceptionSanitization:
 
     def test_database_error_sanitized(self, client):
         """数据库错误应隐藏 SQL 和表名。"""
-        # 尝试用无效 token 访问需要数据库的端点
-        response = client.get(
-            "/api/v1/kb/list",
-            headers={"Authorization": "Bearer invalid_token_format"},
-        )
-        
+        response = client.get("/api/v1/documents")
+
         # 应返回通用错误，不暴露数据库细节
         if response.status_code == 500:
             data = response.json()
             content = str(data)
-            
+
             # 不应包含敏感信息
             assert "SQL" not in content.upper()
             assert "SELECT" not in content.upper()
             assert "TABLE" not in content.upper()
             assert "SQLALCHEMY" not in content.upper()
-            
+
             # 应包含 request_id
             assert "request_id" in data
 
     def test_general_exception_no_stacktrace(self, client):
         """通用异常不应返回堆栈信息。"""
-        # 这个测试需要触发一个未捕获的异常
-        # 由于我们的端点都有错误处理，这里模拟场景
-        
-        # 尝试访问不存在的端点会返回 404（FastAPI 默认处理）
         response = client.get("/api/nonexistent/endpoint")
-        
+
         # 404 是正常的，但如果是 500，应该脱敏
         if response.status_code == 500:
             data = response.json()
             content = str(data)
-            
+
             # 不应包含 Python 堆栈信息
             assert "Traceback" not in content
             assert "File \"" not in content
-            assert "line " not in content.lower() or "request_id" in content.lower()
-            
+
             # 应该是通用提示
             assert "message" in data
             assert "request_id" in data
 
-    def test_auth_error_messages_safe(self, client):
-        """认证错误不应泄露用户存在性。"""
-        # 尝试用不存在的用户登录
+    def test_auth_endpoints_removed_and_safe(self, client):
+        """登录端点已移除，且 404 响应不泄露内部结构。"""
         response = client.post(
             "/api/v1/auth/login",
             json={"login": "nonexistent_user_12345", "password": "SomePass123"},
         )
-        
-        assert response.status_code == 401
-        data = response.json()
-        
-        # 应返回通用提示，不区分"用户不存在"或"密码错误"
-        assert "detail" in data
-        assert "用户名或密码错误" in data["detail"] or "Unauthorized" in str(data)
-        
-        # 不应包含具体信息
-        assert "不存在" not in data.get("detail", "").lower() or "用户名或密码" in data.get("detail", "")
+        assert response.status_code in (404, 405)
+        content = str(response.json()).lower()
+        assert "traceback" not in content
+        assert "sqlalchemy" not in content
 
     def test_rate_limit_response_safe(self, client):
-        """限流错误应该是安全的。"""
-        # 快速发送多个注册请求触发限流
+        """限流错误（如果真的触发）应该是安全的。"""
+        response = None
         for _ in range(10):
             response = client.post(
-                "/api/v1/auth/register",
-                json={
-                    "username": f"user_{_}",
-                    "password": "ValidPass123",
-                    "email": f"user{_}@example.com",
-                },
+                "/api/v1/feedback",
+                json={"query": f"q{_}", "rating": "helpful"},
             )
-        
-        # 最后一个应该被限流
-        if response.status_code == 429:
-            data = response.json()
-            content = str(data)
-            
+
+        if response is not None and response.status_code == 429:
+            content = str(response.json())
             # 不应暴露限流实现细节
             assert "slowapi" not in content.lower()
             assert "redis" not in content.lower()

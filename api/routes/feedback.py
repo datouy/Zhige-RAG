@@ -24,7 +24,7 @@ from sqlalchemy.orm import Session
 
 from src.db.database import get_db
 from src.db.models import FeedbackRecord, User
-from src.middleware.auth import get_current_user
+from src.middleware.identity import get_current_user
 from src.utils import get_logger, resolve_path
 
 logger = get_logger("api.routes.feedback")

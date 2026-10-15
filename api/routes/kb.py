@@ -50,7 +50,7 @@ from src.kb_service import (
     update_kb,
     update_session,
 )
-from src.middleware.auth import get_current_user
+from src.middleware.identity import get_current_user
 from src.utils import get_logger
 
 logger = get_logger("api.routes.kb")

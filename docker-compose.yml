@@ -38,13 +38,8 @@ services:
       - OPENAI_BASE_URL=${OPENAI_BASE_URL:-https://api.deepseek.com/v1}
       - OPENAI_MODEL=${OPENAI_MODEL:-deepseek-chat}
       # Security
-      # 变量名必须是 JWT_SECRET —— 这是 src/auth/jwt_handler.py 读取的名字。
-      # 历史上这里写的是 SECRET_KEY，两者不匹配导致生产环境实际回落到代码里
-      # 硬编码的默认弱密钥，任何人都能离线伪造 token 接管账户。
-      - JWT_SECRET=${JWT_SECRET:?JWT_SECRET 必须设置为至少 32 字符的随机串（见 .env.example）}
-      # 生产环境强制拒绝默认弱密钥启动（jwt_handler.py 会据此 raise）
-      - REQUIRE_STRONG_JWT=1
-      - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-http://localhost:8000,http://127.0.0.1:8000}
+      - ALLOWED_ORIGINS=
+${ALLOWED_ORIGINS:-http://localhost:8000,http://127.0.0.1:8000}
       # Rate Limiting
       - RATE_LIMIT_STORAGE_URL=redis://redis:6379/0
       # Chroma

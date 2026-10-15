@@ -77,11 +77,6 @@ spec:
 
           env:
             # Secrets
-            - name: JWT_SECRET
-              valueFrom:
-                secretKeyRef:
-                  name: chineseragkb-secrets
-                  key: JWT_SECRET
             - name: DATABASE_URL
               valueFrom:
                 secretKeyRef:

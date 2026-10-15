@@ -80,7 +80,6 @@ SENSITIVE_FIELDS: Set[str] = {
 
 # URL 中的敏感路径模式
 SENSITIVE_PATHS: List[re.Pattern] = [
-    re.compile(r"/auth/(login|register|password)"),
     re.compile(r"/admin/"),
 ]
 

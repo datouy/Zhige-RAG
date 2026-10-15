@@ -24,16 +24,6 @@ class DatabaseConfig(BaseModel):
     pool_pre_ping: bool = Field(True, description="使用前验证连接")
 
 
-# ======================== JWT 配置 ========================
-
-class JWTConfig(BaseModel):
-    """JWT 配置模型。"""
-    secret: str = Field(..., min_length=32, description="JWT 密钥（至少 32 字符）")
-    algorithm: str = Field("HS256", description="JWT 算法")
-    access_token_expire_minutes: int = Field(30, ge=1, le=1440, description="访问令牌过期时间（分钟）")
-    refresh_token_expire_days: int = Field(7, ge=1, le=30, description="刷新令牌过期时间（天）")
-
-
 # ======================== LLM 配置 ========================
 
 class LLMQuantizationConfig(BaseModel):
@@ -313,12 +303,7 @@ def validate_env_vars() -> List[str]:
         缺失或无效的环境变量列表
     """
     errors = []
-    
-    # JWT 密钥检查
-    jwt_secret = os.getenv("JWT_SECRET", "")
-    if jwt_secret and len(jwt_secret) < 32:
-        errors.append("JWT_SECRET should be at least 32 characters for security")
-    
+
     # API Key 检查（如果有外部 LLM）
     if os.getenv("OPENAI_API_KEY") and not os.getenv("OPENAI_API_KEY", "").startswith("sk-"):
         errors.append("OPENAI_API_KEY should start with 'sk-'")

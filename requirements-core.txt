@@ -18,12 +18,6 @@ aiofiles>=23.3.0
 pydantic>=2.0.0
 sqlalchemy>=2.0.0
 
-# ---------- 认证 ----------
-# JWT 用 pyjwt，密码哈希用 bcrypt（代码中直接依赖）
-pyjwt>=2.8.0
-bcrypt>=4.0.0
-email-validator>=2.0.0
-
 # ---------- 数据库迁移 ----------
 alembic>=0.9.0
 

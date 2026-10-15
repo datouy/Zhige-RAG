@@ -17,18 +17,9 @@ app:
   name: "知阁"
   version: "0.3.0"
 
-# ------------------ 认证 ------------------
-#
-# enabled: false（默认）—— **单用户本地模式**：打开就能用，不需要注册登录。
-#     所有数据归属一个固定的"本地用户"，并给予 enterprise 级额度（不受配额限制）。
-#     适合：个人开发者、单机部署、内网私有化。
-#
-# enabled: true —— 启用 JWT 认证与多租户隔离（登录后各人只看得到自己的知识库）。
-#     适合：一台服务器多人共用。
-#
-# 也可用环境变量强制覆盖（容器/临时调试很方便）：AUTH_ENABLED=1
-auth:
-  enabled: false
+# ------------------ 身份 ------------------
+# 本服务不提供注册与登录：所有请求自动归属固定的本地用户，
+# 数据归属关系见 src/middleware/identity.py，此处无需任何配置。
 
 # ------------------ 数据目录 ------------------
 paths:
@@ -150,6 +141,11 @@ embedding:
   use_doc_instruction: false
   cache_dir: "./models/sentence-transformers"
   # true = 只用本地已有模型、不联网。**首次部署请改为 false** 让它自动下载（约 100 MB）。
+  #
+  # ⚠️ 权重已经在本地之后，请把它改回 true：false 会让**每次加载模型**都先去
+  #    联网校验（走 HF_ENDPOINT 镜像），网络一慢就是十几秒起步 —— 实测这一项
+  #    就让 Embedding 首次加载从 0.2s 变成 26s。界面的「模型设置」写在
+  #    config/local_overrides.yaml 里，优先级高于本文件，排查时别忘了看它。
   local_files_only: true
 
 # ------------------ 向量数据库 ------------------
@@ -166,6 +162,12 @@ vector_store:
   hybrid:
     enabled: true                 # 必须开启：向量 + BM25 混合
     fetch_k: 20                  # BM25 召回数（> top_k 保证融合质量）
+    # 关键词（BM25）在 RRF 融合里的权重。向量为 1.0。
+    # 中文分词是 unigram+bigram 累加、且未按查询长度归一，短查询下长文档
+    # 很容易靠"命中词多"拿高分（实测一条无关面试题折算出的"相似度"0.90，
+    # 压过真正相关片段的 0.55，并把无关文档顶进引用列表）。
+    # 0.5 = 关键词只做召回补充，不压过语义相似度；设为 1.0 恢复旧的等权融合。
+    bm25_weight: 0.5
 
 # ------------------ 数据层质量管线 ------------------
 data_quality:
@@ -219,7 +221,9 @@ retrieval:
 # 只把真正相关的 Top-3~5 喂给大模型
 #
 # backend 决定"用什么重排"：
-#   bge  —— bge-reranker 交叉编码器（精度高、CPU 上偏慢，需 FlagEmbedding）
+#   bge  —— bge-reranker 交叉编码器（精度高、CPU 上偏慢）
+#           优先用 FlagEmbedding；它与当前 transformers 版本不合时自动改用
+#           sentence-transformers 的 CrossEncoder（同一份本地权重）
 #   d1   —— d1 决策模型 score 原语（毫秒级、0 输出 token，见下方 decision 段）
 #   auto —— 优先 d1，不可用时回落 bge
 #
@@ -227,14 +231,25 @@ retrieval:
 # 🎯 精度优先：保持开启状态
 #
 reranker:
-  enabled: false                   # 默认关闭以提升速度，需要更精准时设为 true
+  # 开启：把初检的 24 个候选交给交叉编码器重排，能显著改善"答案块排不进 top-k"
+  # 的问题。实测（本地 bge-reranker-base）：
+  #   提问"本系统使用的是什么大语言模型"，向量 top-4 取不到写着 Qwen2.5-1.5B 的那一块
+  #   （它排第 11），重排后回到 top-4；无关提问（天气/菜谱）分数 0.00，会被下面
+  #   的 min_relevance 直接挡掉，不再硬编。
+  # 代价：多加载一个 ~1.1GB 的重排模型 + 每次约几十毫秒。
+  # 想换回纯向量检索（更快）就把 enabled 改回 false。
+  enabled: true
   backend: "bge"                   # bge | d1 | auto
   model_name: "./models/bge-reranker-base"
-  device: "cpu"
+  device: "auto"                   # auto 会优先用显卡；纯 CPU 机器会被自动判为 cpu
   top_n: 3                        # 最终返回数
   max_length: 256
   cache_dir: "./models/huggingface"
-  min_relevance: 0.3             # 重排后最低相关度阈值
+  # 重排后最低相关度阈值（交叉编码器 sigmoid 分）。
+  # 实测相关提问 ≥0.087（含糊提问）~0.99（表述清楚的提问），无关提问 ≤0.001，
+  # 所以 0.05 既能挡掉无关内容，又不会把含糊但相关的候选误杀。
+  # 注意：0.3 是当年按 FlagEmbedding 的归一化校准的，换到 CrossEncoder 后偏严。
+  min_relevance: 0.05
   max_candidates: 24             # backend=d1 时最多重排多少个候选（成本护栏）
 
 # ------------------ d1 决策层（Decision Primitives）------------------
@@ -358,6 +373,9 @@ llm:
   trust_remote_code: false
   # true = 只用本地文件、不联网。首次部署请改为 false 让它自动下载，
   # 或提前把权重放到 model_name 指定的目录。这是"开箱即用"最常见的卡点。
+  #
+  # 权重就位后建议改回 true：false 会在每次加载时联网校验模型元数据，
+  # 网络不通/较慢时首问会白等十几秒（同 embedding 段的说明）。
   local_files_only: true
   use_chat_template: true
   chat_template: "auto"

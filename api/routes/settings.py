@@ -20,7 +20,7 @@ from fastapi import HTTPException
 from pydantic import BaseModel, Field
 
 from src.db.models import User
-from src.middleware.auth import get_current_user
+from src.middleware.identity import get_current_user
 from src.settings_service import (
     SettingsError,
     clear_overrides,
@@ -62,16 +62,6 @@ class TestBody(BaseModel):
     model: Optional[str] = None
 
 
-def _require_admin_if_auth(user: User) -> None:
-    """启用认证时，改模型配置属于管理员操作。
-
-    本地单用户模式下 get_current_user 返回的本地用户本身就是 admin，直接放行。
-    """
-    if getattr(user, "is_admin", False):
-        return
-    raise HTTPException(status_code=403, detail="只有管理员可以修改模型设置")
-
-
 @router.get("/api/v1/settings/model", tags=["设置"])
 async def api_get_model_settings(
     current_user: User = Depends(get_current_user),
@@ -94,7 +84,6 @@ async def api_update_model_settings(
     返回体里的 ``warnings`` 要展示给用户 —— 尤其是切换 Embedding 后端时，
     向量库会切到独立 collection，旧文档需要重新入库。
     """
-    _require_admin_if_auth(current_user)
     try:
         payload = body.model_dump(exclude_none=True)
         return update_model_settings(payload)
@@ -123,7 +112,6 @@ async def api_clear_model_settings(
     current_user: User = Depends(get_current_user),
 ) -> Dict[str, Any]:
     """清除界面覆盖，恢复到 ``config/config.yaml`` 的配置。"""
-    _require_admin_if_auth(current_user)
     from api.deps import _reset_cached_config, reset_all_singletons
 
     clear_overrides()

@@ -49,6 +49,5 @@ jobs:
 
       - name: Test imports
         run: |
-          python -c "from src.auth.jwt_handler import create_access_token; print('Auth module OK')"
           python -c "from src.factories import TenantAwareFactory; print('Factory module OK')"
           python -c "from src.db.models import User; print('DB models OK')"

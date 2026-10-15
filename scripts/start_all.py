@@ -160,11 +160,21 @@ def main() -> int:
         print("\n[2/4] Web 界面已随 FastAPI 提供 → http://localhost:8000")
         print("      跳过 Streamlit（需要调试界面时加 --with-streamlit）")
 
-    # 3. LLM 预加载（可选：仅当 scripts/preload_llm.py 存在时执行；失败不影响主服务）
+    # 3. LLM 预加载
+    #
+    # 默认**不再**单独拉起 preload_llm.py：API 进程自己会在启动后台线程里预热
+    # （见 api/main.py::_warm_up_models）。另外起一个进程只会把同一份权重装进
+    # 第二个地址空间 —— 白占一份显存/内存，对 API 的首次响应毫无帮助。
+    #
+    # 确实需要独立进程预热（例如先喂热显存再跑别的工具）时，
+    # 设置 RAG_PRELOAD_LLM_PROCESS=1。
     preload_proc = None
     preload_script = ROOT / "scripts" / "preload_llm.py"
-    if preload_script.exists():
-        print("\n[3/4] 后台预加载 LLM 模型 (首次约 30-120 秒) ...")
+    _want_preload_process = os.getenv("RAG_PRELOAD_LLM_PROCESS", "0").strip().lower() in (
+        "1", "true", "yes", "on"
+    )
+    if preload_script.exists() and _want_preload_process:
+        print("\n[3/4] 后台预加载 LLM 模型 (独立进程，首次约 30-120 秒) ...")
         preload_log = LOG_DIR / "preload.log"
         try:
             preload_proc = run(
@@ -178,8 +188,9 @@ def main() -> int:
             print(f"    [warn] LLM 预加载启动失败，已跳过: {exc}")
             preload_proc = None
     else:
-        print("\n[3/4] 跳过 LLM 预加载（未找到 scripts/preload_llm.py，"
-              "首次问答时会自动懒加载）")
+        print("\n[3/4] API 进程会在启动后台线程里自行预热（embedding / 向量库 / pipeline）")
+        print("      需要连 LLM 一起预热：设 RAG_PRELOAD_LLM=1 后重启"
+              "（首个问题不再等模型加载）")
 
     # 4. 完成
     print("\n[4/4] 最终检查 ...")
@@ -206,7 +217,8 @@ def main() -> int:
     print("    logs\\backend.log")
     if args.with_streamlit:
         print("    logs\\frontend.log")
-    print("    logs\\preload.log")
+    if preload_proc is not None:
+        print("    logs\\preload.log")
     print()
     print("  关闭方式:")
     print("    关闭此窗口 = 停止所有服务")

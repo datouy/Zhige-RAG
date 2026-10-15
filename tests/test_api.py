@@ -5,7 +5,7 @@
 
 说明：
 - 使用 TestClient（无需启动独立服务器）。
-- 受保护端点先注册/登录拿 JWT，再带 ``Authorization: Bearer`` 访问。
+- 服务不需要登录：所有端点直接访问即可，测试里没有任何 token / 登录步骤。
 - 问答 / WebSocket 测试通过 monkeypatch 替换 ``get_runtime_pipeline``，
   避免真实加载 LLM（模型加载 + 推理会让测试套件慢数分钟）。
 """
@@ -26,10 +26,6 @@ if str(ROOT) not in sys.path:
 
 # 设置测试模式的环境变量
 os.environ["STREAMLIT_RUNTIME"] = "enable"
-
-TEST_USER = "api_test_user"
-TEST_EMAIL = "api_test_user@example.com"
-TEST_PASSWORD = "Test12345!"
 
 
 class _FakePipeline:
@@ -55,10 +51,9 @@ class _FakePipeline:
 def client():
     """创建 FastAPI 测试客户端，并对 LLM 依赖打桩。"""
     from api.main import app
-    from api.routes.auth import limiter
+    from src.rate_limit import limiter
     import api.routes.chat as chat_module
 
-    # 测试不限流（注册 3/min、登录 5/min 会干扰重复运行）
     limiter.enabled = False
 
     # 打桩：问答端点不加载真实 LLM
@@ -73,27 +68,42 @@ def client():
         chat_module.get_runtime_pipeline = original
 
 
-@pytest.fixture(scope="module")
-def auth(client):
-    """注册（幂等）并登录，返回 (headers, token)。"""
-    # 尝试注册（可能用户已存在，忽略 400 错误）
-    register_resp = client.post(
-        "/api/v1/auth/register",
-        json={"username": TEST_USER, "email": TEST_EMAIL, "password": TEST_PASSWORD},
-    )
-    # 无论注册是否成功，都尝试登录
-    login_resp = client.post(
-        "/api/v1/auth/login", json={"login": TEST_USER, "password": TEST_PASSWORD}
-    )
-    
-    # 如果登录失败，说明用户不存在或口令错误
-    if login_resp.status_code != 200:
-        # 注册也失败了，打印详细信息
-        assert register_resp.status_code in (201, 400), f"注册失败: {register_resp.text}"
-        assert False, f"登录失败: {login_resp.text}，注册响应: {register_resp.text}"
-    
-    token = login_resp.json()["access_token"]
-    return {"Authorization": f"Bearer {token}"}, token
+# =========================== 测试：无需登录 ===========================
+class TestNoLoginRequired:
+    """服务不需要登录：受保护端点直接可访问，登录注册端点已移除。"""
+
+    @pytest.mark.parametrize("path", ["/api/v1/auth/login", "/api/v1/auth/register"])
+    def test_auth_endpoints_removed(self, client, path):
+        """登录 / 注册端点必须已删除（404 或 405）。"""
+        response = client.post(path, json={"username": "x", "password": "y"})
+        assert response.status_code in (404, 405)
+
+    def test_documents_without_token(self, client):
+        """不带任何凭证也能读文档列表。"""
+        response = client.get("/api/v1/documents")
+        assert response.status_code == 200
+
+    def test_search_without_token(self, client):
+        """不带任何凭证也能检索。"""
+        response = client.post("/api/v1/search", json={"query": "什么是 RAG", "top_k": 4})
+        assert response.status_code == 200
+
+    def test_chat_without_token(self, client):
+        """不带任何凭证也能问答。"""
+        response = client.post("/api/v1/chat", json={"query": "你好", "top_k": 4})
+        assert response.status_code == 200
+
+    def test_config_without_token(self, client):
+        """不带任何凭证也能读运行配置。"""
+        response = client.get("/api/v1/config")
+        assert response.status_code == 200
+
+    def test_wrong_credentials_are_not_special_cased(self, client):
+        """Authorization 头不再被解析：随便填也会落到本地用户。"""
+        response = client.get(
+            "/api/v1/documents", headers={"Authorization": "Bearer nonsense"}
+        )
+        assert response.status_code == 200
 
 
 # =========================== 测试：健康检查 ===========================
@@ -125,51 +135,25 @@ class TestHealth:
         assert "sources" in data
 
 
-# =========================== 测试：认证 ===========================
-class TestAuth:
-    """认证端点测试。"""
-
-    def test_me_requires_token(self, client):
-        """本地模式下不需要 token（返回本地用户），多租户模式下拒绝（401/403）。"""
-        response = client.get("/api/v1/auth/me")
-        assert response.status_code in (200, 401, 403)
-
-    def test_me_returns_user(self, client, auth):
-        """带 token 访问 /me 应返回当前用户（本地模式下返回 local 用户）。"""
-        headers, _ = auth
-        response = client.get("/api/v1/auth/me", headers=headers)
-        assert response.status_code == 200
-        # 本地模式下返回 local 用户，多租户模式下返回注册的用户
-        assert response.json()["username"] in ("local", TEST_USER)
-
-
 # =========================== 测试：文档列表 ===========================
 class TestDocuments:
     """GET /api/v1/documents 测试。"""
 
-    def test_list_documents_requires_auth(self, client):
-        """本地模式下不需要认证（返回 200），多租户模式下拒绝（401/403）。"""
-        response = client.get("/api/v1/documents")
-        assert response.status_code in (200, 401, 403)
-
-    def test_list_documents_returns_200(self, client, auth):
+    def test_list_documents_returns_200(self, client):
         """文档列表应返回 200。"""
-        headers, _ = auth
-        response = client.get("/api/v1/documents", headers=headers)
+        response = client.get("/api/v1/documents")
         assert response.status_code == 200
 
-    def test_list_documents_returns_array(self, client, auth):
+    def test_list_documents_returns_array(self, client):
         """文档列表应返回 documents 数组。"""
-        headers, _ = auth
-        response = client.get("/api/v1/documents", headers=headers)
+        response = client.get("/api/v1/documents")
         data = response.json()
         assert "documents" in data
         assert isinstance(data["documents"], list)
 
-    def test_list_documents_includes_total(self, client, auth):
+    def test_list_documents_includes_total(self, client):
         """文档列表应包含 total 和 total_chunks。"""
-        headers, _ = auth
-        response = client.get("/api/v1/documents", headers=headers)
+        response = client.get("/api/v1/documents")
         data = response.json()
         assert "total" in data
         assert "total_chunks" in data
@@ -179,53 +163,28 @@ class TestDocuments:
 class TestSearch:
     """POST /api/v1/search 测试。"""
 
-    def test_search_requires_auth(self, client):
-        """本地模式下不需要认证（返回 200），多租户模式下拒绝（401/403）。"""
-        response = client.post("/api/v1/search", json={"query": "什么是 RAG", "top_k": 4})
-        assert response.status_code in (200, 401, 403)
-
-    def test_search_returns_200(self, client, auth):
+    def test_search_returns_200(self, client):
         """检索应返回 200。"""
-        headers, _ = auth
-        response = client.post(
-            "/api/v1/search",
-            json={"query": "什么是 RAG", "top_k": 4},
-            headers=headers,
-        )
+        response = client.post("/api/v1/search", json={"query": "什么是 RAG", "top_k": 4})
         assert response.status_code == 200
 
-    def test_search_returns_hits(self, client, auth):
+    def test_search_returns_hits(self, client):
         """检索应返回 hits 数组。"""
-        headers, _ = auth
-        response = client.post(
-            "/api/v1/search",
-            json={"query": "什么是 RAG", "top_k": 4},
-            headers=headers,
-        )
+        response = client.post("/api/v1/search", json={"query": "什么是 RAG", "top_k": 4})
         data = response.json()
         assert "hits" in data
         assert isinstance(data["hits"], list)
 
-    def test_search_includes_scores(self, client, auth):
+    def test_search_includes_scores(self, client):
         """检索结果应包含相似度分数。"""
-        headers, _ = auth
-        response = client.post(
-            "/api/v1/search",
-            json={"query": "RAG", "top_k": 4},
-            headers=headers,
-        )
+        response = client.post("/api/v1/search", json={"query": "RAG", "top_k": 4})
         data = response.json()
         for hit in data.get("hits", []):
             assert "score" in hit
 
-    def test_search_respects_top_k(self, client, auth):
+    def test_search_respects_top_k(self, client):
         """检索应尊重 top_k 参数。"""
-        headers, _ = auth
-        response = client.post(
-            "/api/v1/search",
-            json={"query": "测试", "top_k": 2},
-            headers=headers,
-        )
+        response = client.post("/api/v1/search", json={"query": "测试", "top_k": 2})
         data = response.json()
         # 注意：实际返回数量取决于知识库内容
         assert data["hits"] is not None or data["total"] == 0
@@ -235,73 +194,42 @@ class TestSearch:
 class TestChatSync:
     """POST /api/v1/chat 测试。"""
 
-    def test_chat_requires_auth(self, client):
-        """本地模式下不需要认证（返回 200），多租户模式下拒绝（401/403）。"""
-        response = client.post("/api/v1/chat", json={"query": "你好", "top_k": 4})
-        assert response.status_code in (200, 401, 403)
-
-    def test_chat_sync_returns_200(self, client, auth):
+    def test_chat_sync_returns_200(self, client):
         """同步问答应返回 200。"""
-        headers, _ = auth
-        response = client.post(
-            "/api/v1/chat", json={"query": "你好", "top_k": 4}, headers=headers
-        )
+        response = client.post("/api/v1/chat", json={"query": "你好", "top_k": 4})
         assert response.status_code == 200
 
-    def test_chat_sync_returns_answer(self, client, auth):
+    def test_chat_sync_returns_answer(self, client):
         """同步问答应返回 answer 字段。"""
-        headers, _ = auth
-        response = client.post(
-            "/api/v1/chat", json={"query": "你好", "top_k": 4}, headers=headers
-        )
+        response = client.post("/api/v1/chat", json={"query": "你好", "top_k": 4})
         data = response.json()
         assert "answer" in data
 
-    def test_chat_sync_returns_sources(self, client, auth):
+    def test_chat_sync_returns_sources(self, client):
         """同步问答应返回 sources 字段。"""
-        headers, _ = auth
-        response = client.post(
-            "/api/v1/chat", json={"query": "你好", "top_k": 4}, headers=headers
-        )
+        response = client.post("/api/v1/chat", json={"query": "你好", "top_k": 4})
         data = response.json()
         assert "sources" in data
 
-    def test_chat_requires_query(self, client, auth):
+    def test_chat_requires_query(self, client):
         """空 query 应返回验证错误。"""
-        headers, _ = auth
-        response = client.post(
-            "/api/v1/chat", json={"query": "", "top_k": 4}, headers=headers
-        )
+        response = client.post("/api/v1/chat", json={"query": "", "top_k": 4})
         # FastAPI 默认返回 422 Unprocessable Entity
         assert response.status_code == 422
 
 
 # =========================== 测试：WebSocket 流式问答 ===========================
 class TestWebSocketChat:
-    """WS /ws/chat 测试（需携带 ?token=）。"""
+    """WS /ws/chat 测试（不需要 token）。"""
 
-    def test_websocket_requires_token(self, client):
-        """本地模式下不需要 token（连接成功），多租户模式下拒绝连接。"""
-        from starlette.testclient import WebSocketDisconnect
-
-        try:
-            with client.websocket_connect("/ws/chat") as ws:
-                # 本地模式下连接成功
-                assert ws is not None
-        except WebSocketDisconnect:
-            # 多租户模式下会断开连接
-            pass
-
-    def test_websocket_connect(self, client, auth):
-        """带有效 token 应能成功连接。"""
-        _, token = auth
-        with client.websocket_connect(f"/ws/chat?token={token}") as websocket:
+    def test_websocket_connects(self, client):
+        """无需 token 即可连接。"""
+        with client.websocket_connect("/ws/chat") as websocket:
             assert websocket is not None
 
-    def test_websocket_receive_message(self, client, auth):
+    def test_websocket_receive_message(self, client):
         """WebSocket 应能接收消息。"""
-        _, token = auth
-        with client.websocket_connect(f"/ws/chat?token={token}") as websocket:
+        with client.websocket_connect("/ws/chat") as websocket:
             websocket.send_json({"query": "测试", "top_k": 4})
             events = []
             try:
@@ -317,10 +245,9 @@ class TestWebSocketChat:
                 assert "event" in ev
                 assert "data" in ev
 
-    def test_websocket_event_types(self, client, auth):
+    def test_websocket_event_types(self, client):
         """WebSocket 事件应包含正确的类型。"""
-        _, token = auth
-        with client.websocket_connect(f"/ws/chat?token={token}") as websocket:
+        with client.websocket_connect("/ws/chat") as websocket:
             websocket.send_json({"query": "你好", "top_k": 2})
             event_types = set()
             try:
@@ -334,10 +261,9 @@ class TestWebSocketChat:
             assert "hits" in event_types
             assert "done" in event_types
 
-    def test_websocket_empty_query_error(self, client, auth):
+    def test_websocket_empty_query_error(self, client):
         """空 query 应返回错误。"""
-        _, token = auth
-        with client.websocket_connect(f"/ws/chat?token={token}") as websocket:
+        with client.websocket_connect("/ws/chat") as websocket:
             websocket.send_json({"query": "", "top_k": 4})
             event = websocket.receive_json()
             assert event.get("event") == "error"
@@ -347,31 +273,27 @@ class TestWebSocketChat:
 class TestConfig:
     """GET /api/v1/config 测试。"""
 
-    def test_config_requires_auth(self, client, monkeypatch):
-        """启用认证时未认证应被拒绝（本地模式默认放行，故显式开启认证）。"""
-        monkeypatch.setenv("AUTH_ENABLED", "1")
-        response = client.get("/api/v1/config")
-        assert response.status_code in (401, 403)
-
-    def test_config_returns_200(self, client, auth):
+    def test_config_returns_200(self, client):
         """配置接口应返回 200。"""
-        headers, _ = auth
-        response = client.get("/api/v1/config", headers=headers)
+        response = client.get("/api/v1/config")
         assert response.status_code == 200
 
-    def test_config_includes_sections(self, client, auth):
+    def test_config_includes_sections(self, client):
         """配置应包含主要配置块。"""
-        headers, _ = auth
-        response = client.get("/api/v1/config", headers=headers)
+        response = client.get("/api/v1/config")
         data = response.json()
         expected_sections = ["embedding", "llm", "vector_store"]
         for section in expected_sections:
             assert section in data, f"配置应包含 {section} 节"
 
-    def test_config_redacts_secrets(self, client, auth):
+    def test_config_has_no_auth_section(self, client):
+        """配置里不应再有 auth 段（登录开关已删除）。"""
+        response = client.get("/api/v1/config")
+        assert "auth" not in response.json()
+
+    def test_config_redacts_secrets(self, client):
         """配置中的敏感键（如 neo4j password）应被脱敏。"""
-        headers, _ = auth
-        response = client.get("/api/v1/config", headers=headers)
+        response = client.get("/api/v1/config")
         data = response.json()
         kg = data.get("knowledge_graph", {})
         neo4j = kg.get("neo4j", {}) if isinstance(kg, dict) else {}
@@ -383,25 +305,16 @@ class TestConfig:
 class TestUpload:
     """POST /api/v1/ingest 测试。"""
 
-    def test_ingest_requires_auth(self, client, monkeypatch):
-        """启用认证时未认证应被拒绝（本地模式默认放行，故显式开启认证）。"""
-        monkeypatch.setenv("AUTH_ENABLED", "1")
+    def test_ingest_requires_file(self, client):
+        """无文件上传应返回 422。"""
         response = client.post("/api/v1/ingest")
-        assert response.status_code in (401, 403)
-
-    def test_ingest_requires_file(self, client, auth):
-        """认证后无文件上传应返回 422。"""
-        headers, _ = auth
-        response = client.post("/api/v1/ingest", headers=headers)
         assert response.status_code == 422
 
-    def test_ingest_rejects_path_traversal(self, client, auth):
+    def test_ingest_rejects_path_traversal(self, client):
         """路径穿越文件名应返回 400。"""
-        headers, _ = auth
         response = client.post(
             "/api/v1/ingest",
             files={"file": ("../../evil.txt", b"malicious")},
-            headers=headers,
         )
         assert response.status_code == 400
 
@@ -410,8 +323,8 @@ class TestUpload:
 class TestRoot:
     """GET / 测试。"""
 
-    def test_root_returns_redirect(self, client):
-        """根路径应重定向到 index.html。"""
+    def test_root_returns_index(self, client):
+        """根路径应返回主界面（或重定向到它）。"""
         response = client.get("/")
         assert response.status_code in (200, 307, 308)
 

@@ -269,7 +269,58 @@ def build_security_where(
 def hybrid_kwargs(vs_cfg: Dict[str, Any]) -> Dict[str, Any]:
     """从 vector_store 配置段构造 ChromaStore 的混合检索参数。"""
     h = (vs_cfg or {}).get("hybrid") or {}
-    return {"hybrid_enabled": bool(h.get("enabled", False)), "hybrid_fetch_k": int(h.get("fetch_k", 20))}
+    return {
+        "hybrid_enabled": bool(h.get("enabled", False)),
+        "hybrid_fetch_k": int(h.get("fetch_k", 20)),
+        "hybrid_bm25_weight": float(h.get("bm25_weight", 0.5)),
+    }
+
+
+def _metadata_matches(metadata: Dict[str, Any], where: Optional[Dict[str, Any]]) -> bool:
+    """判断一条 metadata 是否满足 Chroma 的 ``where`` 条件。
+
+    只覆盖本项目实际会生成的算子：``=`` / ``$eq`` / ``$ne`` / ``$in`` / ``$nin``
+    以及 ``$and`` / ``$or`` 组合（见 :func:`build_security_where`）。
+
+    **认不出来就返回 False（fail-closed）**：宁可少一条关键词召回，也不能让被
+    ``doc_status`` / ``acl`` 排除掉的文档从关键词这一路溜回结果里。
+    """
+    if not where:
+        return True
+    meta = metadata or {}
+    for key, cond in where.items():
+        if key == "$and":
+            if not all(_metadata_matches(meta, c) for c in (cond or [])):
+                return False
+            continue
+        if key == "$or":
+            if not any(_metadata_matches(meta, c) for c in (cond or [])):
+                return False
+            continue
+        if key.startswith("$"):
+            return False  # 不认识的顶层算子：保守排除
+        value = meta.get(key)
+        if isinstance(cond, dict):
+            if len(cond) != 1:
+                return False
+            op, operand = next(iter(cond.items()))
+            seq = operand if isinstance(operand, (list, tuple, set)) else None
+            if op == "$eq":
+                ok = value == operand
+            elif op == "$ne":
+                ok = value != operand
+            elif op == "$in":
+                ok = seq is not None and value in seq
+            elif op == "$nin":
+                ok = seq is not None and value not in seq
+            else:
+                return False
+            if not ok:
+                return False
+            continue
+        if value != cond:
+            return False
+    return True
 
 
 class ChromaStore:
@@ -283,6 +334,7 @@ class ChromaStore:
         distance_fn: str = "cosine",
         hybrid_enabled: bool = False,
         hybrid_fetch_k: int = 20,
+        hybrid_bm25_weight: float = 0.5,
     ) -> None:
         try:
             import chromadb
@@ -321,6 +373,9 @@ class ChromaStore:
         # 混合检索（BM25 + 向量 RRF 融合）
         self.hybrid_enabled = bool(hybrid_enabled)
         self.hybrid_fetch_k = max(int(hybrid_fetch_k), 1)
+        # 关键词路在 RRF 里的权重：只做召回补充，不压过向量相似度
+        # （取值理由见 _fuse_hybrid 的说明）
+        self.hybrid_bm25_weight = max(0.0, float(hybrid_bm25_weight))
         self._bm25: Optional[BM25Index] = None
 
     def _invalidate_bm25(self) -> None:
@@ -342,47 +397,69 @@ class ChromaStore:
         query_text: str,
         vector_hits: List[Hit],
         top_k: int,
+        where: Optional[Dict[str, Any]] = None,
     ) -> List[Hit]:
-        """向量命中与 BM25 命中做 RRF 倒数排名融合。"""
+        """向量命中与 BM25 命中做 RRF 倒数排名融合。
+
+        ``where`` 必须**同时**作用在两条路上：向量侧交给 Chroma 过滤，关键词侧
+        由 :func:`_metadata_matches` 过滤。此前只过滤了向量侧，于是被
+        ``doc_status`` / ``acl`` 排除的文档会从 BM25 溜回结果 —— 既越权，也让
+        无关文档拿到高分、把真正相关的内容挤出上下文。
+
+        关键词路的权重由 ``hybrid.bm25_weight`` 控制（默认 0.5）。理由：本项目的
+        中文分词是多粒度 unigram+bigram，BM25 分数是命中词条的累加、**没有做查询
+        长度归一**，短查询下长文档极易拿高分 —— 实测一条 Node.js 面试题对
+        「用的是什么模型 完成的是什么功能？」能排到关键词第 1，折算出的"相似度"
+        0.90 压过了真正相关片段的 0.55。让它只做召回补充，才不至于颠倒是非。
+        """
         vec_by_id = {h.id: h for h in vector_hits}
         rrf: Dict[str, float] = {}
         RRF_K = 60
-        
+
         # 向量检索排名
         for rank, h in enumerate(vector_hits):
             rrf[h.id] = rrf.get(h.id, 0.0) + 1.0 / (RRF_K + rank + 1)
-        
-        # BM25 检索排名
-        bm_hits = self._ensure_bm25().search(query_text, top_k=self.hybrid_fetch_k)
+
+        bm = self._ensure_bm25()
+        bm_idx = {cid: i for i, cid in enumerate(bm.ids)}
         bm_score: Dict[str, float] = {}
-        for rank, (cid, s) in enumerate(bm_hits):
+        kept = 0
+        # 多取一些再过滤：过滤本身会丢掉一部分候选
+        for cid, s in bm.search(query_text, top_k=max(self.hybrid_fetch_k * 4, 20)):
+            idx = bm_idx.get(cid)
+            if idx is None or not _metadata_matches(bm.metadatas[idx], where):
+                continue
             bm_score[cid] = s
-            rrf[cid] = rrf.get(cid, 0.0) + 1.0 / (RRF_K + rank + 1)
-        
+            rrf[cid] = rrf.get(cid, 0.0) + self.hybrid_bm25_weight / (RRF_K + kept + 1)
+            kept += 1
+            if kept >= self.hybrid_fetch_k:
+                break
+
         if not rrf:
             return vector_hits
 
-        fused_ids = sorted(rrf, key=lambda cid: -rrf[cid])[:max(1, int(top_k))]
-        bm = self._ensure_bm25()
-        bm_meta = {cid: i for i, cid in enumerate(bm.ids)}
-        
+        fused_ids = sorted(rrf, key=lambda cid: -rrf[cid])[: max(1, int(top_k))]
+
         hits: List[Hit] = []
         for cid in fused_ids:
             if cid in vec_by_id:
                 hits.append(vec_by_id[cid])
-            else:
-                idx = bm_meta.get(cid)
-                if idx is None:
-                    continue
-                s = bm_score.get(cid, 0.0)
-                hits.append(
-                    Hit(
-                        id=cid,
-                        text=bm.texts[idx],
-                        score=(s / (1.0 + s)) if s > 0 else 0.0,
-                        metadata=bm.metadatas[idx] or {},
-                    )
+                continue
+            idx = bm_idx.get(cid)
+            if idx is None:
+                continue
+            s = bm_score.get(cid, 0.0)
+            md = dict(bm.metadatas[idx] or {})
+            # 标注分数类型：这不是余弦相似度，别让界面/调用方当成"相似度"读。
+            md["_score_kind"] = "keyword"
+            hits.append(
+                Hit(
+                    id=cid,
+                    text=bm.texts[idx],
+                    score=(s / (1.0 + s)) if s > 0 else 0.0,
+                    metadata=md,
                 )
+            )
         return hits
 
     def add_chunks(
@@ -509,7 +586,7 @@ class ChromaStore:
                 )
             
             if self.hybrid_enabled:
-                hits = self._fuse_hybrid(query_text, hits, top_k)
+                hits = self._fuse_hybrid(query_text, hits, top_k, where=where)
             results.append(hits)
         
         return results

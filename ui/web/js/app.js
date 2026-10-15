@@ -2,22 +2,19 @@
  * 知阁 Web UI —— 本地知识库问答前端
  * 
  * 开箱即用设计：
- * - 默认本地模式，无需登录
+ * - 无需登录：所有请求自动归属固定的本地用户
  * - 首次使用引导
  * - 模型状态可视化
  * 
  * 依赖后端 REST + WebSocket：
- *   POST /api/v1/auth/{register,login}     认证
  *   GET/POST/PATCH/DELETE /api/v1/kb       知识库
  *   GET/POST/PATCH/DELETE /api/v1/sessions 会话
  *   POST /api/v1/ingest                    文件入库（multipart，可带 kb_id）
  *   POST /api/v1/ingest/url                网页入库
- *   WS   /ws/chat?token=…                  流式问答
+ *   WS   /ws/chat                          流式问答
  */
 class ChatApp {
     constructor() {
-        this.token = localStorage.getItem('zhige_token') || '';
-        this.user = null;
         this.ws = null;
         this.connected = false;
         this.currentSources = [];
@@ -42,17 +39,12 @@ class ChatApp {
     async init() {
         this.cacheElements();
         this.bindEvents();
-        
-        // 默认本地模式：假设不需要登录，除非 API 明确返回需要认证
-        // 这样即使用户首次访问时 API 还没就绪，也能看到欢迎界面
-        this.authRequired = false;
-        
+
         // 显示首次使用引导
         if (this.firstVisit) {
             this.showWelcome();
         } else {
-            // 非首次访问时，先探测认证状态
-            await this.probeAndStart();
+            await this.bootstrap();
         }
     }
     
@@ -69,33 +61,27 @@ class ChatApp {
         if (!box) return;
         
         try {
-            const st = await this.probeAuthStatus();
+            const s = await this.api('/settings/model');
+            const llmBackend = (s.llm && s.llm.backend) || 'local';
+            const embBackend = (s.embedding && s.embedding.backend) || 'local';
+            const backendLabel = { local: '本机权重', ollama: '本机 Ollama', openai: '云端 API' };
             let html = '<ul class="status-list">';
-            
-            // LLM 状态
-            if (st.llm_backend) {
-                const llmOk = st.llm_available !== false;
-                html += `<li class="${llmOk ? 'ok' : 'warn'}">
-                    <span class="status-dot ${llmOk ? 'green' : 'yellow'}"></span>
-                    <span>对话模型: ${st.llm_backend} ${llmOk ? '✓' : '未配置'}</span>
+
+            html += `<li class="ok">
+                    <span class="status-dot green"></span>
+                    <span>对话模型: ${llmBackend}（${backendLabel[llmBackend] || llmBackend}）</span>
                 </li>`;
-            }
-            
-            // Embedding 状态
-            if (st.embedding_backend) {
-                const embOk = st.embedding_available !== false;
-                html += `<li class="${embOk ? 'ok' : 'warn'}">
-                    <span class="status-dot ${embOk ? 'green' : 'yellow'}"></span>
-                    <span>向量模型: ${st.embedding_backend} ${embOk ? '✓' : '未配置'}</span>
+            html += `<li class="ok">
+                    <span class="status-dot green"></span>
+                    <span>向量模型: ${embBackend}（${backendLabel[embBackend] || embBackend}）</span>
                 </li>`;
-            }
-            
+
             html += '</ul>';
-            
+
             // 添加帮助提示
-            if (!st.llm_available || !st.embedding_available) {
+            if (llmBackend === 'local' || embBackend === 'local') {
                 html += `<div class="status-help">
-                    <p>⚠️ 模型未就绪</p>
+                    <p>⚠️ 选择「本机权重」需要先安装 torch 并准备模型文件</p>
                     <details>
                         <summary>如何配置模型？</summary>
                         <div class="help-content">
@@ -114,39 +100,15 @@ class ChatApp {
                     </details>
                 </div>`;
             } else {
-                html += `<div class="status-ready">✅ 模型已就绪，可以开始使用</div>`;
+                html += `<div class="status-ready">✅ 模型后端已选定，可在「模型设置」里测试连通性</div>`;
             }
-            
+
             box.innerHTML = html;
         } catch (e) {
             box.innerHTML = '<span class="warn">无法检测模型状态，请启动后端后重试</span>';
         }
     }
-    
-    async probeAndStart() {
-        try {
-            const st = await this.probeAuthStatus();
-            // 只有当 API 明确返回需要认证时，才显示登录界面
-            this.authRequired = !!st.auth_required;
-            this.modeHint = st.hint || '';
-        } catch (e) {
-            // API 不可用时，默认本地模式，继续初始化
-            console.warn('认证状态探测失败，使用本地模式:', e.message);
-            this.authRequired = false;
-        }
 
-        if (!this.authRequired) {
-            // 本地模式：直接进入主界面
-            await this.bootstrap();
-        } else if (this.token) {
-            // 多用户模式且有 token：尝试用 token 登录
-            await this.bootstrap();
-        } else {
-            // 多用户模式且无 token：显示登录界面
-            this.showAuth();
-        }
-    }
-    
     hideWelcome() {
         const overlay = document.getElementById('welcome-overlay');
         if (overlay) {
@@ -162,16 +124,9 @@ class ChatApp {
         this.showWelcome();
     }
 
-    async probeAuthStatus() {
-        const resp = await fetch('/api/v1/auth/status');
-        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-        return resp.json();
-    }
-
     cacheElements() {
         const ids = [
-            'auth-overlay', 'auth-username', 'auth-email', 'auth-password',
-            'auth-submit', 'auth-error', 'app-layout', 'kb-list', 'session-list',
+            'app-layout', 'kb-list', 'session-list',
             'messages', 'chat-input', 'send-btn', 'status', 'current-kb-name',
             'kb-meta', 'file-input', 'modal', 'modal-title', 'modal-body',
             'welcome-state', 'welcome-overlay',
@@ -181,23 +136,13 @@ class ChatApp {
             'emb-backend', 'emb-remote', 'emb-base-url', 'emb-model', 'emb-api-key', 'emb-test',
         ];
         ids.forEach((id) => { this.el[id] = document.getElementById(id); });
-        this.el.authTabs = document.querySelectorAll('.auth-tab');
     }
 
     bindEvents() {
         // ---- 首次使用引导 ----
         document.getElementById('welcome-start')?.addEventListener('click', () => {
             this.hideWelcome();
-            this.probeAndStart();
-        });
-        
-        // ---- 认证 ----
-        this.el.authTabs.forEach((tab) => {
-            tab.addEventListener('click', () => this.switchAuthMode(tab.dataset.mode));
-        });
-        this.el['auth-submit']?.addEventListener('click', () => this.submitAuth());
-        this.el['auth-password']?.addEventListener('keypress', (e) => {
-            if (e.key === 'Enter') this.submitAuth();
+            this.bootstrap();
         });
 
         // ---- 侧边栏 ----
@@ -206,7 +151,6 @@ class ChatApp {
         document.getElementById('upload-btn')?.addEventListener('click', () => this.el['file-input'].click());
         document.getElementById('url-btn')?.addEventListener('click', () => this.promptImportUrl());
         document.getElementById('guide-btn')?.addEventListener('click', () => this.showGuide());
-        document.getElementById('logout-btn')?.addEventListener('click', () => this.logout());
         this.el['file-input']?.addEventListener('change', (e) => this.uploadFiles(e.target.files));
 
         // ---- 对话 ----
@@ -237,10 +181,9 @@ class ChatApp {
         });
     }
 
-    /** 统一请求封装：自动带 token、统一错误处理 */
+    /** 统一请求封装：统一错误处理 */
     async api(path, { method = 'GET', body = null, raw = false } = {}) {
         const headers = {};
-        if (this.token) headers['Authorization'] = `Bearer ${this.token}`;
         if (body && !raw) headers['Content-Type'] = 'application/json';
 
         const resp = await fetch(`/api/v1${path}`, {
@@ -248,17 +191,6 @@ class ChatApp {
             headers,
             body: body ? (raw ? body : JSON.stringify(body)) : undefined,
         });
-
-        if (resp.status === 401) {
-            this.token = '';
-            localStorage.removeItem('zhige_token');
-            // 本地模式本不该出现 401；真出现了说明是其它问题，不要误导用户去登录
-            if (this.authRequired) {
-                this.showAuth();
-                throw new Error('登录已过期，请重新登录');
-            }
-            throw new Error('请求被拒绝（401），请检查后端日志');
-        }
 
         const text = await resp.text();
         let data = null;
@@ -271,89 +203,9 @@ class ChatApp {
         return data;
     }
 
-    // ================= 认证 =================
-
-    switchAuthMode(mode) {
-        this.authMode = mode;
-        this.el.authTabs.forEach((t) => t.classList.toggle('active', t.dataset.mode === mode));
-        this.el['auth-email'].hidden = mode !== 'register';
-        this.el['auth-submit'].textContent = mode === 'register' ? '注册并登录' : '登录';
-        this.el['auth-error'].textContent = '';
-    }
-
-    showAuth() {
-        this.el['auth-overlay'].hidden = false;
-        this.el['app-layout'].hidden = true;
-        if (!this.authMode) this.switchAuthMode('login');
-    }
-
-    async submitAuth() {
-        const username = this.el['auth-username'].value.trim();
-        const email = this.el['auth-email'].value.trim();
-        const password = this.el['auth-password'].value;
-        const errEl = this.el['auth-error'];
-        errEl.textContent = '';
-
-        if (!username || !password) { errEl.textContent = '请填写用户名和密码'; return; }
-        if (this.authMode === 'register' && !email) { errEl.textContent = '请填写邮箱'; return; }
-        if (password.length < 8) { errEl.textContent = '密码至少 8 位'; return; }
-
-        const btn = this.el['auth-submit'];
-        btn.disabled = true;
-        try {
-            if (this.authMode === 'register') {
-                await this.api('/auth/register', { method: 'POST', body: { username, email, password } });
-            }
-            const data = await this.api('/auth/login', {
-                method: 'POST',
-                body: { login: username, password },
-            });
-            this.token = data.access_token;
-            localStorage.setItem('zhige_token', this.token);
-            await this.bootstrap();
-        } catch (e) {
-            errEl.textContent = e.message;
-        } finally {
-            btn.disabled = false;
-        }
-    }
-
-    logout() {
-        this.token = '';
-        localStorage.removeItem('zhige_token');
-        if (this.ws) { try { this.ws.close(); } catch (_) {} this.ws = null; }
-        this.knowledgeBases = [];
-        this.sessions = [];
-        this.currentSession = null;
-        this.el['chat-input'].value = '';
-        this.el['messages'].innerHTML = '';
-        this.showAuth();
-    }
-
-    /** 进入主界面：拉用户信息、知识库、会话，并建立 WS */
+    /** 进入主界面：拉知识库、会话，并建立 WS */
     async bootstrap() {
-        try {
-            this.user = await this.api('/auth/me');
-        } catch (e) {
-            if (this.authRequired) {
-                // 多用户模式下，/auth/me 失败必须显示登录界面
-                this.showAuth();
-                return;
-            }
-            // 本地模式下，/auth/me 失败可能是后端还没完全就绪，继续初始化
-            // 显示警告但不阻止用户进入主界面
-            console.warn('获取用户信息失败（本地模式）:', e.message);
-            this.user = { id: 'local', username: '本地用户' };
-        }
-        this.el['auth-overlay'].hidden = true;
         this.el['app-layout'].hidden = false;
-
-        // 本地单用户模式没有"登录"这回事，把退出按钮收起来，免得误导
-        const logoutBtn = document.getElementById('logout-btn');
-        if (logoutBtn) logoutBtn.hidden = !this.authRequired;
-
-        this.updateStatus(this.authRequired ? this.user.username : '本地模式 ✓', true);
-
         await this.loadKnowledgeBases();
         await this.loadSessions();
         this.connectWebSocket();
@@ -364,9 +216,13 @@ class ChatApp {
     async loadKnowledgeBases() {
         const data = await this.api('/kb');
         this.knowledgeBases = data.knowledge_bases || [];
-        if (!this.currentKb || !this.knowledgeBases.some((k) => k.id === this.currentKb.id)) {
-            this.currentKb = this.knowledgeBases.find((k) => k.is_default) || this.knowledgeBases[0] || null;
-        }
+        // 始终换成列表里的新对象：否则上传/删除后侧边栏已是新计数，顶栏还
+        // 拿着旧对象（表现为一直显示「0 文档 / 0 分块」）。
+        const fresh = this.knowledgeBases.find((k) => this.currentKb && k.id === this.currentKb.id);
+        this.currentKb = fresh
+            || this.knowledgeBases.find((k) => k.is_default)
+            || this.knowledgeBases[0]
+            || null;
         this.renderKnowledgeBases(data.quota);
         this.renderCurrentKb();
     }
@@ -555,9 +411,7 @@ class ChatApp {
 
     connectWebSocket() {
         const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        // 本地模式没有 token，就不带这个参数（后端也不会校验）
-        const qs = this.token ? `?token=${encodeURIComponent(this.token)}` : '';
-        const url = `${proto}//${window.location.host}/ws/chat${qs}`;
+        const url = `${proto}//${window.location.host}/ws/chat`;
 
         try {
             this.ws = new WebSocket(url);
@@ -575,12 +429,6 @@ class ChatApp {
         };
         this.ws.onclose = (ev) => {
             this.connected = false;
-            // 4401 = 未认证（仅认证模式下会出现）
-            if (ev.code === 4401) {
-                this.updateStatus('认证失败', false);
-                if (this.authRequired) this.logout();
-                return;
-            }
             this.updateStatus('已断开，重连中…', false);
             setTimeout(() => this.connectWebSocket(), 3000);
         };
@@ -692,9 +540,14 @@ class ChatApp {
         const ul = document.createElement('ul');
         sources.forEach((s, i) => {
             const li = document.createElement('li');
-            const score = typeof s.score === 'number' ? s.score.toFixed(3) : '—';
+            // 分数来源不同、量纲也不同：dense 是余弦相似度，rerank 是交叉编码器
+            // 相关度，keyword 是 BM25 命中强度。混在一起叫「相似度」会误导。
+            const has = typeof s.score === 'number';
+            const label = s.score_kind === 'keyword' ? '关键词'
+                : s.score_kind === 'rerank' ? '相关度' : '相似度';
+            const head = has ? `${label} ${s.score.toFixed(3)}` : label;
             li.innerHTML = `<strong>[${i + 1}]</strong> ${this.esc(s.title || s.source || '未知')}
-                <span class="score">相似度 ${score}</span>`;
+                <span class="score">${head}</span>`;
             li.addEventListener('click', () => this.showChunkDetail(s));
             ul.appendChild(li);
         });

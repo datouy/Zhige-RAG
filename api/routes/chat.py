@@ -54,7 +54,7 @@ from src.document_loader import load_document, load_directory
 from src.document_meta import enrich_directory, enrich_file
 from src.factories import TenantAwareFactory
 from src.memory import SESSION_MEMORY
-from src.middleware.auth import get_current_user
+from src.middleware.identity import get_current_user
 from src.rag_pipeline import RAGPipeline
 from src.utils import SUPPORTED_EXTENSIONS, ensure_dir, get_logger, resolve_path
 
@@ -817,38 +817,19 @@ async def ingest_directory(
 
 # =========================== WebSocket Chat ===========================
 @router.websocket("/ws/chat")
-async def websocket_chat(websocket: WebSocket, token: Optional[str] = None):
+async def websocket_chat(websocket: WebSocket):
     """WebSocket 流式问答。
 
-    认证策略与 HTTP 路径完全一致（见 :mod:`src.middleware.auth`）：
-
-    - **未启用认证（默认，单用户本地模式）**：不要求 token，直接绑定本地用户；
-    - 启用认证时：必须携带有效 **access** token（``?token=``）。
+    服务不需要登录：连接建立后直接绑定本地用户（见 :mod:`src.middleware.identity`）。
 
     P1.3：通过 ``LLMConcurrencyGate.semaphore`` 限制并发 LLM 调用，避免
     单实例下被并发 WS 流量击穿。
     """
-    from src.middleware.auth import auth_enabled, get_local_user
+    from src.middleware.identity import get_local_user
 
     db = SessionLocal()
     try:
-        if auth_enabled():
-            from src.auth.jwt_handler import decode_token
-
-            payload = decode_token(token) if token else None
-            # 必须同时校验 type == "access"：refresh token（7 天有效期）若能直接
-            # 建立 WS 连接，就变相绕过了 access token 的 30 分钟有效期。
-            if not payload or not payload.get("sub") or payload.get("type") != "access":
-                await websocket.close(code=4401)  # 未认证
-                return
-            # 加载一次用户并校验状态（配额校验需要 max_queries_per_day）
-            ws_user = db.query(User).filter(User.id == payload["sub"]).first()
-            if ws_user is None or not ws_user.is_active:
-                await websocket.close(code=4403)  # 用户不存在或已禁用
-                return
-        else:
-            ws_user = get_local_user(db)
-
+        ws_user = get_local_user(db)
         user_id = ws_user.id
         await websocket.accept()
         while True:

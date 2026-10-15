@@ -16,7 +16,7 @@ import shutil
 from pathlib import Path
 from typing import Generator, Optional
 
-from sqlalchemy import create_engine, event, text, Engine
+from sqlalchemy import create_engine, event, inspect, text, Engine
 from sqlalchemy.orm import sessionmaker, Session, declarative_base
 from sqlalchemy.pool import NullPool, QueuePool
 
@@ -71,6 +71,15 @@ _LIGHT_COLUMN_MIGRATIONS = {
     ],
 }
 
+# 登录/注册时代的遗留结构清理：{表名: [列名]} 与 (表名, ...)
+#
+# 老版本支持注册登录，库里因此有 ``users.password_hash``（NOT NULL）和
+# ``refresh_tokens`` 表。服务现在不需要登录：password_hash 留着不仅无用，
+# 还会让"自动创建本地用户"撞上 NOT NULL 约束直接报错；refresh_tokens
+# 只是一堆死数据。启动时按存在性删除，重复执行安全。
+_LEGACY_COLUMN_CLEANUP = {"users": ["password_hash"]}
+_LEGACY_TABLE_CLEANUP = ("refresh_tokens",)
+
 # 检测是否为 PostgreSQL
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 _is_postgresql = DATABASE_URL.startswith("postgresql") or DATABASE_URL.startswith("postgres")
@@ -124,7 +133,7 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 
 def init_db() -> None:
-    """初始化数据库表，并对老库做轻量列迁移。
+    """初始化数据库表，并对老库做轻量列迁移 + 遗留结构清理。
 
     ``create_all`` 只建缺失的**表**，不会给已有表加列。新版本给既有表加了列时，
     老库直接启动会在读写时报 ``no such column``。这里按方言做存在性检查后
@@ -156,6 +165,49 @@ def init_db() -> None:
                         _log.info("轻量迁移：%s 新增列 %s", table, column)
         except Exception:  # noqa: BLE001
             _log.warning("%s 列迁移跳过（可能已存在）", table, exc_info=True)
+
+    _cleanup_legacy_auth_schema()
+
+
+def _cleanup_legacy_auth_schema() -> None:
+    """删除登录 / 注册时代遗留的列与表。
+
+    见 ``_LEGACY_COLUMN_CLEANUP`` / ``_LEGACY_TABLE_CLEANUP``。只在结构确实存在时
+    动手，失败也不阻塞启动 —— 老库能继续用，只是空留一个无用列/表。
+    """
+    try:
+        existing_tables = set(inspect(engine).get_table_names())
+    except Exception:  # noqa: BLE001
+        _log.warning("遗留结构清理跳过：无法读取表清单", exc_info=True)
+        return
+
+    for table, columns in _LEGACY_COLUMN_CLEANUP.items():
+        if table not in existing_tables:
+            continue
+        try:
+            existing_columns = {c["name"] for c in inspect(engine).get_columns(table)}
+        except Exception:  # noqa: BLE001
+            continue
+        for column in columns:
+            if column not in existing_columns:
+                continue
+            try:
+                with engine.begin() as conn:
+                    # 表名/列名来自本模块的常量，不是外部输入
+                    conn.exec_driver_sql(f"ALTER TABLE {table} DROP COLUMN {column}")
+                _log.info("遗留结构清理：%s 已删除列 %s", table, column)
+            except Exception:  # noqa: BLE001
+                _log.warning("%s.%s 删除失败（已跳过，不影响启动）", table, column, exc_info=True)
+
+    for table in _LEGACY_TABLE_CLEANUP:
+        if table not in existing_tables:
+            continue
+        try:
+            with engine.begin() as conn:
+                conn.exec_driver_sql(f"DROP TABLE {table}")
+            _log.info("遗留结构清理：已删除表 %s", table)
+        except Exception:  # noqa: BLE001
+            _log.warning("删除表 %s 失败（已跳过，不影响启动）", table, exc_info=True)
 
 
 def get_db() -> Generator[Session, None, None]:

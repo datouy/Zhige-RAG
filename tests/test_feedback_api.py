@@ -1,6 +1,6 @@
 """feedback 路由测试：反馈提交 / 统计 / 差评导出评估集 / 长期记忆管理。
 
-不加载 LLM：用最小 FastAPI 应用只挂 feedback 路由，并覆盖认证与 DB 依赖。
+不加载 LLM：用最小 FastAPI 应用只挂 feedback 路由，并覆盖身份与 DB 依赖。
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ from sqlalchemy.pool import StaticPool
 
 from src.db.database import get_db as _get_db
 from src.db.models import Base, User
-from src.middleware.auth import get_current_user as _get_current_user
+from src.middleware.identity import get_current_user as _get_current_user
 
 
 @pytest.fixture()
@@ -73,14 +73,17 @@ class TestSubmitFeedback:
         resp = client.post("/api/v1/feedback", json={"query": "q", "rating": "meh"})
         assert resp.status_code == 422
 
-    def test_requires_auth(self, client, monkeypatch):
-        # 默认是本地单用户模式（匿名请求落到本地用户 → 200）。
-        # 本用例验证的是"启用认证后"的拒绝路径，故显式开启认证。
-        monkeypatch.setenv("AUTH_ENABLED", "1")
-        # 仅移除认证覆盖（保留 DB 覆盖），真实 get_current_user 会因无 token 拒绝
+    def test_no_auth_required(self, client):
+        """服务不需要登录：不覆盖身份依赖也应由本地用户接住请求。"""
         client.extra_override.pop(_get_current_user)
-        resp = client.post("/api/v1/feedback", json={"query": "q", "rating": "helpful"})
-        assert resp.status_code in (401, 403)
+        try:
+            resp = client.post(
+                "/api/v1/feedback", json={"query": "q", "rating": "helpful"}
+            )
+            assert resp.status_code == 200
+        finally:
+            # 还原覆盖，避免影响同模块其它用例
+            client.extra_override[_get_current_user] = lambda: client.extra_user
 
 
 class TestStats:

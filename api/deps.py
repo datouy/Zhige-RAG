@@ -209,6 +209,15 @@ def get_vector_store() -> ChromaStore:
     return _vector_store
 
 
+def env_flag(name: str, default: str = "0") -> bool:
+    """把环境变量解析成布尔值。
+
+    不能写成 ``bool(os.getenv(...))``：字符串 ``"0"`` 在 Python 里是**真值**，
+    于是 ``RAG_LAZY_LLM=0`` 会被当成"开启懒加载"，开关形同虚设。
+    """
+    return os.getenv(name, default).strip().lower() in ("1", "true", "yes", "on")
+
+
 def get_pipeline() -> RAGPipeline:
     """获取或创建全局 Pipeline 实例（懒加载，单例）。"""
     global _pipeline
@@ -222,9 +231,11 @@ def get_pipeline() -> RAGPipeline:
         vs = get_vector_store()
         cfg = get_runtime_config()
 
-        # 默认 lazy_llm=True（避免冷启动慢），首次 answer 时按需加载
+        # 默认 lazy_llm=True：不在构造 pipeline 时就占显存，首次问答时按需加载。
+        # （加载后实例由所有租户副本共享，见 RAGPipeline.ensure_llm）
+        # 想在启动阶段就把模型load进来：RAG_LAZY_LLM=0，或 RAG_PRELOAD_LLM=1。
         llm: Optional[LocalLLM] = None
-        if not bool(os.getenv("RAG_LAZY_LLM", "1")):
+        if not env_flag("RAG_LAZY_LLM", "1"):
             # P1.4：与 RAGPipeline.from_config / ensure_llm 共用同一构造逻辑
             llm = RAGPipeline._build_llm_from_cfg(cfg.get("llm", {}))
 

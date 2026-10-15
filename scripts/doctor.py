@@ -61,8 +61,6 @@ DEPS_CORE = [
     ("uvicorn", "uvicorn", "ASGI 服务器"),
     ("pydantic", "pydantic", "数据校验"),
     ("sqlalchemy", "sqlalchemy", "ORM"),
-    ("pyjwt", "jwt", "JWT 认证"),
-    ("bcrypt", "bcrypt", "密码哈希"),
     ("PyYAML", "yaml", "配置解析"),
     ("chromadb", "chromadb", "向量库"),
     ("numpy", "numpy", "数值计算"),

@@ -137,7 +137,6 @@ class TestRouteModuleSurface:
     def test_route_modules_reexport_routers(self):
         from api.routes import (
             agent_router,
-            auth_router,
             chat_router,
             eval_router,
             kg_router,
@@ -147,7 +146,6 @@ class TestRouteModuleSurface:
 
         for r in (
             agent_router,
-            auth_router,
             chat_router,
             eval_router,
             kg_router,
@@ -187,8 +185,6 @@ class TestRouteModuleSurface:
             "/api/ready",
             "/api/metrics",
             "/api/v1/metrics",
-            "/api/v1/auth/register",
-            "/api/v1/auth/login",
             "/api/v1/chat",
             "/api/v1/search",
             "/api/v1/ingest",
@@ -202,3 +198,13 @@ class TestRouteModuleSurface:
             "/api/v1/ws/agent",
         ):
             assert required in paths, f"missing route: {required}"
+
+        # 登录 / 注册路由必须已经不存在
+        for removed in (
+            "/api/v1/auth/register",
+            "/api/v1/auth/login",
+            "/api/v1/auth/refresh",
+            "/api/v1/auth/me",
+            "/api/v1/auth/logout",
+        ):
+            assert removed not in paths, f"auth route should be removed: {removed}"
