@@ -34,7 +34,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 OK, WARN, FAIL, INFO = "OK", "WARN", "FAIL", "INFO"
-_ICON = {OK: "✅", WARN: "⚠️ ", FAIL: "❌", INFO: "ℹ️ "}
+_ICON = {OK: "[OK]", WARN: "[WARN]", FAIL: "[FAIL]", INFO: "[INFO]"}
 
 _findings: List[Tuple[str, str, str]] = []
 
@@ -386,7 +386,7 @@ def render() -> int:
     print("=" * 74)
     order = {FAIL: 0, WARN: 1, OK: 2, INFO: 3}
     for level, title, hint in sorted(_findings, key=lambda f: order[f[0]]):
-        print(f"{_ICON[level]} [{level:<4}] {title}")
+        print(f"{_ICON[level]} {title}")
         if hint:
             for line in hint.split("\n"):
                 print(f"          → {line}")
@@ -397,7 +397,7 @@ def render() -> int:
     print(f"结果：{n_fail} 项阻塞问题，{n_warn} 项警告，共 {len(_findings)} 项检查")
 
     if n_fail:
-        print("\n结论：**当前环境无法正常启动**，请按上面 ❌ 项逐条修复。")
+        print("\n结论：**当前环境无法正常启动**，请按上面 [FAIL] 项逐条修复。")
         print("提示：若你只想先跑起来看看，最快路径是把 config/config.yaml 的")
         print("      llm.backend 改为 ollama 或 openai —— 这两条路都不需要 GPU，也不需要下载权重。")
         return 1

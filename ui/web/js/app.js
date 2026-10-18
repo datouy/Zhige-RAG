@@ -88,7 +88,7 @@ class ChatApp {
                             <p><strong>方式一：使用 Ollama（推荐，无需 GPU）</strong></p>
                             <ol>
                                 <li>下载 <a href="https://ollama.com/download" target="_blank">Ollama</a></li>
-                                <li>运行: <code>ollama pull qwen2.5:7b</code></li>
+                                <li>运行: <code>ollama pull qwen3:4b-instruct-2507-q4_K_M</code></li>
                                 <li>运行: <code>ollama pull nomic-embed-text</code></li>
                             </ol>
                             <p><strong>方式二：使用云端 API</strong></p>
@@ -684,7 +684,7 @@ class ChatApp {
         const modelEl = document.getElementById(`${k}-model`);
         if (backend === 'ollama') {
             if (baseEl && !baseEl.value) baseEl.value = 'http://localhost:11434/v1';
-            if (modelEl && !modelEl.value) modelEl.placeholder = k === 'llm' ? 'qwen2.5:7b' : 'nomic-embed-text';
+            if (modelEl && !modelEl.value) modelEl.placeholder = k === 'llm' ? 'qwen3:4b-instruct-2507-q4_K_M' : 'nomic-embed-text';
         } else if (backend === 'openai') {
             if (baseEl && (!baseEl.value || baseEl.value.includes('localhost'))) {
                 baseEl.value = 'https://api.deepseek.com/v1';

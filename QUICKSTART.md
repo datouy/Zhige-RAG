@@ -4,16 +4,32 @@
 
 ---
 
-## 🚀 3 步启动
+## 🚀 4 步启动
 
-### 第一步：下载模型（推荐 Ollama，无需 GPU）
+### 第一步：安装项目
+
+Windows 用户可以直接双击 `setup.bat`，选择“快速安装”。
+
+也可以手动安装：
+
+```bash
+python -m venv .venv
+# Windows
+.venv\Scripts\activate
+# macOS / Linux
+source .venv/bin/activate
+
+pip install -r requirements-quick.txt
+```
+
+### 第二步：下载模型（推荐 Ollama，无需 GPU）
 
 ```bash
 # 1. 安装 Ollama（一个命令，无需 GPU）
 # 访问 https://ollama.com/download
 
 # 2. 下载模型（运行一次即可，后续不用再跑）
-ollama pull qwen2.5:7b        # 对话模型（推荐，7B 参数足够好）
+ollama pull qwen3:4b-instruct-2507-q4_K_M  # 非思考指令模型，约 2.5 GB
 ollama pull nomic-embed-text  # 向量模型（用于语义搜索）
 ```
 
@@ -23,11 +39,11 @@ ollama pull nomic-embed-text  # 向量模型（用于语义搜索）
 - ✅ 完全免费，无需 API Key
 - ✅ 完全离线可用
 
-### 第二步：启动服务
+### 第三步：启动服务
 
 ```bash
 # 进入项目目录
-cd ChineseRAGKB
+cd Zhige-RAG
 
 # 方式 A：一键启动（推荐）
 python scripts\quickstart.py
@@ -35,7 +51,7 @@ python scripts\quickstart.py
 # 方式 B：如果模型不可用，会给出提示，按提示配置后重试
 ```
 
-### 第三步：打开浏览器
+### 第四步：打开浏览器
 
 ```
 http://localhost:8000/
@@ -81,7 +97,7 @@ python scripts\quickstart.py
 ### Q: 启动报错 "缺少 xxx"
 ```bash
 # 安装依赖
-pip install -r requirements-core.txt
+pip install -r requirements-quick.txt
 ```
 
 ### Q: Ollama 模型下载慢
@@ -104,7 +120,7 @@ pip install -r requirements-core.txt
 ## 📁 项目结构
 
 ```
-ChineseRAGKB/
+Zhige-RAG/
 ├── config/
 │   └── config.yaml      # 配置文件（默认无需修改）
 ├── ui/

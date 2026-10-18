@@ -28,7 +28,7 @@
     llm:
       backend: ollama            # local | ollama | openai
       ollama:
-        model: qwen2.5:7b
+        model: qwen3:4b-instruct-2507-q4_K_M
         base_url: http://localhost:11434/v1
       openai:
         model: deepseek-chat
@@ -61,7 +61,7 @@ BACKEND_OPENAI = "openai"
 SUPPORTED_BACKENDS = (BACKEND_LOCAL, BACKEND_OLLAMA, BACKEND_OPENAI)
 
 _DEFAULT_OLLAMA_BASE = "http://localhost:11434/v1"
-_DEFAULT_OLLAMA_MODEL = "qwen2.5:7b"
+_DEFAULT_OLLAMA_MODEL = "qwen3:4b-instruct-2507-q4_K_M"
 _DEFAULT_OPENAI_BASE = "https://api.openai.com/v1"
 _DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
 
@@ -81,7 +81,7 @@ class OpenAICompatLLM:
     vLLM、LM Studio、Ollama 等。
 
     Args:
-        model_name: 模型标识（如 ``qwen2.5:7b``、``deepseek-chat``）。
+        model_name: 模型标识（如 ``qwen3:4b-instruct-2507-q4_K_M``、``deepseek-chat``）。
         base_url: 服务根地址，需含 ``/v1`` 这类前缀（本类会追加 ``/chat/completions``）。
         api_key: 鉴权密钥；本地服务（Ollama / vLLM）可为空。
         generation: 默认生成参数 :class:`~src.llm.GenerationConfig`。

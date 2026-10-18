@@ -45,7 +45,7 @@ if errorlevel 1 (
         %PYTHON% -m pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
     ) else (
         echo 正在安装快速依赖...
-        %PYTHON% -m pip install -r requirements-core.txt -r requirements-optional.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+        %PYTHON% -m pip install -r requirements-quick.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
     )
 )
 
@@ -58,7 +58,7 @@ if errorlevel 1 (
     echo.
     echo   推荐安装 Ollama（无需 GPU，完全免费）：
     echo   - 下载地址：https://ollama.com/download
-    echo   - 模型命令：ollama pull qwen2.5:7b
+    echo   - 模型命令：ollama pull qwen3:4b-instruct-2507-q4_K_M
     echo   - 模型命令：ollama pull nomic-embed-text
     echo.
     echo   或者使用云端 API（需要 API Key）：

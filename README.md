@@ -91,8 +91,8 @@
 ### 0. 准备环境
 
 ```bash
-git clone https://github.com/datouy/rag.git
-cd rag
+git clone https://github.com/datouy/Zhige-RAG.git
+cd Zhige-RAG
 
 python -m venv .venv
 # Windows
@@ -100,9 +100,8 @@ python -m venv .venv
 # macOS / Linux
 source .venv/bin/activate
 
-# 只装核心依赖（不含 torch，通常几分钟）
-pip install -r requirements-core.txt
-pip install -r requirements-optional.txt   # 需要解析 PDF / Word 时
+# 快速模式：服务 + PDF / Word / Markdown 解析，不含 torch
+pip install -r requirements-quick.txt
 pip install -r requirements-ocr.txt        # 需要处理扫描件（图片型 PDF）时，约 100~150 MB
 ```
 
@@ -118,7 +117,7 @@ pip install -r requirements-ocr.txt        # 需要处理扫描件（图片型 P
 
 ```bash
 # 安装 Ollama: https://ollama.com/download
-ollama pull qwen2.5:7b          # 对话模型，约 4.7 GB
+ollama pull qwen3:4b-instruct-2507-q4_K_M  # 非思考指令模型，约 2.5 GB
 ollama pull nomic-embed-text    # 向量模型，约 270 MB
 ollama serve
 ```
@@ -359,7 +358,7 @@ Kubernetes 清单见 `k8s/`。
 ## 项目结构
 
 ```
-rag/
+Zhige-RAG/
 ├── api/                     FastAPI 服务
 │   ├── main.py              应用装配（中间件 / 路由 / 生命周期）
 │   ├── deps.py              单例与共享依赖（模型、向量库、Pipeline）
@@ -391,7 +390,8 @@ rag/
 │   └── app.py               Streamlit 控制台
 ├── config/config.yaml       主配置
 ├── data/                    知识库、向量库、上传文件
-├── requirements-core.txt    核心依赖（必装）
+├── requirements-quick.txt   快速模式依赖（Ollama / API，开箱即用）
+├── requirements-core.txt    核心服务依赖（必装）
 ├── requirements-local.txt   本地推理（torch，可选）
 ├── requirements-optional.txt 文档解析 / UI（可选）
 ├── requirements-ocr.txt     扫描件 OCR（可选）
@@ -423,7 +423,7 @@ rag/
 效果显著优于小参数量本地推理。
 
 **Q：上传 PDF 没反应**
-需要解析依赖：`pip install -r requirements-optional.txt`。
+需要 Streamlit、重排器等可选能力：`pip install -r requirements-optional.txt`。
 扫描件（图片型 PDF）目前不支持 OCR，见下方「已知限制」。
 
 **Q：切换了 Embedding 模型后检索结果不对**

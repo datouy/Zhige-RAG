@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -21,6 +22,7 @@ ROOT = Path(__file__).resolve().parent.parent
 VENV_PY = ROOT / ".venv" / "Scripts" / "python.exe"
 if not VENV_PY.exists():
     VENV_PY = ROOT / ".venv" / "bin" / "python"
+RECOMMENDED_OLLAMA_MODEL = "qwen3:4b-instruct-2507-q4_K_M"
 
 
 def run(cmd: list[str], check: bool = False, env: dict | None = None, 
@@ -36,8 +38,11 @@ def step(n: int, total: int, msg: str) -> None:
 
 def check_ollama_installed() -> bool:
     """检查 Ollama 是否已安装"""
-    r = run(["ollama", "--version"], capture=True)
-    return r.returncode == 0
+    try:
+        r = run(["ollama", "--version"], capture=True)
+        return r.returncode == 0
+    except FileNotFoundError:
+        return False
 
 
 def check_ollama_running() -> bool:
@@ -52,6 +57,8 @@ def check_ollama_running() -> bool:
 
 
 def main() -> int:
+    global VENV_PY
+
     parser = argparse.ArgumentParser(description="知阁 Zhige 一键安装")
     parser.add_argument("--full", action="store_true", help="完整安装（包含 torch + 本地模型）")
     parser.add_argument("--ollama", action="store_true", help="安装 Ollama 后端依赖（推荐，无需 GPU）")
@@ -96,6 +103,18 @@ def main() -> int:
     else:
         print("  GPU: 未检测到，将以 CPU 模式运行")
 
+    if args.check:
+        venv_python = VENV_PY if VENV_PY.exists() else None
+        if venv_python is None:
+            print("\n  [FAIL] 未找到项目虚拟环境，请运行 python scripts\\install.py")
+            return 1
+        deps_ok = run(
+            [str(venv_python), "-c", "import fastapi, uvicorn, chromadb, yaml"],
+            capture=True,
+        ).returncode == 0
+        print(f"\n  {'[OK]' if deps_ok else '[FAIL]'} 核心依赖{'齐备' if deps_ok else '不完整'}")
+        return 0 if deps_ok else 1
+
     # 创建虚拟环境
     step(3, 5, "创建虚拟环境")
     venv_dir = ROOT / ".venv"
@@ -104,18 +123,20 @@ def main() -> int:
         print("  [OK] 虚拟环境已创建")
     else:
         print("  [OK] 虚拟环境已存在")
+    VENV_PY = ROOT / ".venv" / "Scripts" / "python.exe"
+    if not VENV_PY.exists():
+        VENV_PY = ROOT / ".venv" / "bin" / "python"
+    if not VENV_PY.exists():
+        print("  [FAIL] 虚拟环境创建失败")
+        return 1
     print(f"  路径: {VENV_PY}")
 
     # 升级 pip
     step(4, 5, "升级 pip")
     run([str(VENV_PY), "-m", "pip", "install", "--upgrade", "pip",
-         "-i", "https://pypi.tuna.tsinghua.edu.cn/simple"], check=True)
+         "-i", "https://pypi.tuna.tsinghua.edu.cn/simple"],
+        check=True, capture=False)
     print("  [OK] pip 已升级")
-
-    # 选择安装模式
-    if args.check:
-        print("\n  [跳过] 仅检查环境，不执行安装")
-        return 0
 
     step(5, 5, "安装依赖")
     
@@ -127,7 +148,7 @@ def main() -> int:
         req = ROOT / "requirements.txt"
     elif args.ollama:
         install_mode = "ollama"
-        req = ROOT / "requirements-core.txt"
+        req = ROOT / "requirements-quick.txt"
     elif has_cuda:
         # 有 GPU 但没指定模式，询问用户
         install_mode = "full"
@@ -136,7 +157,7 @@ def main() -> int:
     else:
         # 无 GPU 或无虚拟环境，默认快速模式
         install_mode = "quick"
-        req = ROOT / "requirements-core.txt"
+        req = ROOT / "requirements-quick.txt"
         print("  [i] 自动选择快速安装模式（使用 Ollama，无需 GPU）")
 
     # 安装依赖
@@ -144,72 +165,45 @@ def main() -> int:
     print(f"  依赖文件: {req.name}")
 
     if install_mode in ('quick', 'ollama'):
-        # 快速安装：只装核心依赖
-        extra_pkgs = [str(ROOT / "requirements-optional.txt")]
-        extra_files = [f for f in extra_pkgs if f]
+        # 快速安装：核心服务 + 文档解析，不安装 torch / Streamlit / 重排器。
+        extra_files = []
     else:
         # 完整安装
         extra_files = [str(ROOT / "requirements.txt")]
 
-    # 先对齐核心版本（解决依赖冲突）
-    print("  - 对齐核心依赖版本...")
-    pinned = [
-        "numpy==1.26.4",
-        "transformers==4.46.1",
-        "huggingface-hub==0.27.1",
-        "tokenizers==0.20.3",
-        "sentence-transformers==3.3.1",
-        "scikit-learn==1.5.2",
-    ]
-    run([str(VENV_PY), "-m", "pip", "install"] + pinned +
-        ["-i", "https://pypi.tuna.tsinghua.edu.cn/simple"], check=False)
+    if install_mode == "full":
+        # Keep the local-inference toolchain aligned only for full installs.
+        print("  - 对齐本地推理依赖版本...")
+        pinned = [
+            "numpy==1.26.4",
+            "transformers==4.46.1",
+            "huggingface-hub==0.27.1",
+            "tokenizers==0.20.3",
+            "sentence-transformers==3.3.1",
+            "scikit-learn==1.5.2",
+        ]
+        run([str(VENV_PY), "-m", "pip", "install"] + pinned +
+            ["-i", "https://pypi.tuna.tsinghua.edu.cn/simple"],
+            check=False, capture=False)
 
     # 安装主依赖
     pkgs = []
-    for req_file in [str(ROOT / "requirements-core.txt")] + extra_files:
+    for req_file in [str(req)] + extra_files:
         if Path(req_file).exists():
             pkgs.extend(["-r", req_file])
     
     if pkgs:
         r = run([str(VENV_PY), "-m", "pip", "install"] + pkgs +
-                ["-i", "https://pypi.tuna.tsinghua.edu.cn/simple"])
+                ["-i", "https://pypi.tuna.tsinghua.edu.cn/simple"],
+                capture=False)
         if r.returncode != 0:
-            # 处理 chromadb 在 Windows 上的兼容问题
-            print("  [!] 依赖安装遇到问题，尝试修复...")
-            if sys.platform == "win32":
-                run([str(VENV_PY), "-m", "pip", "uninstall", "-y",
-                     "chroma-hnswlib", "chromadb"], check=False)
-                ok1 = run([str(VENV_PY), "-m", "pip", "install",
-                           "chroma-hnswlib==0.7.5", "--only-binary=:all:",
-                           "-i", "https://pypi.tuna.tsinghua.edu.cn/simple"],
-                          check=False).returncode == 0
-                if ok1:
-                    ok2 = run([str(VENV_PY), "-m", "pip", "install",
-                               "chromadb>=0.4.24,<0.6.0", "--no-deps",
-                               "-i", "https://pypi.tuna.tsinghua.edu.cn/simple"],
-                              check=False).returncode == 0
-                    if ok2:
-                        # 重新安装其他依赖
-                        other_pkgs = []
-                        for req_file in [str(ROOT / "requirements-core.txt")] + extra_files:
-                            if Path(req_file).exists():
-                                lines = Path(req_file).read_text(encoding="utf-8").splitlines()
-                                lines = [l for l in lines
-                                         if not l.strip().startswith("chromadb")
-                                         and not l.strip().startswith("chroma-hnswlib")]
-                                tmp_req = ROOT / "logs" / "requirements_temp.txt"
-                                tmp_req.parent.mkdir(exist_ok=True)
-                                tmp_req.write_text("\n".join(lines), encoding="utf-8")
-                                other_pkgs.extend(["-r", str(tmp_req)])
-                        if other_pkgs:
-                            run([str(VENV_PY), "-m", "pip", "install"] + other_pkgs +
-                                ["-i", "https://pypi.tuna.tsinghua.edu.cn/simple"], check=False)
-                        print("  [OK] chromadb 兼容性问题已修复")
-                    else:
-                        print("  [!] chromadb 安装仍有问题，但不影响 Ollama 模式运行")
-                else:
-                    print("  [!] chromadb-hnswlib 安装失败，但不影响 Ollama 模式运行")
-    
+            print("  [!] 国内镜像安装失败，改用 PyPI 官方源重试...")
+            r = run([str(VENV_PY), "-m", "pip", "install"] + pkgs,
+                    capture=False)
+        if r.returncode != 0:
+            print("  [FAIL] 依赖安装失败，请检查网络和上方 pip 日志。")
+            return 1
+
     print("  [OK] 依赖安装完成")
 
     # 完成后提示
@@ -224,8 +218,8 @@ def main() -> int:
         print()
         print("  1. 下载 Ollama: https://ollama.com/download")
         print("  2. 安装并启动 Ollama")
-        print("  3. 运行以下命令下载模型（约 5 GB）：")
-        print("     ollama pull qwen2.5:7b")
+        print("  3. 运行以下命令下载模型（约 3 GB）：")
+        print(f"     ollama pull {RECOMMENDED_OLLAMA_MODEL}")
         print("     ollama pull nomic-embed-text")
         print("  4. 启动知阁：")
         print("     python scripts\\quickstart.py")
@@ -240,8 +234,8 @@ def main() -> int:
         print("  1. 启动 Ollama:")
         print("     ollama serve")
         print()
-        print("  2. 下载模型（约 5 GB）：")
-        print("     ollama pull qwen2.5:7b")
+        print("  2. 下载模型（约 3 GB）：")
+        print(f"     ollama pull {RECOMMENDED_OLLAMA_MODEL}")
         print("     ollama pull nomic-embed-text")
         print()
         print("  3. 启动知阁：")
@@ -250,7 +244,7 @@ def main() -> int:
         print("【下一步】Ollama 已就绪！")
         print()
         print("  1. 确保模型已下载（如果没有，运行）：")
-        print("     ollama pull qwen2.5:7b")
+        print(f"     ollama pull {RECOMMENDED_OLLAMA_MODEL}")
         print("     ollama pull nomic-embed-text")
         print()
         print("  2. 启动知阁：")

@@ -30,7 +30,11 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-OK, WARN, FAIL, INFO = "✅", "⚠️ ", "❌", "ℹ️"
+RECOMMENDED_OLLAMA_MODEL = "qwen3:4b-instruct-2507-q4_K_M"
+
+# Windows terminals often default to GBK. ASCII status labels keep the startup
+# checks readable and prevent a UnicodeEncodeError before the service starts.
+OK, WARN, FAIL, INFO = "[OK]", "[WARN]", "[FAIL]", "[INFO]"
 
 
 def say(icon: str, message: str) -> None:
@@ -39,9 +43,28 @@ def say(icon: str, message: str) -> None:
 
 def header(title: str) -> None:
     print()
-    print("─" * 66)
+    print("=" * 66)
     print(f"  {title}")
-    print("─" * 66)
+    print("=" * 66)
+
+
+def _reexec_in_project_venv() -> Optional[int]:
+    """Use the project's virtualenv even when quickstart is called by system Python."""
+    if os.environ.get("ZHIGE_VENV_REEXEC") == "1":
+        return None
+    existing = venv_python()
+    if not existing:
+        return None
+    current = Path(sys.executable).resolve()
+    if current == existing.resolve():
+        return None
+    print(f"[INFO] 切换到项目虚拟环境：{existing}")
+    env = dict(os.environ, ZHIGE_VENV_REEXEC="1")
+    return subprocess.call(
+        [str(existing), str(Path(__file__).resolve()), *sys.argv[1:]],
+        env=env,
+        cwd=str(ROOT),
+    )
 
 
 # ----------------------------------------------------------------------
@@ -196,6 +219,14 @@ def check_ollama() -> Tuple[bool, str, str]:
         return False, str(exc)[:50], ""
 
 
+def _ollama_root(base: str) -> str:
+    """Accept both native and OpenAI-compatible Ollama base URLs."""
+    root = str(base or "http://localhost:11434").rstrip("/")
+    if root.endswith("/v1"):
+        root = root[:-3]
+    return root
+
+
 def check_api_key() -> Optional[str]:
     """检查是否有可用的 API Key。"""
     # 尝试从多个位置读取
@@ -228,7 +259,11 @@ def auto_detect_backend() -> str:
             say(OK, f"Ollama 已就绪（{ollama_info}）")
             return "ollama"
         else:
-            say(WARN, f"Ollama 运行中，但未检测到模型：ollama pull qwen2.5:7b && ollama pull nomic-embed-text")
+            say(
+                WARN,
+                "Ollama 运行中，但未检测到模型："
+                f"ollama pull {RECOMMENDED_OLLAMA_MODEL} && ollama pull nomic-embed-text",
+            )
             return "ollama"
     
     # 2. 检查 API Key
@@ -263,13 +298,13 @@ def check_llm_backend(cfg: Dict[str, Any], force_backend: Optional[str] = None) 
         base = os.getenv("OLLAMA_BASE_URL") or section.get("base_url") or "http://localhost:11434"
         model = os.getenv("OLLAMA_MODEL") or section.get("model") or ""
         
-        status, body = _probe(f"{base.rstrip('/')}/api/tags")
+        status, body = _probe(f"{_ollama_root(base)}/api/tags")
         if status == 200:
             say(OK, f"Ollama 可达（{base}）")
             if model and model not in body:
                 say(WARN, f"Ollama 中没有模型 {model}")
                 say("  ", f"请先拉取：ollama pull {model}")
-                say("  ", "推荐模型：ollama pull qwen2.5:7b")
+                say("  ", f"推荐模型：ollama pull {RECOMMENDED_OLLAMA_MODEL}")
                 return False
             if model:
                 say(OK, f"模型已就绪：{model}")
@@ -278,9 +313,9 @@ def check_llm_backend(cfg: Dict[str, Any], force_backend: Optional[str] = None) 
         say(FAIL, f"Ollama 不可达：{base}")
         say("  ", "① 安装 Ollama：https://ollama.com/download")
         say("  ", "② 启动服务：ollama serve")
-        say("  ", "③ 拉取模型：ollama pull qwen2.5:7b")
+        say("  ", f"③ 拉取模型：ollama pull {RECOMMENDED_OLLAMA_MODEL}")
         if os.getenv("HTTP_PROXY") or os.getenv("HTTPS_PROXY"):
-            say("  ", "⚠️ 检测到代理环境变量，可能需要加入 NO_PROXY")
+            say("  ", "[WARN] 检测到代理环境变量，可能需要加入 NO_PROXY")
         return False
 
     if backend == "openai":
@@ -340,7 +375,7 @@ def check_embedding_backend(cfg: Dict[str, Any], force_backend: Optional[str] = 
             or "http://localhost:11434"
         )
         model = os.getenv("EMBEDDING_OLLAMA_MODEL") or section.get("model") or ""
-        status, body = _probe(f"{base.rstrip('/')}/api/tags")
+        status, body = _probe(f"{_ollama_root(base)}/api/tags")
         if status != 200:
             say(FAIL, f"Ollama 不可达（{base}），Embedding 无法工作")
             return False
@@ -399,29 +434,26 @@ def launch(interpreter: Path, extra_env: Dict[str, str]) -> int:
 def show_recommendations():
     """显示配置建议。"""
     print()
-    print("┌─────────────────────────────────────────────────────────┐")
-    print("│  推荐配置（按推荐程度排序）                              │")
-    print("├─────────────────────────────────────────────────────────┤")
-    print("│                                                         │")
-    print("│  1️⃣  Ollama（推荐，无需 GPU，完全免费）                   │")
-    print("│     - 下载：https://ollama.com/download                │")
-    print("│     - 模型：ollama pull qwen2.5:7b                     │")
-    print("│     - 向量：ollama pull nomic-embed-text               │")
-    print("│     - 启动：python scripts\\quickstart.py --backend ollama │")
-    print("│                                                         │")
-    print("│  2️⃣  云端 API（无需本地，按量付费）                      │")
-    print("│     - DeepSeek: https://platform.deepseek.com/         │")
-    print("│     - 通义千问: https://dashscope.console.aliyun.com/   │")
-    print("│     - 设置环境变量 OPENAI_API_KEY 后启动                │")
-    print("│                                                         │")
-    print("│  3️⃣  本地模型（需要 GPU，完全离线）                       │")
-    print("│     - 安装：pip install -r requirements.txt           │")
-    print("│     - 启动：python scripts\\quickstart.py               │")
-    print("│                                                         │")
-    print("└─────────────────────────────────────────────────────────┘")
+    print("推荐配置（按推荐程度排序）")
+    print("  1. Ollama（推荐，无需 GPU，完全免费）")
+    print("     - 下载：https://ollama.com/download")
+    print(f"     - 模型：ollama pull {RECOMMENDED_OLLAMA_MODEL}")
+    print("     - 向量：ollama pull nomic-embed-text")
+    print("     - 启动：python scripts\\quickstart.py --backend ollama")
+    print("  2. 云端 API（无需本地模型，按量付费）")
+    print("     - DeepSeek: https://platform.deepseek.com/")
+    print("     - 通义千问: https://dashscope.console.aliyun.com/")
+    print("     - 设置环境变量 OPENAI_API_KEY 后启动")
+    print("  3. 本地模型（需要 GPU，完全离线）")
+    print("     - 安装：pip install -r requirements.txt")
+    print("     - 启动：python scripts\\quickstart.py")
 
 
 def main() -> int:
+    reexec_result = _reexec_in_project_venv()
+    if reexec_result is not None:
+        return reexec_result
+
     parser = argparse.ArgumentParser(description="知阁 Zhige 一键启动")
     parser.add_argument("--check", action="store_true", help="只做检查，不启动服务")
     parser.add_argument("--install", action="store_true", help="缺少核心依赖时自动安装")

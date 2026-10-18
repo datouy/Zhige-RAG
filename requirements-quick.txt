@@ -1,0 +1,10 @@
+# Keep the Ollama / OpenAI-compatible path light: no torch, no reranker weights.
+-r requirements-core.txt
+
+# Common document formats supported by the web upload page.
+pdfplumber>=0.10.0
+pypdf>=4.0.0
+python-docx>=1.1.0
+markdown>=3.6
+beautifulsoup4>=4.12.0
+lxml>=4.9.0

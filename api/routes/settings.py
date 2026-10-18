@@ -37,7 +37,7 @@ router = APIRouter()
 
 class BackendSection(BaseModel):
     """某个后端的连接参数。"""
-    model: Optional[str] = Field(None, description="模型名，如 qwen2.5:7b / deepseek-chat")
+    model: Optional[str] = Field(None, description="模型名，如 qwen3:4b-instruct-2507-q4_K_M / deepseek-chat")
     base_url: Optional[str] = Field(None, description="服务地址，如 http://localhost:11434/v1")
     api_key: Optional[str] = Field(None, description="API Key（本地服务可留空）")
 

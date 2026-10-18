@@ -62,7 +62,7 @@ ENV PATH=/home/appuser/.local/bin:$PATH \
     EMBEDDING_BACKEND=ollama \
     OLLAMA_BASE_URL=http://host.docker.internal:11434/v1 \
     EMBEDDING_OLLAMA_BASE_URL=http://host.docker.internal:11434/v1 \
-    OLLAMA_MODEL=qwen2.5:7b \
+    OLLAMA_MODEL=qwen3:4b-instruct-2507-q4_K_M \
     EMBEDDING_OLLAMA_MODEL=nomic-embed-text \
     HF_ENDPOINT=https://hf-mirror.com
 

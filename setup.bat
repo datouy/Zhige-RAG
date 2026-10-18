@@ -116,7 +116,7 @@ echo [OK] pip 已升级
 REM 安装核心依赖
 echo.
 echo [安装] 安装核心依赖（可能需要几分钟）...
-.venv\Scripts\python.exe -m pip install -r requirements-core.txt -r requirements-optional.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+.venv\Scripts\python.exe -m pip install -r requirements-quick.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 if errorlevel 1 (
     echo [错误] 依赖安装失败
     echo.
@@ -149,7 +149,7 @@ if not exist ".venv\Scripts\ollama.exe" (
     )
 )
 echo   1) 下载模型（如果使用 Ollama）：
-echo      ollama pull qwen2.5:7b
+echo      ollama pull qwen3:4b-instruct-2507-q4_K_M
 echo      ollama pull nomic-embed-text
 echo.
 echo   2) 启动知阁：

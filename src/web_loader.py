@@ -38,7 +38,7 @@ from .utils import clean_text, get_logger
 logger = get_logger("web_loader")
 
 DEFAULT_USER_AGENT = (
-    "Mozilla/5.0 (compatible; ZhigeBot/1.0; +https://github.com/datouy/rag) "
+    "Mozilla/5.0 (compatible; ZhigeBot/1.0; +https://github.com/datouy/Zhige-RAG) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
 )
 ALLOWED_SCHEMES = ("http", "https")

@@ -332,10 +332,10 @@ decision:
 # 【开箱即用推荐配置】
 #   LLM_BACKEND=ollama && EMBEDDING_BACKEND=ollama
 #   不需要 torch，不需要 GPU，不需要下载权重，一条命令启动：
-#   ollama pull qwen2.5:7b && ollama pull nomic-embed-text && python scripts/quickstart.py
+#   ollama pull qwen3:4b-instruct-2507-q4_K_M && ollama pull nomic-embed-text && python scripts/quickstart.py
 #
 # 快速切换：
-#   1) 已装 Ollama：    backend 改 "ollama"，执行 `ollama pull qwen2.5:7b`
+#   1) 已装 Ollama：    backend 改 "ollama"，执行 `ollama pull qwen3:4b-instruct-2507-q4_K_M`
 #   2) 用云端 API：     backend 改 "openai"，填好下方 openai 段
 #   3) 完全离线推理：   backend 保持 "local"，预先下载 model_name 指向的权重
 llm:
@@ -344,7 +344,7 @@ llm:
   # --- backend: ollama ---
   # model 用 `ollama list` 显示的名字；Ollama 自带 OpenAI 兼容端点。
   ollama:
-    model: "qwen2.5:7b"
+    model: "qwen3:4b-instruct-2507-q4_K_M"
     base_url: "http://localhost:11434/v1"
     timeout: 120.0
     # Ollama 默认不校验密钥，留空即可；走内网网关时才需要。

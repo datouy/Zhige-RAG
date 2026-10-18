@@ -150,6 +150,6 @@ pytest tests/ -q   →   437 passed, 0 failed   (2m28s)
 | 名称 | 地址 |
 | --- | --- |
 | `origin` | https://gitee.com/tokyi/agent.git |
-| `github` | https://github.com/datouy/rag.git |
+| `github` | https://github.com/datouy/Zhige-RAG.git |
 
 > 尚未 push —— 需要推送到 `origin`（Gitee）和/或 `github` 请明确告知。
