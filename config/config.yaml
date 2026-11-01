@@ -384,7 +384,7 @@ llm:
     cache_dir: "./models/huggingface"
 
   generation:
-    max_new_tokens: 256
+    max_new_tokens: 1024
     temperature: 0.1               # 更低温度：0.1 更精准（事实型问答推荐）
     top_p: 0.9
     repetition_penalty: 1.05

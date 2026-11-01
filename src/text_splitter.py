@@ -91,14 +91,19 @@ _DECIMAL_DOT_TOKEN = "\x00"
 
 
 def _split_into_sentences(text: str) -> List[str]:
-    """按中英文句末标点切分句子（小数点不做切分边界）。"""
+    """按中英文句末标点切分句子（小数点不做切分边界）。
+
+    段落内的单换行按空格处理，避免把一段话按行拆散，产生「会议/室」
+    这类残缺片段。
+    """
     text = _DECIMAL_DOT_RE.sub(_DECIMAL_DOT_TOKEN, text.strip())
+    text = text.replace("\n", " ")
     if not text:
         return []
     
     # 找所有句子
     sentences = []
-    pattern = rf'([^{re.escape(_ALL_SENTENCE_END)}\n]*[{re.escape(_ALL_SENTENCE_END)}])'
+    pattern = rf'([^{re.escape(_ALL_SENTENCE_END)}]*[{re.escape(_ALL_SENTENCE_END)}])'
     parts = re.findall(pattern, text)
     
     consumed = sum(len(p) for p in parts)
@@ -112,6 +117,24 @@ def _split_into_sentences(text: str) -> List[str]:
             sentences.append(s)
     
     return sentences
+
+
+def _sentence_tail(text: str, max_len: int) -> str:
+    """取文本末尾不超过 max_len 的整句后缀（用于 overlap，不切词）。"""
+    if not text or max_len <= 0:
+        return ""
+    parts = re.split(r"(?<=[。！？!?；;])", text)
+    parts = [p for p in parts if p]
+    if not parts:
+        return text[-max_len:]
+    tail = ""
+    for p in reversed(parts):
+        candidate = p + tail
+        if len(candidate) <= max_len:
+            tail = candidate
+        else:
+            break
+    return tail or (parts[-1][-max_len:] if parts else "")
 
 
 def _merge_short_paragraphs(paragraphs: List[str], min_len: int = 20) -> List[str]:
@@ -364,32 +387,26 @@ class ChineseTextSplitter:
         return merged
 
     def _add_overlap(self, chunks: List[str]) -> List[str]:
-        """添加块间 overlap，保持上下文连贯。"""
+        """添加块间 overlap：按整句重叠，绝不从词中间截断。"""
         if len(chunks) <= 1:
             return chunks
-            
-        overlapped: List[str] = []
-        overlapped.append(chunks[0])
-        
+
+        overlapped: List[str] = [chunks[0]]
         for i in range(1, len(chunks)):
             prev = overlapped[-1]
-            # 取前一块的末尾 overlap 字符
-            tail = prev[-self.chunk_overlap:] if len(prev) > self.chunk_overlap else prev
-            
-            # 合并
-            merged = tail + "\n" + chunks[i]
-            
-            # 如果超长，压缩 tail 而不是丢弃 chunks[i] 的内容
+            tail = _sentence_tail(prev, self.chunk_overlap)
+            merged = (tail + "\n" + chunks[i]) if tail else chunks[i]
+
             max_len = self.chunk_size + self.chunk_overlap
             if len(merged) > max_len:
                 keep = max_len - len(chunks[i]) - 1
                 if keep > 0:
-                    merged = tail[-keep:] + "\n" + chunks[i]
+                    tail = _sentence_tail(prev, keep)
+                    merged = (tail + "\n" + chunks[i]) if tail else chunks[i]
                 else:
                     merged = chunks[i]
-            
+
             overlapped.append(merged)
-        
         return overlapped
 
 
