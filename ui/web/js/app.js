@@ -529,9 +529,9 @@ class ChatApp {
 
     showSources(sources) {
         if (!sources || !sources.length) return;
-        const box = document.createElement('div');
+        const box = document.createElement('details');
         box.className = 'message sources';
-        const title = document.createElement('h4');
+        const title = document.createElement('summary');
         title.textContent = `📎 引用来源（${sources.length} 条）`;
         box.appendChild(title);
 
