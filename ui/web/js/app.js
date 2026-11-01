@@ -470,12 +470,14 @@ class ChatApp {
             this.appendToken(String(data ?? ''));
         } else if (event === 'done') {
             this.hideTypingIndicator();
+            this.finalizeAssistant();
             this.showSources(this.currentSources);
             this.enableInput();
             this.loadSessions();   // 会话标题/预览可能已更新
             if (this.currentKb) { this.loadKnowledgeBases(); }
         } else if (event === 'error') {
             this.hideTypingIndicator();
+            this.finalizeAssistant();
             this.showAlert('错误：' + data, 'error');
             this.enableInput();
         }
@@ -516,6 +518,13 @@ class ChatApp {
         }
         last.querySelector('.message-content').textContent += token;
         this.scrollBottom();
+    }
+
+    finalizeAssistant() {
+        // 回答结束/出错时移除 streaming 标记，避免下一次回答 token 继续追加到上一条回答里
+        this.el['messages'].querySelectorAll('.message.assistant.streaming').forEach((el) => {
+            el.classList.remove('streaming');
+        });
     }
 
     showSources(sources) {
