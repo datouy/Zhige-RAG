@@ -86,7 +86,7 @@ def probe_collections(client: Any) -> Dict[str, Any]:
             count = int(collection.count())
             if count > 0:
                 sample = collection.get(
-                    limit=1, include=["ids", "metadatas"]
+                    limit=1, include=["metadatas"]
                 )
                 ids = sample.get("ids") or []
                 if not ids:

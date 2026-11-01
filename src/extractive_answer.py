@@ -12,6 +12,10 @@ _SOURCE_RANGE_RE = re.compile(r"\[\d{1,3}\]\s*[-–—]\s*\[\d{1,3}\]")
 _SOURCE_CITE_RE = re.compile(r"\[\d{1,3}\]")
 _LEADING_HEADER_RE = re.compile(r"^\s*【[^】\n]{0,120}】\s*")
 _MD_HEADING_LINE_RE = re.compile(r"^\s*#{1,6}\s+.*$", re.MULTILINE)
+_PAREN_MARKER_RE = re.compile(r"^\s*[（(][^）)]{0,24}[）)]\s*")
+_BULLET_MARKER_RE = re.compile(r"^\s*(?:[-•·*]\s*)+")
+_NUM_MARKER_RE = re.compile(r"^\s*\d{1,2}[.、．)]\s*")
+
 
 _STOP_BIGRAMS = frozenset(
     {
@@ -61,13 +65,26 @@ def _split_sentences(text: str) -> List[str]:
     cleaned = _SOURCE_RANGE_RE.sub("编号", text or "")
     cleaned = _SOURCE_CITE_RE.sub("", cleaned)
     cleaned = _SPACE_RE.sub(" ", cleaned).strip()
-    sentences = [match.group(0).strip() for match in _SENTENCE_RE.finditer(cleaned)]
+    sentences = [_strip_heading_markers(match.group(0)) for match in _SENTENCE_RE.finditer(cleaned)]
     return [sentence for sentence in sentences if len(sentence) >= 8]
 
 
 def _strip_markdown_headings(text: str) -> str:
     """Remove Markdown heading lines to avoid leaking titles into extracts."""
     return _MD_HEADING_LINE_RE.sub("", text or "")
+
+
+def _strip_heading_markers(text: str) -> str:
+    """Strip list/heading markers such as （C1） / （M3） / 1. / - from a sentence."""
+    cleaned = text or ""
+    for _ in range(3):
+        prev = cleaned
+        cleaned = _PAREN_MARKER_RE.sub("", cleaned)
+        cleaned = _BULLET_MARKER_RE.sub("", cleaned)
+        cleaned = _NUM_MARKER_RE.sub("", cleaned)
+        if cleaned == prev:
+            break
+    return cleaned.strip()
 
 
 def select_passages(

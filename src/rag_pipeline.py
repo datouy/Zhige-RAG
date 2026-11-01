@@ -83,6 +83,16 @@ _QUERY_FILLER_PREFIX_RE = re.compile(
 )
 
 
+def _strip_breadcrumb(text: str) -> str:
+    """Remove a leading breadcrumb such as 【章节路径】 from display text."""
+    s = (text or "").strip()
+    if s.startswith("【"):
+        end = s.find("】")
+        if end != -1:
+            s = s[end + 1 :].lstrip()
+    return s
+
+
 def normalize_query(query: str) -> str:
     """查询归一化：全角→半角（NFKC）、合并空白、剥离中文客套前缀。
 
@@ -848,7 +858,7 @@ class RAGPipeline:
                 title=c["title"],
                 source=str(meta.get("source") or meta.get("filepath") or "未知"),
                 page=page_label,
-            )
+            ).strip()
             cites.append(
                 {
                     "index": c["index"],
@@ -860,7 +870,7 @@ class RAGPipeline:
                     # 四条来源全是"相似度 —"。现在带上真实分数与类型。
                     "score": c.get("score", meta.get("_rerank_score")),
                     "score_kind": c.get("score_kind", "dense"),
-                    "snippet": c["content"][:200],
+                    "snippet": _strip_breadcrumb(c["content"])[:200],
                 }
             )
         return cites

@@ -209,13 +209,13 @@ data_quality:
 # 推荐配置：
 # - top_k: 8（检索数）
 # - rerank_candidates: 24（重排候选数，top_k * 3）
-# - min_score: 0.25（最低分兜底）
+# - min_score: 0.40（最低分兜底）
 #
 retrieval:
   top_k: 8                       # 召回数
   rerank_candidates: 24            # 重排候选数（top_k * 3）
   score_threshold: 0.0
-  min_score: 0.25                 # 命中最低分兜底
+  min_score: 0.40                 # 命中最低分兜底（过低会让无关问题也硬答）
   status_filter: true
   status_filter_fallback: true
   acl_filter: true
