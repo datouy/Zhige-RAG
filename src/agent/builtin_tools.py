@@ -16,7 +16,6 @@ from __future__ import annotations
 import ast
 import datetime as _dt
 import math
-import os
 import re
 from typing import Any, Dict, List, Optional
 
@@ -304,7 +303,7 @@ class GetCurrentTimeTool(Tool):
             tz_used = tz_name
         except Exception:
             tz_used = f"UTC{offset_h:+d}"
-            dt = _dt.datetime.utcnow() + _dt.timedelta(hours=offset_h)
+            dt = _dt.datetime.now(_dt.timezone.utc).replace(tzinfo=None) + _dt.timedelta(hours=offset_h)
         return ToolResult(
             success=True,
             content={

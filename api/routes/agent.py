@@ -72,6 +72,14 @@ def _get_agent(user_id: Optional[str] = None):
                 pipeline = get_runtime_pipeline(user_id=user_id)
                 try:
                     pipeline.ensure_llm()
+                except RuntimeError as exc:
+                    raise HTTPException(
+                        status_code=503,
+                        detail=(
+                            "ReAct Agent 依赖生成式 LLM；当前为无 LLM 模式。"
+                            "请使用 /api/v1/chat 获取带引用的检索摘录。"
+                        ),
+                    ) from exc
                 except Exception as exc:
                     logger.warning("ensure_llm 失败：%s", exc)
                 llm = getattr(pipeline, "llm", None)

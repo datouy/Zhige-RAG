@@ -23,14 +23,93 @@ import hashlib
 import logging
 import math
 import re
+import threading
 from collections import Counter
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 from .embeddings import EmbeddingModel
 from .utils import Timer, get_logger, resolve_path
 
 logger = get_logger("vector_store")
+
+_CHROMA_CLIENTS: Dict[str, Any] = {}
+_CHROMA_CLIENT_LOCK = threading.Lock()
+
+
+def get_shared_chroma_client(persist_directory: str) -> Any:
+    """Return one persistent Chroma client per database directory.
+
+    Chroma 1.x initializes its default tenant lazily. Creating several clients
+    from the startup warmup and the first request at the same time can race and
+    fail once with ``Could not connect to tenant default_tenant``. A shared,
+    serialized client removes that race and avoids duplicate runtime state.
+    """
+    import chromadb
+    from chromadb.config import Settings
+
+    path = resolve_path(persist_directory).resolve()
+    path.mkdir(parents=True, exist_ok=True)
+    key = str(path)
+    with _CHROMA_CLIENT_LOCK:
+        client = _CHROMA_CLIENTS.get(key)
+        if client is None:
+            client = chromadb.PersistentClient(
+                path=key,
+                settings=Settings(
+                    anonymized_telemetry=False,
+                    allow_reset=False,
+                ),
+            )
+            _CHROMA_CLIENTS[key] = client
+        return client
+
+
+class VectorStoreHealthError(RuntimeError):
+    """向量库 collection 无法完成基础读写探测。"""
+
+
+def probe_collections(client: Any) -> Dict[str, Any]:
+    """探测客户端中的全部 collection。
+
+    ``collection.count()`` 仍可能读取缓存或只走轻量元数据。真实故障（例如
+    Chroma 升级后 metadata segment 编码不兼容）通常要到 ``get()`` 才暴露，
+    因此对非空 collection 额外读取一条最小记录。这里不改数据，也不会加载
+    embedding 模型。
+    """
+    collections = list(client.list_collections())
+    reports: List[Dict[str, Any]] = []
+    chunks_total = 0
+    for collection in collections:
+        name = str(getattr(collection, "name", collection))
+        try:
+            count = int(collection.count())
+            if count > 0:
+                sample = collection.get(
+                    limit=1, include=["ids", "metadatas"]
+                )
+                ids = sample.get("ids") or []
+                if not ids:
+                    raise VectorStoreHealthError("count > 0 但读取样本为空")
+            chunks_total += count
+            reports.append({"name": name, "status": "healthy", "chunks": count})
+        except Exception as exc:
+            reports.append(
+                {
+                    "name": name,
+                    "status": "unhealthy",
+                    "error": str(exc)[:500],
+                }
+            )
+
+    failures = [item for item in reports if item["status"] != "healthy"]
+    return {
+        "status": "healthy" if not failures else "unhealthy",
+        "collections": len(reports),
+        "chunks": chunks_total,
+        "details": reports,
+        "errors": failures,
+    }
 
 
 # ----------------------------------------------------------------------
@@ -73,7 +152,15 @@ def _init_jieba_with_custom_dict() -> None:
     try:
         import jieba
         jieba.setLogLevel(logging.ERROR)
-        
+
+        if not _JIEBA_CUSTOM_WORDS:
+            dictionary = resolve_path("config/custom_dict.txt")
+            if dictionary.exists():
+                for line in dictionary.read_text(encoding="utf-8").splitlines():
+                    word = line.strip()
+                    if word and not word.startswith("#"):
+                        _JIEBA_CUSTOM_WORDS.add(word)
+
         # 加载自定义词典
         for word in _JIEBA_CUSTOM_WORDS:
             jieba.add_word(word)
@@ -95,6 +182,11 @@ def add_custom_words(words: List[str]) -> None:
     """添加自定义词典词汇（用于领域术语、专有名词等）。"""
     global _JIEBA_CUSTOM_WORDS
     _JIEBA_CUSTOM_WORDS.update(words)
+    if _JIEBA_INITIALIZED and _JIEBA_STATE == "on":
+        import jieba
+
+        for word in words:
+            jieba.add_word(word)
     logger.info(f"已添加 {len(words)} 个自定义词典词")
 
 
@@ -198,6 +290,59 @@ class BM25Index:
             self.tfs.append(tf)
             for term in tf:
                 self.df[term] += 1
+
+    def _rebuild_stats(self) -> None:
+        self.N = len(self.ids)
+        self.avgdl = (
+            sum(len(tokens) for tokens in self.docs_tokens) / self.N
+            if self.N
+            else 0.0
+        )
+        self.df = Counter()
+        self.tfs = []
+        for tokens in self.docs_tokens:
+            tf = Counter(tokens)
+            self.tfs.append(tf)
+            self.df.update(tf.keys())
+
+    def upsert_documents(
+        self,
+        ids: Sequence[str],
+        texts: Sequence[str],
+        metadatas: Sequence[Dict[str, Any]],
+    ) -> None:
+        """增量覆盖指定 chunk，不重新读取或分词整个 collection。"""
+        positions = {chunk_id: index for index, chunk_id in enumerate(self.ids)}
+        for chunk_id, text, metadata in zip(ids, texts, metadatas):
+            tokens = _tokenize(text)
+            position = positions.get(chunk_id)
+            if position is None:
+                positions[chunk_id] = len(self.ids)
+                self.ids.append(chunk_id)
+                self.texts.append(text)
+                self.metadatas.append(metadata)
+                self.docs_tokens.append(tokens)
+            else:
+                self.texts[position] = text
+                self.metadatas[position] = metadata
+                self.docs_tokens[position] = tokens
+        self._rebuild_stats()
+
+    def remove_ids(self, ids: Sequence[str]) -> None:
+        """删除指定 chunk 并重建词频统计（不重新分词）。"""
+        remove = set(ids)
+        if not remove:
+            return
+        kept = [
+            index
+            for index, chunk_id in enumerate(self.ids)
+            if chunk_id not in remove
+        ]
+        self.ids = [self.ids[index] for index in kept]
+        self.texts = [self.texts[index] for index in kept]
+        self.metadatas = [self.metadatas[index] for index in kept]
+        self.docs_tokens = [self.docs_tokens[index] for index in kept]
+        self._rebuild_stats()
 
     def search(self, query_text: str, top_k: int) -> List[Tuple[str, float]]:
         """返回 [(chunk_id, bm25_score)]，按分数降序。"""
@@ -337,8 +482,7 @@ class ChromaStore:
         hybrid_bm25_weight: float = 0.5,
     ) -> None:
         try:
-            import chromadb
-            from chromadb.config import Settings
+            import chromadb  # noqa: F401
         except ImportError as exc:
             raise ImportError("未安装 chromadb，请运行 `pip install chromadb`") from exc
 
@@ -346,10 +490,7 @@ class ChromaStore:
         self.persist_directory.mkdir(parents=True, exist_ok=True)
         self.collection_name = collection_name
 
-        self.client = chromadb.PersistentClient(
-            path=str(self.persist_directory),
-            settings=Settings(anonymized_telemetry=False, allow_reset=False),
-        )
+        self.client = get_shared_chroma_client(str(self.persist_directory))
 
         if embedding_model is None:
             logger.info("未提供 embedding_model，使用默认的 Chroma 内置 embedding")
@@ -377,6 +518,50 @@ class ChromaStore:
         # （取值理由见 _fuse_hybrid 的说明）
         self.hybrid_bm25_weight = max(0.0, float(hybrid_bm25_weight))
         self._bm25: Optional[BM25Index] = None
+        self._bm25_lock = threading.Lock()
+
+    def health_check(self, query_probe: bool = True) -> Dict[str, Any]:
+        """执行不会写数据的一致性探测，失败时抛出明确异常。"""
+        report = probe_collections(self.client)
+        report["active_collection"] = self.collection_name
+        if report["status"] != "healthy":
+            errors = "; ".join(
+                f"{item['name']}: {item.get('error', 'unknown')}"
+                for item in report["errors"][:3]
+            )
+            raise VectorStoreHealthError(errors or "向量库健康检查失败")
+
+        target_collection = self.collection
+        if query_probe and self.count() == 0:
+            non_empty = next(
+                (item for item in report.get("details", []) if item.get("chunks")),
+                None,
+            )
+            if non_empty is not None:
+                target_collection = self.client.get_collection(non_empty["name"])
+
+        can_query_probe = query_probe and int(target_collection.count()) > 0
+        if can_query_probe:
+            try:
+                sample = target_collection.get(limit=1, include=["embeddings"])
+                embeddings = sample.get("embeddings")
+                if embeddings is None or len(embeddings) == 0:
+                    raise VectorStoreHealthError("无法读取已存向量")
+                dimension = len(embeddings[0])
+                expected_dim = getattr(self.embedding_model, "dim", None)
+                if expected_dim and int(expected_dim) != dimension:
+                    raise VectorStoreHealthError(
+                        f"向量维度不一致：collection={dimension}, model={expected_dim}"
+                    )
+                # 使用非零探针向量验证 HNSW 查询路径，不触发模型加载。
+                probe_vector = [1.0] + [0.0] * max(0, dimension - 1)
+                target_collection.query(query_embeddings=[probe_vector], n_results=1)
+            except Exception as exc:
+                raise VectorStoreHealthError(
+                    f"collection {target_collection.name} 查询探测失败: {exc}"
+                ) from exc
+        report["query_probe"] = bool(can_query_probe)
+        return report
 
     def _invalidate_bm25(self) -> None:
         """数据变更后使 BM25 索引失效。"""
@@ -384,12 +569,15 @@ class ChromaStore:
 
     def _ensure_bm25(self) -> BM25Index:
         if self._bm25 is None:
-            got = self.collection.get(include=["documents", "metadatas"])
-            self._bm25 = BM25Index(
-                ids=got.get("ids") or [],
-                texts=got.get("documents") or [],
-                metadatas=got.get("metadatas") or [],
-            )
+            # 并发首查时只允许一个线程构建索引，避免重复全量读取和分词。
+            with self._bm25_lock:
+                if self._bm25 is None:
+                    got = self.collection.get(include=["documents", "metadatas"])
+                    self._bm25 = BM25Index(
+                        ids=got.get("ids") or [],
+                        texts=got.get("documents") or [],
+                        metadatas=got.get("metadatas") or [],
+                    )
         return self._bm25
 
     def _fuse_hybrid(
@@ -510,11 +698,87 @@ class ChromaStore:
                     embeddings=embeds,
                     metadatas=metadatas,
                 )
+            if self._bm25 is not None:
+                self._bm25.upsert_documents(ids, texts, metadatas)
             total += len(ids)
 
-        self._invalidate_count_cache()
+        self._invalidate_count_cache(invalidate_bm25=False)
         logger.info("写入完成：%d 条", total)
         return total
+
+    def replace_chunks_for_sources(
+        self,
+        chunks: Sequence[Any],
+        sources: Sequence[str],
+        on_commit: Optional[Callable[[], None]] = None,
+    ) -> int:
+        """先写新分块、再删旧分块，失败时恢复变更前的 collection。
+
+        ``on_commit`` 用于把数据库台账更新纳入同一补偿边界：回调抛错时，
+        本方法会恢复旧向量并删除本次新增的 chunk id，避免“向量已更新但台账
+        仍是旧数据”的半成功状态。
+        """
+        chunks = list(chunks)
+        source_set = sorted({str(source) for source in sources if source})
+        if not chunks:
+            if on_commit is not None:
+                on_commit()
+            return 0
+        if not source_set:
+            raise ValueError("replace_chunks_for_sources 需要至少一个 source")
+
+        where = {"source": {"$in": source_set}}
+        old = self.collection.get(
+            where=where,
+            include=["documents", "metadatas", "embeddings"],
+        )
+        old_ids = [str(chunk_id) for chunk_id in (old.get("ids") or [])]
+        old_id_set = set(old_ids)
+
+        new_ids: List[str] = []
+        for chunk in chunks:
+            metadata = dict(chunk.metadata or {})
+            source = str(metadata.get("source") or metadata.get("filepath") or "unknown")
+            page = int(metadata.get("page") or 1)
+            new_ids.append(_make_id(source, page, chunk.index))
+        new_id_set = set(new_ids)
+
+        def _restore_old() -> None:
+            new_only = list(new_id_set - old_id_set)
+            if new_only:
+                self.collection.delete(ids=new_only)
+            if old_ids:
+                self.collection.upsert(
+                    ids=old_ids,
+                    documents=old.get("documents") or [],
+                    metadatas=old.get("metadatas") or [],
+                    embeddings=[
+                        list(map(float, vector))
+                        for vector in (old.get("embeddings") or [])
+                    ],
+                )
+            self._invalidate_count_cache()
+
+        try:
+            inserted = self.add_chunks(chunks)
+            stale_ids = list(old_id_set - new_id_set)
+            if stale_ids:
+                self.collection.delete(ids=stale_ids)
+                if self._bm25 is not None:
+                    self._bm25.remove_ids(stale_ids)
+                self._invalidate_count_cache(invalidate_bm25=False)
+            if on_commit is not None:
+                on_commit()
+            return inserted
+        except Exception as exc:
+            try:
+                _restore_old()
+            except Exception as rollback_exc:
+                raise RuntimeError(
+                    "分块写入失败，且旧数据恢复失败；请立即从 Chroma 备份恢复"
+                    f"（sources={source_set}, write_error={exc}, rollback_error={rollback_exc})"
+                ) from exc
+            raise
 
     def query(
         self,
@@ -591,20 +855,32 @@ class ChromaStore:
         
         return results
 
-    def _invalidate_count_cache(self) -> None:
+    def _invalidate_count_cache(self, invalidate_bm25: bool = True) -> None:
         """写入/删除后调用，使 count 缓存失效。"""
         self._count_cache_valid = False
-        self._invalidate_bm25()
+        if invalidate_bm25:
+            self._invalidate_bm25()
 
     def delete_by_metadata(self, where: Dict[str, Any]) -> int:
         """按 metadata 条件删除文档，返回删除条数。"""
         if not where:
             raise ValueError("where 条件不能为空，避免误删")
+        matching_ids = (
+            [
+                chunk_id
+                for chunk_id, metadata in zip(self._bm25.ids, self._bm25.metadatas)
+                if _metadata_matches(metadata, where)
+            ]
+            if self._bm25 is not None
+            else []
+        )
         before = self.collection.count()
         self.collection.delete(where=where)
         after = self.collection.count()
         deleted = before - after
-        self._invalidate_count_cache()
+        if self._bm25 is not None:
+            self._bm25.remove_ids(matching_ids)
+        self._invalidate_count_cache(invalidate_bm25=False)
         logger.info("按 %s 删除 %d 条", where, deleted)
         return deleted
 
@@ -614,7 +890,9 @@ class ChromaStore:
         before = self.collection.count()
         self.collection.delete(ids=list(ids))
         after = self.collection.count()
-        self._invalidate_count_cache()
+        if self._bm25 is not None:
+            self._bm25.remove_ids(ids)
+        self._invalidate_count_cache(invalidate_bm25=False)
         return before - after
 
     def list_sources(self) -> List[Dict[str, Any]]:

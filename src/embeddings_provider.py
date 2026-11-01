@@ -1,4 +1,4 @@
-"""Embedding 后端抽象：``local``（sentence-transformers）/ ``ollama`` / ``openai``（OpenAI 兼容）。
+"""Embedding 后端抽象：``onnx`` / ``local`` / ``ollama`` / ``openai``。
 
 为什么必须和 LLM 一起做
 -----------------------
@@ -41,9 +41,15 @@ from src.utils import Timer, get_logger
 logger = get_logger("embeddings_provider")
 
 BACKEND_LOCAL = "local"
+BACKEND_ONNX = "onnx"
 BACKEND_OLLAMA = "ollama"
 BACKEND_OPENAI = "openai"
-SUPPORTED_BACKENDS = (BACKEND_LOCAL, BACKEND_OLLAMA, BACKEND_OPENAI)
+SUPPORTED_BACKENDS = (
+    BACKEND_ONNX,
+    BACKEND_LOCAL,
+    BACKEND_OLLAMA,
+    BACKEND_OPENAI,
+)
 
 _DEFAULT_OLLAMA_BASE = "http://localhost:11434/v1"
 _DEFAULT_OLLAMA_MODEL = "nomic-embed-text"
@@ -218,7 +224,7 @@ def embedding_fingerprint(emb_cfg: Dict[str, Any]) -> str:
     写入时会直接报错，且混库后检索结果不可信。
     """
     backend = str(emb_cfg.get("backend") or BACKEND_LOCAL).strip().lower()
-    if backend == BACKEND_LOCAL:
+    if backend in (BACKEND_LOCAL, BACKEND_ONNX):
         model = emb_cfg.get("model_name", "")
     else:
         model = (emb_cfg.get(backend) or {}).get("model") or emb_cfg.get("model_name", "")
@@ -231,11 +237,12 @@ def embedding_fingerprint(emb_cfg: Dict[str, Any]) -> str:
 def embedding_collection_name(base_name: str, emb_cfg: Dict[str, Any]) -> str:
     """按 Embedding 后端为 collection 起名。
 
-    - ``local`` 后端：**沿用原名**，保证升级不破坏已有知识库；
+    - ``onnx`` / ``local`` 后端：**沿用原名**。两者都使用同一个 BGE 中文
+      向量空间，因此已有知识库无需重新入库；
     - 其它后端：追加后端与模型指纹，避免与本地向量（维度不同）混在一个库里。
     """
     backend = str(emb_cfg.get("backend") or BACKEND_LOCAL).strip().lower()
-    if backend == BACKEND_LOCAL:
+    if backend in (BACKEND_ONNX, BACKEND_LOCAL):
         return base_name
     return f"{base_name}__{embedding_fingerprint(emb_cfg)}"
 
@@ -296,12 +303,31 @@ def _build_local_embedding(emb_cfg: Dict[str, Any]):
     )
 
 
+def _build_onnx_embedding(emb_cfg: Dict[str, Any]):
+    from src.onnx_embedding import OnnxEmbedding
+
+    section = emb_cfg.get("onnx") or {}
+    return OnnxEmbedding(
+        model_path=section.get("model_path") or emb_cfg.get(
+            "model_name", "./models/bge-small-zh-v1.5-onnx"
+        ),
+        model_file=section.get("model_file", "onnx/model_quantized.onnx"),
+        tokenizer_file=section.get("tokenizer_file", "tokenizer.json"),
+        batch_size=int(emb_cfg.get("batch_size", 16)),
+        max_seq_length=int(emb_cfg.get("max_seq_length", 512)),
+        normalize=bool(emb_cfg.get("normalize_embeddings", True)),
+        num_threads=section.get("num_threads"),
+        pooling=section.get("pooling", "cls"),
+    )
+
+
 def create_embedding(emb_cfg: Optional[Dict[str, Any]] = None):
     """按 ``embedding.backend`` 创建 Embedding 实例。
 
     ``backend`` 取值：
 
-    - ``local``（默认）：sentence-transformers，需要 torch，行为与改造前一致；
+    - ``onnx``（默认）：本地 ONNX 向量模型，CPU 推理，不需要 torch / LLM；
+    - ``local``：sentence-transformers，需要 torch；
     - ``ollama``：本机 Ollama 的 embedding 模型，**不需要 torch**；
     - ``openai``：任意 OpenAI 兼容的 ``/v1/embeddings`` 服务。
 
@@ -310,7 +336,7 @@ def create_embedding(emb_cfg: Optional[Dict[str, Any]] = None):
         EmbeddingProviderError: 远程后端缺少必要配置。
     """
     cfg = dict(emb_cfg or {})
-    backend = str(cfg.get("backend") or BACKEND_LOCAL).strip().lower()
+    backend = str(cfg.get("backend") or BACKEND_ONNX).strip().lower()
 
     if backend in (BACKEND_OLLAMA, BACKEND_OPENAI):
         embedding = _build_remote_embedding(cfg, backend)
@@ -319,6 +345,16 @@ def create_embedding(emb_cfg: Optional[Dict[str, Any]] = None):
             backend,
             embedding.model_name,
             embedding.base_url,
+        )
+        return embedding
+
+    if backend == BACKEND_ONNX:
+        embedding = _build_onnx_embedding(cfg)
+        logger.info(
+            "Embedding 后端：onnx（model=%s, dim=%s, threads=%s）",
+            embedding.model_name,
+            embedding.dimension or "auto",
+            embedding.num_threads,
         )
         return embedding
 
@@ -331,6 +367,7 @@ def create_embedding(emb_cfg: Optional[Dict[str, Any]] = None):
 
 
 __all__ = [
+    "BACKEND_ONNX",
     "BACKEND_LOCAL",
     "BACKEND_OLLAMA",
     "BACKEND_OPENAI",

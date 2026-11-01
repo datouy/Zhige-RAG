@@ -140,7 +140,6 @@ class TestRouteModuleSurface:
             chat_router,
             eval_router,
             kg_router,
-            subscription_router,
             system_router,
         )
 
@@ -149,7 +148,6 @@ class TestRouteModuleSurface:
             chat_router,
             eval_router,
             kg_router,
-            subscription_router,
             system_router,
         ):
             assert hasattr(r, "routes"), f"{r} missing routes attribute"

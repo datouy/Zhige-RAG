@@ -18,10 +18,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from src.embeddings import EmbeddingModel
 from src.text_splitter import ChineseTextSplitter, RecursiveTextSplitter
-from src.utils import apply_env_overrides, ensure_dir, get_logger, load_config, merge_dict
-from src.vector_store import ChromaStore
+from src.utils import apply_env_overrides, ensure_dir, get_logger, load_config
 
 # 版本管理功能
 import scripts.version_manager as version_manager
@@ -66,8 +64,6 @@ def ingest_path(
         splitter: 文本分块器。
         enable_version: 是否保存版本到 data/versions/。
     """
-    dl_cfg = cfg.get("document_loader", {})
-
     # 数据层统一管线：元数据增强（标题/层级/更新时间/权限/状态）
     # → 深度清洗 → 去重 → 准入门（过滤过期/草稿/权限不清）→ 分块 → 分块去重
     from src.data_quality import run_data_pipeline
@@ -130,36 +126,39 @@ def ingest_path(
                 )
                 logger.info("文档 %s 已保存版本 %s", source_name, version)
 
-    # 加载 embedding & 向量库
-    # 必须走工厂（local / ollama / openai），否则离线入库会强制加载本地模型
-    from src.embeddings_provider import create_embedding, embedding_collection_name
+    # CLI 与 API 必须写入同一个本地用户 / 默认知识库，否则数据库中看得见
+    # 台账、向量库却检索不到（或反过来）。
+    from src.db.database import SessionLocal, init_db
+    from src.factories import TenantAwareFactory
+    from src.kb_service import ensure_default_kb
+    from src.middleware.identity import get_local_user
 
-    embed = create_embedding(cfg.get("embedding", {}))
-    store = ChromaStore(
-        persist_directory=cfg["vector_store"]["persist_directory"],
-        collection_name=embedding_collection_name(
-            cfg["vector_store"].get("collection_name", "chinese_rag_kb"),
-            cfg.get("embedding", {}),
-        ),
-        embedding_model=embed,
-        distance_fn=cfg["vector_store"].get("distance_fn", "cosine"),
-    )
+    init_db()
+    db = SessionLocal()
+    try:
+        user = get_local_user(db)
+        kb = ensure_default_kb(db, user.id, cfg)
+        user_id = user.id
+        kb_id = kb.id
+        collection_name = kb.collection_name
+    finally:
+        db.close()
 
-    # 入库前按 source 清理同名文档旧分块，避免内容更新后残留旧块
-    # （分块 id 只含 source|page|chunk_index，upsert 不会删除已消失的块）
-    stale_sources = {
+    for chunk in all_chunks:
+        chunk.metadata["kb_id"] = kb_id
+    store = TenantAwareFactory.get_chroma_store_by_name(collection_name, cfg)
+
+    sources = {
         str(c.metadata.get("source") or c.metadata.get("filepath") or "unknown")
         for c in all_chunks
     }
-    for src in stale_sources:
-        try:
-            deleted = store.delete_by_metadata({"source": {"$eq": src}})
-            if deleted:
-                logger.info("已清理 %s 的 %d 条旧分块", src, deleted)
-        except Exception as exc:
-            logger.warning("清理旧分块失败（source=%s）: %s", src, exc)
+    from api.routes.chat import _commit_ingestion_metadata
 
-    n = store.add_chunks(all_chunks)
+    n = store.replace_chunks_for_sources(
+        all_chunks,
+        sorted(sources),
+        on_commit=lambda: _commit_ingestion_metadata(user_id, all_chunks, report, kb_id),
+    )
     logger.info("✅ 入库完成，新增/覆盖 %d 条", n)
     
     # 入库后打印几条分块样例，检查质量
@@ -173,9 +172,9 @@ def _print_chunk_samples(chunks, num_samples: int = 5):
     if not chunks:
         return
     
-    print(f"\n{'='*80}")
-    print(f"分块质量检查 - 样例展示")
-    print(f"{'='*80}\n")
+    print("\n" + "=" * 80)
+    print("分块质量检查 - 样例展示")
+    print("=" * 80 + "\n")
     
     print(f"总分块数: {len(chunks)}")
     avg_len = sum(len(c.text) for c in chunks) / len(chunks)
@@ -194,7 +193,7 @@ def _print_chunk_samples(chunks, num_samples: int = 5):
         print(f"  来源: {chunk.metadata.get('source', 'N/A')}")
         if 'title' in chunk.metadata:
             print(f"  标题: {chunk.metadata['title']}")
-        print(f"  内容预览:\n")
+        print("  内容预览:\n")
         
         # 显示前 200 字符
         preview = chunk.text[:200]

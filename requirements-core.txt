@@ -17,12 +17,15 @@ aiofiles>=23.3.0
 # ---------- 数据校验 / ORM ----------
 pydantic>=2.0.0
 sqlalchemy>=2.0.0
+psycopg[binary]>=3.2.0,<4.0.0   # PostgreSQL 同步驱动（Docker / K8s）
 
 # ---------- 数据库迁移 ----------
 alembic>=0.9.0
 
 # ---------- 向量库 ----------
-chromadb>=1.5.0,<2.0
+# 固定到已验证版本：Chroma 的小版本也会改变持久化 schema。升级前先运行
+# `python scripts/chroma_admin.py health` 并完成备份。
+chromadb==1.5.0
 # 某些 Linux 上 chromadb 需要更新的 sqlite，可选：
 # pysqlite3-binary; sys.modules['sqlite3'] = sys.modules.pop('pysqlite3')
 
@@ -32,10 +35,14 @@ jieba>=0.42.1
 
 # ---------- 基础工具 ----------
 PyYAML>=6.0
-numpy>=1.24.0,<3.0.0
+numpy>=1.24.0,<2.0.0
 python-dotenv>=1.0.0
 tiktoken>=0.5.0
 filelock>=3.12.0          # scripts/preload_llm.py 单飞行锁
+
+# ---------- 本地 Embedding（CPU，无 torch / 无 LLM）----------
+onnxruntime>=1.17.0,<2.0.0
+tokenizers>=0.15.0,<1.0.0
 
 # ---------- 限流 / 健康检查 / 指标 ----------
 slowapi>=0.1.9

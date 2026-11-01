@@ -339,34 +339,3 @@ def _is_document_owned_by_user(doc_path: str, user_id: str) -> bool:
     # 或者通过 metadata 中的 user_id 判断
     user_prefix = user_id[:8] if user_id else ""
     return user_prefix in str(doc_path)
-
-
-def render_tenant_version_selector():
-    """渲染多租户版本选择器。
-    
-    在版本管理页面中显示当前用户拥有的文档版本。
-    """
-    st.sidebar.subheader("🏢 多租户设置")
-    
-    # 显示当前租户信息
-    if "user_id" in st.session_state:
-        user_id = st.session_state.get("user_id", "")
-        st.sidebar.caption(f"用户: {user_id[:8]}...")
-        
-        if "subscription_tier" in st.session_state:
-            tier = st.session_state.get("subscription_tier", "free")
-            st.sidebar.caption(f"套餐: {tier.upper()}")
-    else:
-        st.sidebar.info("未登录")
-
-
-def render_multi_tenant_badge():
-    """渲染多租户状态徽章。"""
-    if "subscription_tier" in st.session_state:
-        tier = st.session_state.get("subscription_tier", "free")
-        tier_icons = {"free": "🔵", "pro": "🟢", "enterprise": "🟣"}
-        icon = tier_icons.get(tier, "🔵")
-        st.markdown(f"{icon} **{tier.upper()}** 租户")
-    else:
-        st.markdown("🔵 **FREE** 租户")
-

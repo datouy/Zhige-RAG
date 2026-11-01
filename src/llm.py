@@ -341,7 +341,7 @@ class LocalLLM:
         import torch  # type: ignore
 
         inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
-        with Timer(f"llm generate"):
+        with Timer("llm generate"):
             with torch.no_grad():
                 output_ids = self.model.generate(
                     **inputs,

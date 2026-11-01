@@ -96,19 +96,25 @@ text_splitter:
 
 # ------------------ Embedding 模型 ------------------
 #
-# backend 与 llm.backend 同理（实现见 src/embeddings_provider.py）：
-#   local  —— sentence-transformers，**需要 torch（2~3 GB）**
-#   ollama —— 本机 Ollama 的 embedding 模型，**不需要 torch** ← 开箱即用推荐
-#   openai —— 任意 OpenAI 兼容的 /v1/embeddings（通义 DashScope、硅基流动、OpenAI…）
+# backend（实现见 src/embeddings_provider.py）：
+#   onnx   —— 本地量化 BGE，CPU 推理，约 24 MB，不需要 torch / LLM（当前默认）
+#   local  —— sentence-transformers，需要 torch（2~3 GB）
+#   ollama —— 本机 Ollama 的 embedding 模型，不需要 torch
+#   openai —— 任意 OpenAI 兼容的 /v1/embeddings
 #
-# ⚠️ 切换 Embedding 模型会改变向量维度。非 local 后端会自动为 collection
+# ⚠️ 切换 Embedding 模型会改变向量维度。远程后端会自动为 collection
 #    追加"后端+模型"指纹，避免与旧向量混在同一个库里（见 embedding_collection_name）。
-# 
-# 【开箱即用推荐配置】
-#   LLM_BACKEND=ollama && EMBEDDING_BACKEND=ollama
-#   不需要 torch，不需要 GPU，不需要下载权重
 embedding:
-  backend: "ollama"
+  backend: "onnx"
+
+  # --- backend: onnx（当前机器推荐）---
+  # i5-13400 使用 8 线程；GTX 1650 4 GB 留给显示/OCR，不加载生成模型。
+  onnx:
+    model_path: "./models/bge-small-zh-v1.5-onnx"
+    model_file: "onnx/model_quantized.onnx"
+    tokenizer_file: "tokenizer.json"
+    num_threads: 8
+    pooling: "cls"
 
   # --- backend: ollama（不想装 torch 时首选）---
   # 准备：ollama pull nomic-embed-text
@@ -129,8 +135,8 @@ embedding:
     api_key: ${OPENAI_API_KEY:-}
     timeout: 60.0
 
-  # --- backend: local ---
-  model_name: "BAAI/bge-small-zh-v1.5"
+  # --- 公共参数 / backend: local ---
+  model_name: "./models/bge-small-zh-v1.5-onnx"
   device: "cpu"
   batch_size: 16
   normalize_embeddings: true
@@ -238,7 +244,7 @@ reranker:
   #   的 min_relevance 直接挡掉，不再硬编。
   # 代价：多加载一个 ~1.1GB 的重排模型 + 每次约几十毫秒。
   # 想换回纯向量检索（更快）就把 enabled 改回 false。
-  enabled: true
+  enabled: false
   backend: "bge"                   # bge | d1 | auto
   model_name: "./models/bge-reranker-base"
   device: "auto"                   # auto 会优先用显卡；纯 CPU 机器会被自动判为 cpu
@@ -323,23 +329,13 @@ decision:
 
 # ------------------ 大语言模型 ------------------
 #
-# backend 决定「模型从哪来」（实现见 src/llm_provider.py）：
-#   local  —— 本地 HuggingFace 权重。需预先下载模型，无 GPU 时较慢。
-#   ollama —— 本机/内网 Ollama 服务。**无需 GPU、无需下载权重**。← 开箱即用推荐
-#   openai —— 任意 OpenAI 兼容接口（DeepSeek / 通义千问 / 智谱 / 硅基流动 /
-#             vLLM / LM Studio …）。只要 base_url + api_key，完全不需要 GPU。
-#
-# 【开箱即用推荐配置】
-#   LLM_BACKEND=ollama && EMBEDDING_BACKEND=ollama
-#   不需要 torch，不需要 GPU，不需要下载权重，一条命令启动：
-#   ollama pull qwen3:4b-instruct-2507-q4_K_M && ollama pull nomic-embed-text && python scripts/quickstart.py
-#
-# 快速切换：
-#   1) 已装 Ollama：    backend 改 "ollama"，执行 `ollama pull qwen3:4b-instruct-2507-q4_K_M`
-#   2) 用云端 API：     backend 改 "openai"，填好下方 openai 段
-#   3) 完全离线推理：   backend 保持 "local"，预先下载 model_name 指向的权重
+# backend 决定「回答如何产生」：
+#   extractive —— 从命中片段抽取原文并附引用，不加载任何 LLM（当前默认）
+#   local      —— 本地 HuggingFace 生成模型（可选，需要 torch）
+#   ollama     —— 本机/内网 Ollama（可选）
+#   openai     —— 任意 OpenAI 兼容接口（可选）
 llm:
-  backend: "ollama"
+  backend: "extractive"
 
   # --- backend: ollama ---
   # model 用 `ollama list` 显示的名字；Ollama 自带 OpenAI 兼容端点。
@@ -402,12 +398,17 @@ llm:
 rag:
   top_k: 4
   use_reranker: false
-  max_context_tokens: 3000
+  max_context_tokens: 1800
   max_history_turns: 3
   score_threshold: 0.0
   answer_citations: true
   return_sources: true
   fallback_answer: "抱歉，知识库中未找到相关信息，无法回答该问题。"
+  # 无 LLM 模式：只返回最相关的若干原文句子，每条均带 [来源编号]。
+  extractive:
+    max_chunks: 3
+    max_sentences_per_chunk: 2
+    max_chars_per_passage: 260
   system_prompt_file: "config/prompts.yaml"
   assistant_name: "小识"
   org_name: "企业知识库"

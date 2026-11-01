@@ -27,6 +27,7 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from api.deps import get_runtime_config
@@ -40,9 +41,7 @@ from src.kb_service import (
     delete_kb,
     delete_session,
     ensure_default_kb,
-    get_kb,
     get_session,
-    kb_quota,
     list_kbs,
     list_messages,
     list_sessions,
@@ -135,7 +134,6 @@ async def api_list_kb(
         items = list_kbs(db, user.id)
         return {
             "knowledge_bases": [_kb_dict(kb) for kb in items],
-            "quota": kb_quota(user.subscription_tier or "free"),
             "total": len(items),
         }
     except Exception as exc:
@@ -149,7 +147,7 @@ async def api_create_kb(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
-    """新建知识库（受套餐 max_kb 限制）。"""
+    """新建知识库。"""
     user: User = current_user
     try:
         kb = create_kb(db, user, body.name, body.description, get_runtime_config())
@@ -223,18 +221,32 @@ async def api_list_sessions(
     user: User = current_user
     try:
         sessions = list_sessions(db, user.id, kb_id=kb_id, limit=limit)
+        session_ids = [session.id for session in sessions]
+        previews: Dict[str, str] = {}
+        if session_ids:
+            ranked = (
+                db.query(
+                    ChatMessage.session_id.label("session_id"),
+                    ChatMessage.content.label("content"),
+                    func.row_number()
+                    .over(
+                        partition_by=ChatMessage.session_id,
+                        order_by=ChatMessage.created_at.desc(),
+                    )
+                    .label("row_number"),
+                )
+                .filter(ChatMessage.session_id.in_(session_ids))
+                .subquery()
+            )
+            previews = {
+                row.session_id: (row.content or "")[:80]
+                for row in db.query(ranked.c.session_id, ranked.c.content)
+                .filter(ranked.c.row_number == 1)
+                .all()
+            }
         out = []
         for s in sessions:
-            preview = None
-            last = (
-                db.query(ChatMessage)
-                .filter(ChatMessage.session_id == s.id)
-                .order_by(ChatMessage.created_at.desc())
-                .first()
-            )
-            if last is not None:
-                preview = (last.content or "")[:80]
-            out.append(_session_dict(s, preview))
+            out.append(_session_dict(s, previews.get(s.id)))
         return {"sessions": out, "total": len(out)}
     except Exception as exc:
         logger.error("列出会话失败: %s", exc)

@@ -10,7 +10,6 @@
 设计要点
 --------
 - ``LOCAL_USER_ID`` 写死，保证换机器/重启后历史数据仍落在同一个身份下；
-- 本地用户给予 enterprise 级额度（这是你自己的机器，不该被配额挡住）；
 - 首次访问时自动建行，之后直接复用。
 """
 from __future__ import annotations
@@ -42,9 +41,6 @@ def get_local_user(db: Session) -> User:
         email=LOCAL_USER_EMAIL,
         is_active=True,
         is_admin=True,
-        subscription_tier="enterprise",
-        max_chunks=-1,
-        max_queries_per_day=-1,
     )
     db.add(user)
     db.commit()

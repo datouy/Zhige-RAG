@@ -15,8 +15,8 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
-from typing import Any, Dict, List, Optional
+from datetime import datetime, timezone
+from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
@@ -282,7 +282,7 @@ def upsert_memory(
         db.add(row)
     else:
         row.mem_value = body.value.strip()
-        row.updated_at = datetime.utcnow() + timedelta(seconds=1)  # 保证排序可见更新
+        row.updated_at = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(seconds=1)  # 保证排序可见更新
     db.commit()
     return {"status": "ok", "key": body.key.strip()}
 

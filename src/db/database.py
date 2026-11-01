@@ -14,10 +14,10 @@ import logging
 import os
 import shutil
 from pathlib import Path
-from typing import Generator, Optional
+from typing import Generator
 
 from sqlalchemy import create_engine, event, inspect, text, Engine
-from sqlalchemy.orm import sessionmaker, Session, declarative_base
+from sqlalchemy.orm import sessionmaker, Session
 from sqlalchemy.pool import NullPool, QueuePool
 
 from .models import Base
@@ -71,13 +71,115 @@ _LIGHT_COLUMN_MIGRATIONS = {
     ],
 }
 
+
+def _migrate_document_record_key() -> None:
+    """把文档台账唯一键从 ``(user_id, source)`` 升级为含知识库的版本。
+
+    ``create_all`` 不会修改既有约束。若不主动迁移，同名文件写入第二个
+    知识库时会撞上旧唯一键，登记异常又被调用方吞掉，最终表现为“上传成功但
+    台账/统计没更新”。SQLite 通过重建表完成约束替换；PostgreSQL 直接替换。
+    """
+    insp = inspect(engine)
+    if "document_records" not in insp.get_table_names():
+        return
+
+    columns = {column["name"] for column in insp.get_columns("document_records")}
+    if "kb_id" not in columns:
+        return
+
+    constraints = insp.get_unique_constraints("document_records")
+    old = next(
+        (
+            item
+            for item in constraints
+            if item.get("column_names") == ["user_id", "source"]
+        ),
+        None,
+    )
+    new = next(
+        (
+            item
+            for item in constraints
+            if item.get("column_names") == ["user_id", "kb_id", "source"]
+        ),
+        None,
+    )
+    if new is not None and old is None:
+        return
+
+    if engine.dialect.name == "sqlite":
+        with engine.begin() as conn:
+            conn.exec_driver_sql("ALTER TABLE document_records RENAME TO document_records_legacy_key")
+            conn.exec_driver_sql(
+                """
+                CREATE TABLE document_records (
+                    id VARCHAR(36) NOT NULL PRIMARY KEY,
+                    user_id VARCHAR(36) NOT NULL,
+                    kb_id VARCHAR(36),
+                    source VARCHAR(512) NOT NULL,
+                    title VARCHAR(512),
+                    doc_status VARCHAR(20) NOT NULL DEFAULT 'active',
+                    acl VARCHAR(512) NOT NULL DEFAULT '*',
+                    department VARCHAR(100),
+                    content_hash VARCHAR(64),
+                    chunk_count INTEGER DEFAULT 0,
+                    file_ext VARCHAR(16),
+                    updated_at_source DATETIME,
+                    created_at DATETIME,
+                    updated_at DATETIME,
+                    CONSTRAINT uq_docrecord_user_kb_source
+                        UNIQUE (user_id, kb_id, source)
+                )
+                """
+            )
+            conn.exec_driver_sql(
+                """
+                INSERT INTO document_records (
+                    id, user_id, kb_id, source, title, doc_status, acl,
+                    department, content_hash, chunk_count, file_ext,
+                    updated_at_source, created_at, updated_at
+                )
+                SELECT
+                    id, user_id, kb_id, source, title, doc_status, acl,
+                    department, content_hash, chunk_count, file_ext,
+                    updated_at_source, created_at, updated_at
+                FROM document_records_legacy_key
+                """
+            )
+            conn.exec_driver_sql("DROP TABLE document_records_legacy_key")
+            conn.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS ix_document_records_user_id "
+                "ON document_records (user_id)"
+            )
+            conn.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS ix_document_records_kb_id "
+                "ON document_records (kb_id)"
+            )
+            conn.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS ix_document_records_content_hash "
+                "ON document_records (content_hash)"
+            )
+    else:
+        with engine.begin() as conn:
+            if old is not None and old.get("name"):
+                conn.exec_driver_sql(
+                    f'ALTER TABLE document_records DROP CONSTRAINT "{old["name"]}"'
+                )
+            if new is None:
+                conn.exec_driver_sql(
+                    "ALTER TABLE document_records ADD CONSTRAINT "
+                    "uq_docrecord_user_kb_source "
+                    "UNIQUE (user_id, kb_id, source)"
+                )
+    _log.info("文档台账唯一键已升级为 (user_id, kb_id, source)")
+
 # 登录/注册时代的遗留结构清理：{表名: [列名]} 与 (表名, ...)
 #
 # 老版本支持注册登录，库里因此有 ``users.password_hash``（NOT NULL）和
 # ``refresh_tokens`` 表。服务现在不需要登录：password_hash 留着不仅无用，
 # 还会让"自动创建本地用户"撞上 NOT NULL 约束直接报错；refresh_tokens
 # 只是一堆死数据。启动时按存在性删除，重复执行安全。
-_LEGACY_COLUMN_CLEANUP = {"users": ["password_hash"]}
+_LEGACY_COLUMN_CLEANUP = {"users": ["password_hash", "subscription_tier", "max_chunks", "max_queries_per_day"]}
 _LEGACY_TABLE_CLEANUP = ("refresh_tokens",)
 
 # 检测是否为 PostgreSQL
@@ -166,6 +268,7 @@ def init_db() -> None:
         except Exception:  # noqa: BLE001
             _log.warning("%s 列迁移跳过（可能已存在）", table, exc_info=True)
 
+    _migrate_document_record_key()
     _cleanup_legacy_auth_schema()
 
 

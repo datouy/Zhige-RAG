@@ -556,8 +556,6 @@ def create_kg_store(config: Dict) -> KGStore:
     backend = (config.get("backend") or "sqlite").lower()
     if backend == "neo4j":
         try:
-            from src.utils import get_logger
-            logger = get_logger("kg.store")
             neo4j_cfg = config.get("neo4j", {})
             store = Neo4jStore(
                 uri=str(neo4j_cfg.get("uri", "bolt://localhost:7687")),

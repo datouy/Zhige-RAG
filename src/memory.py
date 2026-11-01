@@ -37,6 +37,8 @@ _REMEMBER_RE = re.compile(r"记住[：:，,]?\s*(.{2,200})")
 _PROFILE_RE = re.compile(r"(?:我|我们|公司|团队)的\s*([^\s，,。；;：:]{1,12})\s*(?:是|为)\s*([^\s，,。；;]{1,100})")
 # 指代词：命中时触发检索查询改写
 _DEICTIC_RE = re.compile(r"(它|他|她|他们|它们|这个|那个|这些|那些|刚才|上面|上述|之前|继续|还有呢|为什么)")
+# 追问开头：后续问题常省略主语，仅靠"那/那么/还有"衔接上一轮主题
+_FOLLOWUP_START_RE = re.compile(r"^(那|那么|然后|还有|接着|其次|再|另外|嗯|哦|所以)")
 
 
 # ----------------------------------------------------------------------
@@ -134,7 +136,7 @@ class LongTermMemoryStore:
         if not user_id or not key or not value:
             return False
         from .db.models import LongTermMemory
-        from datetime import datetime
+        from datetime import datetime, timezone
 
         db = self._session_factory()
         try:
@@ -148,7 +150,7 @@ class LongTermMemoryStore:
             else:
                 row.mem_value = value
                 row.source = source
-                row.updated_at = datetime.utcnow()
+                row.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
             db.commit()
             return True
         except Exception as exc:  # noqa: BLE001
@@ -247,10 +249,16 @@ def rewrite_query_for_retrieval(query: str, history: List[Dict[str, str]]) -> st
     query = (query or "").strip()
     if not query or not history:
         return query
-    if not _DEICTIC_RE.search(query):
-        return query
     last_user = next((h["content"] for h in reversed(history) if h.get("role") == "user"), "")
     if not last_user or last_user == query:
+        return query
+    # 需要带入上一轮主题的三种情况：含指代词、追问式开头、过短的无主语问句
+    needs_context = (
+        bool(_DEICTIC_RE.search(query))
+        or bool(_FOLLOWUP_START_RE.match(query))
+        or len(query) <= 6
+    )
+    if not needs_context:
         return query
     rewritten = f"{last_user[:80]}；{query}"
     logger.debug("检索查询改写：%r -> %r", query, rewritten)

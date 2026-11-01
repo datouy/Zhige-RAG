@@ -105,7 +105,7 @@ DEFAULT_PROMPTS: Dict[str, str] = {
         "- 若上下文与问题无关或不足以回答，请直接说明无法回答。\n"
         "- 末尾以'参考资料'列出对应的来源编号与标题（不要重复正文中的内容）。"
     ),
-    "cite_block": "[{index}] {title}（来源：{source}，第 {page} 页）",
+    "cite_block": "[{index}] {title}（来源：{source}，第 {page}）",
     "context_chunk": "[{index}] {title}\n{content}",
     "empty_context": (
         "当前知识库中未检索到与问题相关的内容。请尝试：\n"

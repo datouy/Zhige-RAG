@@ -41,7 +41,7 @@ from src.kg import GraphRAG, GraphRetriever, KGExtractor, create_kg_store
 from src.llm import LocalLLM
 from src.rag_pipeline import RAGPipeline
 from src.text_splitter import ChineseTextSplitter, RecursiveTextSplitter
-from src.utils import apply_env_overrides, get_logger, load_config, merge_dict
+from src.utils import apply_env_overrides, get_logger, load_config
 from src.vector_store import ChromaStore, hybrid_kwargs
 
 logger = get_logger("api.deps")

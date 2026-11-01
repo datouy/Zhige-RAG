@@ -9,7 +9,7 @@ import logging
 import os
 import re
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, List, Optional
 
@@ -93,7 +93,7 @@ class JSONFormatter(logging.Formatter):
 
     def format(self, record: logging.LogRecord) -> str:
         log_obj = {
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
             "level": record.levelname,
             "logger": record.name,
             "message": record.getMessage(),
@@ -410,6 +410,9 @@ def apply_env_overrides(cfg: dict) -> dict:
         "OPENAI_MODEL": ("llm", "openai", "model"),
         "EMBEDDING_OPENAI_BASE_URL": ("embedding", "openai", "base_url"),
         "EMBEDDING_OPENAI_MODEL": ("embedding", "openai", "model"),
+        # ---- 存储路径（容器 / 测试环境隔离）----
+        "VECTOR_STORE_PERSIST_DIR": ("vector_store", "persist_directory"),
+        "RAW_DOCS_DIR": ("paths", "raw_docs"),
     }
     for env_key, path in mapping.items():
         val = os.environ.get(env_key)

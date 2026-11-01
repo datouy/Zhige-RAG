@@ -33,15 +33,15 @@ echo [检查] 核心依赖...
 if errorlevel 1 (
     echo [警告] 依赖未安装，是否自动安装？
     echo.
-    echo   1) 快速安装（推荐，使用 Ollama，不需要 GPU）
-    echo   2) 完整安装（包含 torch + 本地模型）
+    echo   1) 轻量安装（推荐：无 LLM、CPU ONNX、无需 GPU）
+    echo   2) 完整安装（文档解析 + 可选界面；仍不含生成式 LLM）
     echo   3) 退出
     echo.
     choice /c 123 /n /m "请选择 [1-3]: "
     
     if errorlevel 3 exit /b 0
     if errorlevel 2 (
-        echo 正在安装完整依赖...
+        echo 正在安装完整依赖（不含生成式 LLM）...
         %PYTHON% -m pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
     ) else (
         echo 正在安装快速依赖...
@@ -49,23 +49,12 @@ if errorlevel 1 (
     )
 )
 
-REM 检查 Ollama
+REM 检查无 LLM 向量模型
 echo.
-echo [检查] Ollama 状态...
-curl -s http://localhost:11434/api/version >nul 2>&1
-if errorlevel 1 (
-    echo [提示] Ollama 未运行
-    echo.
-    echo   推荐安装 Ollama（无需 GPU，完全免费）：
-    echo   - 下载地址：https://ollama.com/download
-    echo   - 模型命令：ollama pull qwen3:4b-instruct-2507-q4_K_M
-    echo   - 模型命令：ollama pull nomic-embed-text
-    echo.
-    echo   或者使用云端 API（需要 API Key）：
-    echo   - 设置环境变量 OPENAI_API_KEY=sk-your-key
-    echo.
-    echo   按任意键继续启动...
-    pause >nul
+echo [检查] 本地 ONNX 向量模型...
+if not exist "models\bge-small-zh-v1.5-onnx\onnx\model_quantized.onnx" (
+    echo [提示] 模型文件缺失，正在下载约 24 MB...
+    %PYTHON% scripts\setup_onnx_embedding.py
 )
 
 REM 启动服务

@@ -8,6 +8,9 @@
 
 from __future__ import annotations
 
+import sys
+import types
+
 import pytest
 
 from src.reranker import BgeReranker
@@ -43,9 +46,9 @@ def test_switches_to_cross_encoder_when_flag_scoring_breaks(monkeypatch):
         def __init__(self, model_name, max_length=None, device=None):
             created["args"] = (model_name, max_length, device)
 
-    import sentence_transformers
-
-    monkeypatch.setattr(sentence_transformers, "CrossEncoder", _StubCrossEncoder, raising=False)
+    fake_module = types.ModuleType("sentence_transformers")
+    fake_module.CrossEncoder = _StubCrossEncoder
+    monkeypatch.setitem(sys.modules, "sentence_transformers", fake_module)
 
     r = _bare_reranker(_BrokenFlagModel())
     r._verify_flag_backend("stub-model")
@@ -56,12 +59,12 @@ def test_switches_to_cross_encoder_when_flag_scoring_breaks(monkeypatch):
 
 
 def test_keeps_flag_backend_when_scoring_works(monkeypatch):
-    import sentence_transformers
-
     def _fail(*_a, **_k):  # pragma: no cover - 正常路径不该走到这里
         raise AssertionError("打分可用时不该构造 CrossEncoder")
 
-    monkeypatch.setattr(sentence_transformers, "CrossEncoder", _fail, raising=False)
+    fake_module = types.ModuleType("sentence_transformers")
+    fake_module.CrossEncoder = _fail
+    monkeypatch.setitem(sys.modules, "sentence_transformers", fake_module)
 
     r = _bare_reranker(_WorkingFlagModel())
     r._verify_flag_backend("stub-model")
@@ -78,5 +81,7 @@ def test_threshold_is_calibrated_for_cross_encoder():
     from src.settings_service import effective_config
 
     rcfg = effective_config().get("reranker") or {}
-    assert rcfg.get("enabled") is True, "本机应开启重排（它决定答案块能否进上下文）"
+    # The current machine uses the LLM-free ONNX profile: a 3.2 GB cross
+    # encoder is disabled so all RAM/VRAM stays available for retrieval/OCR.
+    assert rcfg.get("enabled") is False
     assert float(rcfg.get("min_relevance")) <= 0.1

@@ -22,12 +22,14 @@ from datetime import datetime
 from typing import Any, Dict, Generator, List, Optional
 
 from .embeddings import EmbeddingModel
-from .llm import GenerationConfig, LocalLLM
-from .memory import SESSION_MEMORY, ContextAssembler, rewrite_query_for_retrieval
+from .extractive_answer import build_extractive_answer, iter_answer_chunks
+from .chinese_normalize import normalize_cjk
+from .llm import LocalLLM
+from .memory import ContextAssembler, rewrite_query_for_retrieval
 from .prompt_template import PromptTemplate
 from .query_router import classify_query, is_aggregate_query
 from .reranker import BgeReranker
-from .utils import Timer, get_logger, load_config, merge_dict, resolve_path
+from .utils import Timer, get_logger, load_config, merge_dict
 from .vector_store import ChromaStore, Hit, hybrid_kwargs
 
 logger = get_logger("rag_pipeline")
@@ -53,6 +55,11 @@ DEFAULT_MAX_RETRIES = 2
 # 强词面命中可达 0.7+，不会被误伤；阈值取保守值，只拦截明显无关的查询。
 DEFAULT_MIN_SCORE = 0.25
 
+# 检索结果短 TTL 缓存（秒）：相同查询在窗口内复用，降低重复的 embedding 编码与
+# 向量检索开销。缓存键含 collection 名，多知识库/多租户之间不会串数据。
+RETRIEVAL_CACHE_TTL_SECONDS = 15.0
+RETRIEVAL_CACHE_MAX_ENTRIES = 200
+
 # d1 决策"检索充分性"判定指令（noul 原语）。生成前先问一句"这些片段够不够回答"，
 # 不够就跳过生成直接拒答——用一次毫秒级决策省掉一次自回归生成，也从源头掐掉
 # "没检索到却硬编"的幻觉。这是文章"单次前向决策替代逐 token 生成"的直接落地。
@@ -63,15 +70,30 @@ RETRIEVAL_SUFFICIENCY_INSTRUCTION = (
 )
 
 
-def normalize_query(query: str) -> str:
-    """查询归一化：全角字母/数字/符号 → 半角（NFKC），合并空白。
+_QUERY_FILLER_PREFIX_RE = re.compile(
+    r"^(?:"
+    r"请问一下|请问你|请问您|请问|"
+    r"请帮我查一下|请帮我查查|请帮我查|请帮我看看|请帮我|请告诉我|"
+    r"帮我查一下|帮我查查|帮我查|帮我看看|帮我看下|帮我|"
+    r"麻烦告诉我|麻烦你帮我|麻烦你|麻烦您|麻烦|"
+    r"我想问一下|我想问|我想知道|"
+    r"想请教一下|想请教|"
+    r"告诉我"
+    r")[:：,，。\s]*"
+)
 
-    用户在中文输入法下常打出"ＲＡＧ""１２３"或夹带全角问号——向量编码
-    与 BM25 词法都会因全/半角差异失配，先归一再检索。
+
+def normalize_query(query: str) -> str:
+    """查询归一化：全角→半角（NFKC）、合并空白、剥离中文客套前缀。
+
+    中文用户习惯带"请问 / 我想问 / 帮我查一下"等前缀，这些词对检索无
+    信息量，还会稀释向量与 BM25 的关键词信号；先剥离再检索召回更准。
     """
     if not query:
         return query
     q = unicodedata.normalize("NFKC", query)
+    q = normalize_cjk(q)
+    q = _QUERY_FILLER_PREFIX_RE.sub("", q)
     return re.sub(r"\s+", " ", q).strip()
 
 
@@ -141,6 +163,9 @@ class RAGPipeline:
         self._llm_holder: Dict[str, Any] = {"llm": llm}
         # 懒加载只允许一个线程真正动手，其余等待复用，避免并发首问各自加载。
         self._llm_load_lock = threading.Lock()
+        # 检索短 TTL 缓存：键含 collection 名，防止跨库/跨租户复用
+        self._retrieval_cache: Dict[Any, tuple[float, List[Hit]]] = {}
+        self._retrieval_cache_lock = threading.Lock()
         self.reranker = reranker
         # d1 决策层（可选）：驱动重排 / 路由 / 校验三处增强。
         # 显式注入优先；未注入时 _get_decision_provider 按配置懒加载。
@@ -309,6 +334,58 @@ class RAGPipeline:
             acl_groups=allowed_groups if retrieval_cfg.get("acl_filter", True) else None,
         )
 
+    def _cached_vector_query(
+        self, query_text: str, top_k: int, security_where: Optional[Dict[str, Any]]
+    ) -> List[Hit]:
+        """带短 TTL 缓存的向量检索；失败时降级为未命中（返回空列表）。"""
+        import json
+
+        score_threshold = float(
+            self.config.get("retrieval", {}).get("score_threshold", 0.0) or 0.0
+        )
+        key = (
+            getattr(self.vector_store, "collection_name", ""),
+            query_text,
+            int(top_k),
+            json.dumps(security_where, sort_keys=True, default=str, ensure_ascii=False),
+            score_threshold,
+        )
+        now = time.time()
+        lock = getattr(self, "_retrieval_cache_lock", None)
+        cache = getattr(self, "_retrieval_cache", None)
+        if lock is None or cache is None:
+            lock = threading.Lock()
+            cache = {}
+            self._retrieval_cache_lock = lock
+            self._retrieval_cache = cache
+        with lock:
+            entry = cache.get(key)
+            if entry is not None and now - entry[0] < RETRIEVAL_CACHE_TTL_SECONDS:
+                return entry[1]
+
+        try:
+            with Timer("retrieve"):
+                hits = self.vector_store.query(
+                    query_text=query_text,
+                    top_k=top_k,
+                    where=security_where,
+                    score_threshold=score_threshold,
+                )
+        except Exception as exc:  # noqa: BLE001 - Chroma 不可读时降级为未命中
+            logger.error("向量检索失败，已降级为未命中（查询：%s）: %s", query_text[:50], exc)
+            return []
+
+        with lock:
+            cache[key] = (now, hits)
+            if len(cache) > RETRIEVAL_CACHE_MAX_ENTRIES:
+                expired = [
+                    k for k, v in cache.items()
+                    if now - v[0] >= RETRIEVAL_CACHE_TTL_SECONDS
+                ]
+                for k in expired:
+                    cache.pop(k, None)
+        return hits
+
     def _retrieve(
         self,
         query: str,
@@ -318,13 +395,9 @@ class RAGPipeline:
     ) -> List[Hit]:
         security_where = self._security_where(where, allowed_groups)
         norm_query = normalize_query(query)
-        with Timer("retrieve"):
-            hits = self.vector_store.query(
-                query_text=self._apply_query_instruction(norm_query),
-                top_k=top_k,
-                where=security_where,
-                score_threshold=self.config.get("retrieval", {}).get("score_threshold", 0.0),
-            )
+        hits = self._cached_vector_query(
+            self._apply_query_instruction(norm_query), top_k, security_where
+        )
         # 旧索引兼容：doc_status 过滤导致全空时回退一次（仅状态过滤，ACL 不回退）
         if (
             not hits
@@ -514,7 +587,6 @@ class RAGPipeline:
         md = best.metadata or {}
         prefix = str(md.get("chunk_prefix") or md.get("breadcrumb") or "")
         section = prefix.split("｜")[0].split(" > ")[-1].strip() or "编号条目列表"
-        src = str(md.get("source") or "知识库文档")
         span_m = re.search(r"\[(\d+)\]\s*-\s*\[(\d+)\]", prefix)
         span = f"（编号[{span_m.group(1)}]-[{span_m.group(2)}]）" if span_m else ""
         # 注意：不要把文件名拼进答案——文件名不在分块文本里，会让 verifier
@@ -627,6 +699,10 @@ class RAGPipeline:
         模型实例存在共享的 ``_llm_holder`` 里：任何副本加载完成后，其它
         副本（以及后续请求新建的副本）直接复用，不再重复读权重 / 重新量化。
         """
+        if self._is_extractive_mode():
+            raise RuntimeError(
+                "当前为 extractive（无 LLM）模式，不应加载生成式模型。"
+            )
         if self.llm is not None:
             return
         holder = getattr(self, "_llm_holder", None)
@@ -764,11 +840,14 @@ class RAGPipeline:
         cites: List[Dict[str, Any]] = []
         for c in chunks:
             meta = c.get("metadata", {}) or {}
+            raw_page = meta.get("page", "—")
+            ext = str(meta.get("ext") or "").lower()
+            page_label = f"{raw_page} 页" if ext == ".pdf" else f"{raw_page} 节"
             cite_text = self.prompts.format_citation(
                 index=c["index"],
                 title=c["title"],
                 source=str(meta.get("source") or meta.get("filepath") or "未知"),
-                page=meta.get("page", "—"),
+                page=page_label,
             )
             cites.append(
                 {
@@ -785,6 +864,58 @@ class RAGPipeline:
                 }
             )
         return cites
+
+    def _is_extractive_mode(self) -> bool:
+        """Whether answers should be assembled from retrieved text.
+
+        ``extractive`` is the LLM-free deployment mode. It keeps citations,
+        retrieval, access control, graph augmentation, and streaming intact,
+        while avoiding every generative model call.
+        """
+        backend = str((self.config.get("llm") or {}).get("backend", "local"))
+        return backend.strip().lower() in {"extractive", "none", "disabled"}
+
+    def _build_extractive_result(
+        self,
+        question: str,
+        context_chunks: List[Dict[str, Any]],
+        hits: List[Hit],
+    ) -> RAGResult:
+        """Create a cited answer from the strongest retrieved sentences."""
+        extract_cfg = (self.config.get("rag") or {}).get("extractive") or {}
+        max_chunks = max(1, int(extract_cfg.get("max_chunks", 3)))
+        answer_chunks = context_chunks[:max_chunks]
+        answer = build_extractive_answer(
+            question,
+            answer_chunks,
+            max_chunks=max_chunks,
+            max_sentences_per_chunk=int(
+                extract_cfg.get("max_sentences_per_chunk", 2)
+            ),
+            max_chars_per_passage=int(
+                extract_cfg.get("max_chars_per_passage", 260)
+            ),
+        ).strip()
+        fallback = (self.config.get("rag") or {}).get(
+            "fallback_answer", FALLBACK_NO_HIT_ANSWER
+        )
+        if not answer:
+            answer = fallback
+            answer_chunks = []
+        result = RAGResult(
+            answer=answer,
+            sources=self._format_citations(answer_chunks),
+            raw_hits=hits,
+            timings={
+                "llm_total_ms": 0.0,
+                "ttft_ms": 0.0,
+                "tokens_generated": 0,
+                "tokens_per_sec": None,
+                "answer_mode": "extractive",
+            },
+        )
+        result.verification = self._verify(answer, answer_chunks)
+        return result
 
     # ------------------------------------------------------------------
     def answer(
@@ -825,7 +956,6 @@ class RAGPipeline:
                 return _cc_gen()
             return RAGResult(answer=reply, sources=[], raw_hits=[], timings={"llm_total_ms": 0.0})
 
-        self.ensure_llm()
         retrieval_cfg = self.config.get("retrieval", {})
         k = top_k or retrieval_cfg.get("top_k", 5)
         # 重排候选数 = max(k, top_n*3)
@@ -885,6 +1015,20 @@ class RAGPipeline:
         max_ctx = rag_cfg.get("max_context_tokens", 2048)
         context_chunks, _ctx_str = self._build_context(hits, max_chars=max_ctx * 2)  # 中文字符与 token 约 2:1
         context_chunks = self._augment_with_graph(question, context_chunks)
+
+        if self._is_extractive_mode():
+            result = self._build_extractive_result(question, context_chunks, hits)
+            if stream:
+                def _extractive_gen(_r=result):
+                    for piece in iter_answer_chunks(_r.answer):
+                        yield piece
+                    return _r
+                return _extractive_gen()
+            return result
+
+        # 只有确定需要自回归生成时才加载 LLM；未命中、拒答和结构化答案
+        # 不应为首个无效请求付出模型加载成本。
+        self.ensure_llm()
         long_term = self._recall_long_term(user_id)
         messages = self.context_assembler.build(
             question,
@@ -987,7 +1131,6 @@ class RAGPipeline:
                 timings={"llm_total_ms": 0.0, "ttft_ms": 0.0, "tokens_generated": 0, "tokens_per_sec": None},
             )
 
-        self.ensure_llm()
         k = top_k or retrieval_cfg.get("top_k", 5)
         if self.reranker is not None:
             initial_k = max(k, retrieval_cfg.get("rerank_candidates", k * 3))
@@ -1047,6 +1190,10 @@ class RAGPipeline:
         max_ctx = rag_cfg.get("max_context_tokens", 2048)
         context_chunks, _ctx_str = self._build_context(hits, max_chars=max_ctx * 2)
         context_chunks = self._augment_with_graph(question, context_chunks)
+        if self._is_extractive_mode():
+            return self._build_extractive_result(question, context_chunks, hits)
+
+        self.ensure_llm()
         messages = self.context_assembler.build(
             question,
             context_chunks,
@@ -1149,7 +1296,6 @@ class RAGPipeline:
             yield {"event": "done", "data": [], "verification": None}
             return
 
-        self.ensure_llm()
         search_query = (
             rewrite_query_for_retrieval(question, history)
             if self.context_assembler.enabled and history
@@ -1194,6 +1340,18 @@ class RAGPipeline:
             yield {"event": "done", "data": cites, "verification": self._verify(fallback, [])}
             return
 
+        if self._is_extractive_mode():
+            result = self._build_extractive_result(question, context_chunks, hits)
+            for piece in iter_answer_chunks(result.answer):
+                yield {"event": "token", "data": piece}
+            yield {
+                "event": "done",
+                "data": result.sources,
+                "verification": result.verification,
+            }
+            return
+
+        self.ensure_llm()
         messages = self.context_assembler.build(
             question,
             context_chunks,

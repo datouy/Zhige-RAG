@@ -21,9 +21,8 @@
 from __future__ import annotations
 
 import os
-import time
 import functools
-from typing import Callable, Optional, Any
+from typing import Callable, Optional
 from contextlib import contextmanager
 
 try:

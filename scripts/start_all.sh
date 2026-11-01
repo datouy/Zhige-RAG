@@ -42,9 +42,8 @@ python -m streamlit run ui/app.py --server.port 8501 \
 FRONTEND_PID=$!
 echo "      前端 PID: $FRONTEND_PID"
 
-# ---------- LLM 预加载 ----------
-echo "[3/3] 后台预加载 LLM 模型 ..."
-python scripts/preload_llm.py > logs/preload.log 2>&1 &
+# LLM-free mode: no generative model preload. ONNX embedding is warmed by the API.
+echo "[3/3] 无 LLM 模式：跳过生成模型预加载"
 PRELOAD_PID=$!
 echo "      预加载 PID: $PRELOAD_PID"
 

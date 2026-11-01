@@ -6,7 +6,6 @@
 
 模块清单
 --------
-- ``subscription`` : 订阅 / 套餐路由
 - ``system``       : 健康 / 就绪 / 指标 / 配置
 - ``chat``         : 检索 / 同步问答 / 入库 / WebSocket 流式问答
 - ``kg``           : 知识图谱 / GraphRAG（含 cypher 注入防护）
@@ -23,7 +22,6 @@ from .feedback import router as feedback_router
 from .kb import router as kb_router
 from .kg import router as kg_router
 from .settings import router as settings_router
-from .subscription import router as subscription_router
 from .system import router as system_router
 
 __all__ = [
@@ -34,6 +32,5 @@ __all__ = [
     "kb_router",
     "kg_router",
     "settings_router",
-    "subscription_router",
     "system_router",
 ]

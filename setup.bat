@@ -40,14 +40,12 @@ echo ┌────────────────────────
 echo │  请选择安装模式：                                        │
 echo ├─────────────────────────────────────────────────────────┤
 echo │                                                         │
-echo │  1) 快速安装（推荐，使用 Ollama，无需 GPU）              │
-echo │     - 约 500MB 依赖                                      │
-echo │     - 需要安装 Ollama（约 200MB）                        │
+echo │  1) 轻量安装（推荐：无 LLM，CPU ONNX，无需 GPU）        │
+echo │     - 含 Web/API、文档解析、中文 BM25 与向量检索         │
+echo │     - 不需要 Ollama / torch                              │
 echo │                                                         │
-echo │  2) 完整安装（包含 torch + 本地模型）                   │
-echo │     - 约 3-5GB 依赖                                      │
-echo │     - 不需要 Ollama                                      │
-echo │     - 需要 GPU 才能流畅运行                              │
+echo │  2) 完整安装（增加 OCR 与可选界面）                      │
+echo │     - 仍然不需要 LLM / torch                             │
 echo │                                                         │
 echo │  3) 仅检查环境                                          │
 echo │                                                         │
@@ -66,36 +64,6 @@ if errorlevel 1 goto :quick_install
 echo.
 echo [安装] 快速安装模式
 echo.
-
-REM 检查 Ollama
-where ollama >nul 2>&1
-if errorlevel 1 (
-    echo [提示] Ollama 未安装
-    echo.
-    echo   Ollama 是推荐使用的模型运行方式：
-    echo   - 无需 GPU，CPU 即可运行
-    echo   - 完全免费开源
-    echo   - 支持 qwen、llama 等多种模型
-    echo.
-    echo   下载地址：https://ollama.com/download
-    echo.
-    set OLLAMA_INSTALL=
-    choice /c yn /n /m "是否现在跳过 Ollama 安装？[y/n]: "
-    if errorlevel 2 goto :skip_ollama
-    echo   请先安装 Ollama，然后重新运行本脚本
-    pause
-    exit /b 0
-    :skip_ollama
-) else (
-    echo [OK] Ollama 已安装
-    REM 检查 Ollama 是否运行
-    curl -s http://localhost:11434/api/version >nul 2>&1
-    if errorlevel 1 (
-        echo [提示] Ollama 未运行，建议启动：ollama serve
-    ) else (
-        echo [OK] Ollama 服务正在运行
-    )
-)
 
 REM 创建虚拟环境
 echo.
@@ -129,6 +97,10 @@ if errorlevel 1 (
 )
 echo [OK] 核心依赖安装完成
 
+echo.
+echo [模型] 准备本地 ONNX 向量模型...
+.venv\Scripts\python.exe scripts\setup_onnx_embedding.py
+
 REM 复制 .env 文件
 if not exist ".env" (
     echo.
@@ -143,22 +115,11 @@ echo.
 echo   安装完成！
 echo.
 echo   下一步：
-if not exist ".venv\Scripts\ollama.exe" (
-    if not where ollama >nul 2>&1 (
-        echo   1) 安装 Ollama: https://ollama.com/download
-    )
-)
-echo   1) 下载模型（如果使用 Ollama）：
-echo      ollama pull qwen3:4b-instruct-2507-q4_K_M
-echo      ollama pull nomic-embed-text
-echo.
-echo   2) 启动知阁：
+echo   1) 启动知阁：
 echo      双击 start.bat
 echo      或运行：python scripts\quickstart.py
 echo.
-echo   或使用云端 API：
-echo   - 编辑 .env 文件，填入 OPENAI_API_KEY
-echo   - 设置 LLM_BACKEND=openai
+echo   默认回答模式为原文摘录，不加载 LLM。
 echo.
 echo ═════════════════════════════════════════════════════════════
 pause
@@ -185,17 +146,15 @@ echo [安装] 升级 pip...
 .venv\Scripts\python.exe -m pip install --upgrade pip -i https://pypi.tuna.tsinghua.edu.cn/simple >nul 2>&1
 echo [OK] pip 已升级
 
-REM 安装 torch
-echo.
-echo [安装] 安装 PyTorch（可能需要较长时间）...
-.venv\Scripts\python.exe -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118 -i https://pypi.tuna.tsinghua.edu.cn/simple
-echo [OK] PyTorch 安装完成
-
 REM 安装完整依赖
 echo.
 echo [安装] 安装完整依赖...
-.venv\Scripts\python.exe -m pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+.venv\Scripts\python.exe -m pip install -r requirements.txt -r requirements-ocr.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 echo [OK] 完整依赖安装完成
+
+echo.
+echo [模型] 准备本地 ONNX 向量模型...
+.venv\Scripts\python.exe scripts\setup_onnx_embedding.py
 
 REM 复制 .env 文件
 if not exist ".env" (
@@ -212,7 +171,7 @@ echo   安装完成！
 echo.
 echo   下一步：
 echo   1) 双击 start.bat 或运行：python scripts\quickstart.py
-echo   2) 系统会自动下载所需的模型权重
+echo   2) 默认使用本地 ONNX 向量模型，不需要生成式 LLM
 echo.
 echo ═════════════════════════════════════════════════════════════
 pause
@@ -235,18 +194,11 @@ if exist ".venv" (
 )
 
 echo.
-echo [检查] Ollama...
-where ollama >nul 2>&1
-if errorlevel 1 (
-    echo [提示] Ollama 未安装
+echo [检查] 本地 ONNX 向量模型...
+if exist "models\bge-small-zh-v1.5-onnx\onnx\model_quantized.onnx" (
+    echo [OK] 模型文件已就绪
 ) else (
-    echo [OK] Ollama 已安装
-    curl -s http://localhost:11434/api/version >nul 2>&1
-    if errorlevel 1 (
-        echo [提示] Ollama 未运行（运行 ollama serve 启动）
-    ) else (
-        echo [OK] Ollama 服务运行中
-    )
+    echo [提示] 模型文件缺失，运行 scripts\setup_onnx_embedding.py
 )
 
 echo.

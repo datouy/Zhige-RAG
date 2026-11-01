@@ -6,15 +6,22 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+
+class _StrictModel(BaseModel):
+    """配置模型默认拒绝未知字段，避免拼写错误静默失效。"""
+
+    model_config = ConfigDict(
+        extra="forbid", validate_assignment=True, str_strip_whitespace=True
+    )
 
 
 # ======================== 数据库配置 ========================
 
-class DatabaseConfig(BaseModel):
+class DatabaseConfig(_StrictModel):
     """数据库配置模型。"""
     url: Optional[str] = Field(None, description="数据库连接 URL")
     pool_size: int = Field(20, ge=1, le=100, description="连接池大小")
@@ -26,25 +33,30 @@ class DatabaseConfig(BaseModel):
 
 # ======================== LLM 配置 ========================
 
-class LLMQuantizationConfig(BaseModel):
+class LLMQuantizationConfig(_StrictModel):
     """LLM 量化配置。"""
     enabled: bool = Field(False, description="是否启用量化")
     quant_type: str = Field("nf4", description="量化类型")
     compute_dtype: str = Field("float16", description="计算数据类型")
     double_quant: bool = Field(True, description="是否双重量化")
+    cache_dir: Optional[str] = Field(None, description="量化权重缓存目录")
 
 
-class LLMGenerationConfig(BaseModel):
+class LLMGenerationConfig(_StrictModel):
     """LLM 生成参数配置。"""
     max_new_tokens: int = Field(512, ge=1, le=4096, description="最大生成 token 数")
     temperature: float = Field(0.2, ge=0.0, le=2.0, description="采样温度")
     top_p: float = Field(0.9, ge=0.0, le=1.0, description="Top-p 采样")
     repetition_penalty: float = Field(1.0, ge=1.0, le=2.0, description="重复惩罚")
     do_sample: bool = Field(True, description="是否采样")
+    stream: bool = Field(True, description="是否默认流式输出")
 
 
-class LLMConfig(BaseModel):
+class LLMConfig(_StrictModel):
     """LLM 配置模型。"""
+    backend: str = Field("local", description="local / ollama / openai")
+    ollama: Dict[str, Any] = Field(default_factory=dict)
+    openai: Dict[str, Any] = Field(default_factory=dict)
     model_name: str = Field(..., description="模型名称或路径")
     model_path: Optional[str] = Field("", description="本地模型路径")
     device: str = Field("auto", description="设备类型")
@@ -57,12 +69,18 @@ class LLMConfig(BaseModel):
     chat_template: str = Field("auto", description="聊天模板类型")
     quantization: LLMQuantizationConfig = Field(default_factory=LLMQuantizationConfig)
     generation: LLMGenerationConfig = Field(default_factory=LLMGenerationConfig)
+    timeout: float = Field(120.0, gt=0, description="请求超时（秒）")
+    max_retries: int = Field(2, ge=0, le=10)
 
 
 # ======================== Embedding 配置 ========================
 
-class EmbeddingConfig(BaseModel):
+class EmbeddingConfig(_StrictModel):
     """Embedding 配置模型。"""
+    backend: str = Field("onnx", description="onnx / local / ollama / openai")
+    onnx: Dict[str, Any] = Field(default_factory=dict)
+    ollama: Dict[str, Any] = Field(default_factory=dict)
+    openai: Dict[str, Any] = Field(default_factory=dict)
     model_name: str = Field(..., description="Embedding 模型名称")
     device: str = Field("auto", description="设备类型")
     batch_size: int = Field(32, ge=1, le=256, description="批处理大小")
@@ -76,7 +94,7 @@ class EmbeddingConfig(BaseModel):
 
 # ======================== 向量存储配置 ========================
 
-class VectorStoreConfig(BaseModel):
+class VectorStoreConfig(_StrictModel):
     """向量存储配置模型。"""
     backend: str = Field("chroma", description="向量存储后端")
     collection_name: str = Field("chinese_rag_kb", description="集合名称")
@@ -84,6 +102,8 @@ class VectorStoreConfig(BaseModel):
     distance_fn: str = Field("cosine", description="距离函数")
     top_k: int = Field(4, ge=1, le=100, description="默认 top-k")
     fetch_k: int = Field(20, ge=1, le=500, description="获取数量")
+    filter_metadata: Dict[str, Any] = Field(default_factory=dict)
+    hybrid: Dict[str, Any] = Field(default_factory=dict)
     
     @field_validator("distance_fn")
     @classmethod
@@ -96,7 +116,7 @@ class VectorStoreConfig(BaseModel):
 
 # ======================== RAG 配置 ========================
 
-class RAGConfig(BaseModel):
+class RAGConfig(_StrictModel):
     """RAG 配置模型。"""
     top_k: int = Field(4, ge=1, le=50, description="检索 top-k")
     use_reranker: bool = Field(False, description="是否使用重排序")
@@ -106,11 +126,16 @@ class RAGConfig(BaseModel):
     answer_citations: bool = Field(True, description="是否包含引用")
     return_sources: bool = Field(True, description="是否返回来源")
     fallback_answer: str = Field("抱歉，知识库中未找到相关信息，无法回答该问题。", description="默认回复")
+    extractive: Dict[str, Any] = Field(default_factory=dict)
+    system_prompt_file: str = Field("config/prompts.yaml")
+    assistant_name: str = Field("小识")
+    org_name: str = Field("企业知识库")
+    verification: Dict[str, Any] = Field(default_factory=dict)
 
 
 # ======================== CORS 配置 ========================
 
-class CORSConfig(BaseModel):
+class CORSConfig(_StrictModel):
     """CORS 配置模型。"""
     allowed_origins: List[str] = Field(
         default_factory=lambda: [
@@ -134,25 +159,29 @@ class CORSConfig(BaseModel):
 
 # ======================== 知识图谱配置 ========================
 
-class KnowledgeGraphConfig(BaseModel):
+class KnowledgeGraphConfig(_StrictModel):
     """知识图谱配置模型。"""
     enabled: bool = Field(True, description="是否启用知识图谱")
     backend: str = Field("sqlite", description="存储后端")
     sqlite_path: str = Field("data/kg.db", description="SQLite 数据库路径")
     max_entities_per_chunk: int = Field(20, ge=1, le=100, description="每块最大实体数")
     max_relations_per_chunk: int = Field(30, ge=1, le=100, description="每块最大关系数")
+    neo4j: Dict[str, Any] = Field(default_factory=dict)
+    extractor: Dict[str, Any] = Field(default_factory=dict)
+    retriever: Dict[str, Any] = Field(default_factory=dict)
+    graph_rag: Dict[str, Any] = Field(default_factory=dict)
 
 
 # ======================== 主配置模型 ========================
 
-class ProjectConfig(BaseModel):
+class ProjectConfig(_StrictModel):
     """项目配置。"""
     name: str = Field("ChineseRAGKB", description="项目名称")
     version: str = Field("0.1.0", description="版本号")
     description: Optional[str] = Field(None, description="项目描述")
 
 
-class PathsConfig(BaseModel):
+class PathsConfig(_StrictModel):
     """路径配置。"""
     raw_docs: str = Field("data/raw", description="原始文档目录")
     chroma_db: str = Field("data/chroma_db", description="向量库目录")
@@ -160,7 +189,7 @@ class PathsConfig(BaseModel):
     logs: str = Field("logs", description="日志目录")
 
 
-class DocumentLoaderConfig(BaseModel):
+class DocumentLoaderConfig(_StrictModel):
     """文档加载器配置。"""
     supported_extensions: List[str] = Field(
         default_factory=lambda: [".pdf", ".docx", ".md", ".markdown", ".txt"],
@@ -170,14 +199,21 @@ class DocumentLoaderConfig(BaseModel):
     encoding: str = Field("utf-8", description="文本编码")
     clean_text: bool = Field(True, description="是否清洗文本")
     max_pdf_pages: int = Field(1000, ge=1, description="最大 PDF 页数")
+    markdown_extensions: List[str] = Field(default_factory=list)
+    ocr: Dict[str, Any] = Field(default_factory=dict)
+    url: Dict[str, Any] = Field(default_factory=dict)
 
 
-class TextSplitterConfig(BaseModel):
+class TextSplitterConfig(_StrictModel):
     """文本分块配置。"""
     strategy: str = Field("chinese", description="分块策略")
     chunk_size: int = Field(300, ge=50, le=2000, description="块大小")
     chunk_overlap: int = Field(50, ge=0, le=500, description="块重叠")
     min_chunk_size: int = Field(50, ge=1, description="最小块大小")
+    chinese_separators: List[str] = Field(default_factory=list)
+    separators: List[str] = Field(default_factory=list)
+    keep_separator: bool = True
+    strip_whitespace: bool = True
     
     @model_validator(mode="after")
     def validate_overlap(self) -> "TextSplitterConfig":
@@ -186,24 +222,31 @@ class TextSplitterConfig(BaseModel):
         return self
 
 
-class RetrievalConfig(BaseModel):
+class RetrievalConfig(_StrictModel):
     """检索配置。"""
     top_k: int = Field(4, ge=1, le=50, description="检索 top-k")
     rerank_candidates: int = Field(12, ge=1, le=100, description="重排候选数")
     score_threshold: float = Field(0.0, ge=0.0, le=1.0, description="相似度阈值")
+    min_score: float = Field(0.0, ge=0.0, le=1.0)
+    status_filter: bool = True
+    status_filter_fallback: bool = True
+    acl_filter: bool = True
 
 
-class RerankerConfig(BaseModel):
+class RerankerConfig(_StrictModel):
     """重排序配置。"""
     enabled: bool = Field(False, description="是否启用")
+    backend: str = Field("bge")
     model_name: str = Field("BAAI/bge-reranker-base", description="模型名称")
     device: str = Field("cuda", description="设备类型")
     top_n: int = Field(3, ge=1, le=20, description="重排返回数")
     max_length: int = Field(512, ge=64, le=2048, description="最大长度")
     cache_dir: Optional[str] = Field(None, description="缓存目录")
+    min_relevance: float = Field(0.05, ge=0.0, le=1.0)
+    max_candidates: int = Field(24, ge=1, le=500)
 
 
-class UIConfig(BaseModel):
+class UIConfig(_StrictModel):
     """UI 配置。"""
     title: str = Field("中文个人知识库 RAG", description="标题")
     page_icon: str = Field("📚", description="页面图标")
@@ -213,9 +256,18 @@ class UIConfig(BaseModel):
     show_thinking: bool = Field(False, description="显示思考过程")
     max_upload_mb: int = Field(50, ge=1, description="最大上传大小（MB）")
     max_chat_history: int = Field(20, ge=0, description="最大对话历史")
+    allowed_upload_types: List[str] = Field(default_factory=list)
 
 
-class EvaluationConfig(BaseModel):
+class MemoryConfig(_StrictModel):
+    enabled: bool = True
+    session_turns: int = Field(3, ge=0, le=50)
+    session_ttl_minutes: float = Field(30.0, gt=0)
+    retrieval_rewrite: bool = True
+    long_term_inject_limit: int = Field(10, ge=0, le=100)
+
+
+class EvaluationConfig(_StrictModel):
     """评估配置。"""
     retrieval_top_k: int = Field(5, ge=1, description="检索 top-k")
     judge_model: str = Field("", description="评判模型")
@@ -232,7 +284,7 @@ class EvaluationConfig(BaseModel):
     )
 
 
-class ConfigSchema(BaseModel):
+class ConfigSchema(_StrictModel):
     """主配置 Schema。"""
     project: ProjectConfig = Field(default_factory=ProjectConfig)
     app: Dict[str, str] = Field(default_factory=dict)
@@ -241,19 +293,17 @@ class ConfigSchema(BaseModel):
     text_splitter: TextSplitterConfig = Field(default_factory=TextSplitterConfig)
     embedding: EmbeddingConfig = Field(default_factory=EmbeddingConfig)
     vector_store: VectorStoreConfig = Field(default_factory=VectorStoreConfig)
+    data_quality: Dict[str, Any] = Field(default_factory=dict)
     retrieval: RetrievalConfig = Field(default_factory=RetrievalConfig)
     reranker: RerankerConfig = Field(default_factory=RerankerConfig)
+    decision: Dict[str, Any] = Field(default_factory=dict)
     llm: LLMConfig = Field(default_factory=LLMConfig)
     rag: RAGConfig = Field(default_factory=RAGConfig)
+    memory: MemoryConfig = Field(default_factory=MemoryConfig)
     evaluation: EvaluationConfig = Field(default_factory=EvaluationConfig)
     ui: UIConfig = Field(default_factory=UIConfig)
     knowledge_graph: KnowledgeGraphConfig = Field(default_factory=KnowledgeGraphConfig)
     cors: CORSConfig = Field(default_factory=CORSConfig)
-    
-    class Config:
-        extra = "allow"  # 允许额外字段（向后兼容）
-        validate_assignment = True
-        str_strip_whitespace = True
 
 
 def validate_config(config_dict: dict) -> ConfigSchema:

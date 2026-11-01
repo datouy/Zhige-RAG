@@ -37,7 +37,6 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Optional
 
 
 # 写关键字黑名单（大小写无关；字边界匹配）。

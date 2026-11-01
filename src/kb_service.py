@@ -10,18 +10,17 @@
 本模块把两者提升为**用户可见的一等实体**，并负责：
 
 - collection 命名与隔离（保证升级不破坏已有向量数据）；
-- 各套餐的知识库数量配额（复用 ``models.SUBSCRIPTION_TIERS`` 的 ``max_kb``）；
 - 会话与消息的读写，供 API 与前端使用。
 """
 from __future__ import annotations
 
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from sqlalchemy.orm import Session
 
-from src.db.models import ChatMessage, ChatSession, DocumentRecord, KnowledgeBase, User, get_tier_limits
+from src.db.models import ChatMessage, ChatSession, DocumentRecord, KnowledgeBase, User
 from src.factories import _sanitize_user_id
 from src.utils import get_logger, resolve_path
 
@@ -69,11 +68,6 @@ def collection_name_for(
 # ----------------------------------------------------------------------
 #  知识库 CRUD
 # ----------------------------------------------------------------------
-def kb_quota(tier: str) -> int:
-    """返回该套餐允许的知识库数量（-1 表示不限）。"""
-    return int(get_tier_limits(tier).get("max_kb", 1))
-
-
 def list_kbs(db: Session, user_id: str) -> List[KnowledgeBase]:
     """列出用户的知识库（默认库排在最前）。"""
     return (
@@ -149,7 +143,7 @@ def ensure_default_kb(
 def create_kb(
     db: Session, user: User, name: str, description: str, cfg: Dict[str, Any]
 ) -> KnowledgeBase:
-    """新建知识库（受套餐 ``max_kb`` 限制）。"""
+    """新建知识库。"""
     name = (name or "").strip()
     if not name:
         raise KBError("知识库名称不能为空")
@@ -166,16 +160,8 @@ def create_kb(
     ):
         raise KBError(f"已存在同名知识库：{name}")
 
-    # 确保默认库存在后再判断配额，避免"第一个库"也被算作超额
+    # 确保默认库存在后再创建新库
     ensure_default_kb(db, user.id, cfg)
-
-    limit = kb_quota(user.subscription_tier or "free")
-    current = db.query(KnowledgeBase).filter(KnowledgeBase.user_id == user.id).count()
-    if limit != -1 and current >= limit:
-        raise KBError(
-            f"当前套餐（{user.subscription_tier}）最多创建 {limit} 个知识库，"
-            f"请升级套餐或删除不再需要的知识库"
-        )
 
     base_collection = (cfg.get("vector_store") or {}).get("collection_name", "chinese_rag_kb")
     kb = KnowledgeBase(
@@ -328,8 +314,13 @@ def _drop_collection(collection_name: str, cfg: Dict[str, Any]) -> bool:
         return False
 
 
-def refresh_kb_stats(db: Session, user_id: str, kb_id: str) -> KnowledgeBase:
-    """重算知识库的文档数/分块数统计。"""
+def refresh_kb_stats(
+    db: Session, user_id: str, kb_id: str, *, commit: bool = True
+) -> KnowledgeBase:
+    """重算知识库的文档数/分块数统计。
+
+    ``commit=False`` 供跨向量/数据库补偿事务使用，由调用方统一提交。
+    """
     kb = get_kb(db, user_id, kb_id)
     rows = (
         db.query(DocumentRecord)
@@ -338,7 +329,10 @@ def refresh_kb_stats(db: Session, user_id: str, kb_id: str) -> KnowledgeBase:
     )
     kb.doc_count = len(rows)
     kb.chunk_count = int(sum((r.chunk_count or 0) for r in rows))
-    db.commit()
+    if commit:
+        db.commit()
+    else:
+        db.flush()
     db.refresh(kb)
     return kb
 
@@ -462,7 +456,7 @@ def append_message(
     )
     if session is not None:
         session.message_count = (session.message_count or 0) + 1
-        session.last_message_at = datetime.utcnow()
+        session.last_message_at = datetime.now(timezone.utc).replace(tzinfo=None)
         # 首条用户消息自动成为标题（用户体验：无需手动命名）
         if role == "user" and (session.title in ("", "新会话")):
             session.title = _auto_title(content)
@@ -506,7 +500,6 @@ __all__ = [
     "ensure_session",
     "get_kb",
     "get_session",
-    "kb_quota",
     "list_kbs",
     "list_messages",
     "list_sessions",

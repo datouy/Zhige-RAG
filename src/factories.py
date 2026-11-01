@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 import hashlib
+import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 from threading import Lock
@@ -26,6 +27,12 @@ logger = get_logger("factories")
 def _project_root() -> Path:
     """项目根目录（src/factories.py 的上两级），保证相对路径不依赖 CWD。"""
     return Path(__file__).resolve().parent.parent
+
+
+def _runtime_data_dir() -> Path:
+    """运行时数据目录；测试与容器可用 ``RAG_DATA_DIR`` 显式隔离。"""
+    configured = os.getenv("RAG_DATA_DIR", "").strip()
+    return Path(configured).resolve() if configured else _project_root() / "data"
 
 
 def _sanitize_user_id(user_id: str) -> str:
@@ -128,7 +135,7 @@ class TenantAwareFactory:
             with cls._lock:
                 if user_id not in cls._kg_stores:
                     # 锚定项目根目录，避免受进程工作目录影响
-                    db_path = _project_root() / "data" / f"kg_{user_id}.db"
+                    db_path = _runtime_data_dir() / f"kg_{user_id}.db"
                     db_path.parent.mkdir(parents=True, exist_ok=True)
                     cls._kg_stores[user_id] = SQLiteGraphStore(db_path=str(db_path))
         return cls._kg_stores[user_id]
@@ -168,7 +175,7 @@ class TenantAwareFactory:
                 pass
 
         # 删除 KG SQLite 文件（路径与 get_kg_store 一致）
-        kg_db = _project_root() / "data" / f"kg_{user_id}.db"
+        kg_db = _runtime_data_dir() / f"kg_{user_id}.db"
         if kg_db.exists():
             kg_db.unlink()
 

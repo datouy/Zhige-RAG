@@ -27,7 +27,6 @@ P2.1 安全要点
 from __future__ import annotations
 
 import json
-import re
 import sqlite3
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -41,11 +40,7 @@ from src.db.models import User
 from src.factories import TenantAwareFactory
 from src.middleware.identity import get_current_user
 from src.kg import GraphRAG, GraphRetriever
-from src.kg.cypher_guard import (
-    CypherValidationError,
-    ValidatedCypher,
-    validate_readonly_cypher,
-)
+from src.kg.cypher_guard import CypherValidationError, validate_readonly_cypher
 from src.utils import get_logger, resolve_path
 
 logger = get_logger("api.routes.kg")
@@ -120,7 +115,6 @@ async def kg_list_entities(
         if search:
             entities = store.find_entities_by_name(search, fuzzy=True, limit=limit)
         else:
-            count = store.count().get("entities", 0)
             conn = sqlite3.connect(store.db_path)
             cur = conn.cursor()
             query = "SELECT name, type, description, aliases, attributes FROM entities"

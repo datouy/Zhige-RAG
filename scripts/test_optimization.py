@@ -207,8 +207,7 @@ def main():
         print("   - 分块器配置符合优化建议")
         print("   - 可以开始使用优化后的系统")
         print("\n查看详细文档:")
-        print("   - 优化指南: README_optimization.md")
-        print("   - 变更日志: CHANGELOG_optimization.md")
+        print("   - 变更日志: CHANGELOG.md")
         print("\n")
         
     except Exception as e:

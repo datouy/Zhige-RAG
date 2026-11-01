@@ -3,8 +3,8 @@
 
 定位
 ----
-本项目依赖较重（torch / chromadb / sentence-transformers 等），且模型来源
-可切换（本地权重 / Ollama / OpenAI 兼容 API）。新手最常卡在三个地方：
+默认部署是无 LLM 的中文混合检索（BM25 + ONNX BGE），生成式后端均为可选。
+新手最常卡在三个地方：
 
 1. 依赖没装全（且报错信息指向不到真正的缺失项）；
 2. ``llm.local_files_only: true`` 但模型权重根本没下载；
@@ -78,13 +78,17 @@ DEPS_EMBEDDING = [
     ("sentence-transformers", "sentence_transformers", "本地 Embedding"),
 ]
 
+DEPS_ONNX_EMBEDDING = [
+    ("onnxruntime", "onnxruntime", "ONNX 推理"),
+    ("tokenizers", "tokenizers", "模型分词"),
+]
+
 DEPS_DOCS = [
     ("pdfplumber", "pdfplumber", "PDF 解析"),
     ("pypdf", "pypdf", "PDF 兜底"),
     ("python-docx", "docx", "Word 解析"),
     ("markdown", "markdown", "Markdown 解析"),
     ("beautifulsoup4", "bs4", "HTML 解析"),
-    ("jieba", "jieba", "中文分词（BM25）"),
 ]
 
 DEPS_UI = [
@@ -191,9 +195,12 @@ def _probe(url: str, api_key: str = "", timeout: float = 3.0) -> Tuple[Optional[
 
 def check_llm_backend(cfg: Dict[str, Any]) -> None:
     llm_cfg = cfg.get("llm") or {}
-    backend = str(llm_cfg.get("backend") or "local").strip().lower()
+    backend = str(llm_cfg.get("backend") or "extractive").strip().lower()
 
-    if backend == "local":
+    if backend == "extractive":
+        add(OK, "回答模式：extractive（不加载 LLM，直接返回带引用的原文）")
+
+    elif backend == "local":
         check_dep_group("本地推理依赖（backend: local）", DEPS_LOCAL_LLM, blocker=True)
         model_name = llm_cfg.get("model_name", "")
         model_path = _resolve(model_name)
@@ -265,7 +272,7 @@ def check_llm_backend(cfg: Dict[str, Any]) -> None:
         add(
             FAIL,
             f"未知的 llm.backend：{backend!r}",
-            "可选值：local / ollama / openai",
+            "可选值：extractive / local / ollama / openai",
         )
 
     # 代理提示
@@ -281,11 +288,33 @@ def check_llm_backend(cfg: Dict[str, Any]) -> None:
 def check_embedding(cfg: Dict[str, Any]) -> None:
     """按 ``embedding.backend`` 分支检查。
 
-    只有 local 后端才需要 sentence-transformers 与本地缓存；若用户在
-    ollama / openai 后端下仍看到"缺少本地 Embedding 依赖"，那是指错了方向。
+    onnx 是当前默认的轻量 CPU 路径，不需要 torch / transformers。
     """
     emb_cfg = cfg.get("embedding") or {}
-    backend = str(emb_cfg.get("backend") or "local").strip().lower()
+    backend = str(emb_cfg.get("backend") or "onnx").strip().lower()
+
+    if backend == "onnx":
+        check_dep_group("ONNX Embedding 依赖", DEPS_ONNX_EMBEDDING, blocker=True)
+        section = emb_cfg.get("onnx") or {}
+        model_dir = _resolve(
+            section.get("model_path")
+            or emb_cfg.get("model_name")
+            or "models/bge-small-zh-v1.5-onnx"
+        )
+        model_file = model_dir / section.get("model_file", "onnx/model_quantized.onnx")
+        tokenizer_file = model_dir / section.get(
+            "tokenizer_file", "tokenizer.json"
+        )
+        missing = [str(path) for path in (model_file, tokenizer_file) if not path.exists()]
+        if missing:
+            add(
+                FAIL,
+                "ONNX Embedding 模型文件缺失：" + "、".join(missing),
+                "执行：python scripts/setup_onnx_embedding.py",
+            )
+        else:
+            add(OK, f"ONNX Embedding 已就绪：{model_dir}")
+        return
 
     if backend == "local":
         check_dep_group("Embedding 依赖（backend: local）", DEPS_EMBEDDING, blocker=True)
@@ -348,7 +377,27 @@ def check_embedding(cfg: Dict[str, Any]) -> None:
             add(WARN, f"Embedding 服务不可达：{base_url}（{body[:120]}）")
         return
 
-    add(FAIL, f"未知的 embedding.backend：{backend!r}", "可选值：local / ollama / openai")
+    add(
+        FAIL,
+        f"未知的 embedding.backend：{backend!r}",
+        "可选值：onnx / local / ollama / openai",
+    )
+
+
+def check_bm25_tokenizer() -> None:
+    """BM25 分词器依赖：jieba 是 requirements-core 里的必装项。
+
+    未安装时代码会自动回退到 unigram + bigram，但中文检索质量会明显下降，
+    所以这里单独提示一次，而不是混在文档解析依赖里静默略过。
+    """
+    if has_module("jieba"):
+        add(OK, "中文分词（BM25）：jieba 已就绪")
+    else:
+        add(
+            WARN,
+            "jieba 未安装，BM25 将回退到 unigram + bigram（中文检索质量会下降）",
+            "安装：pip install jieba（已包含在 requirements-core.txt 中）。",
+        )
 
 
 def check_writable_dirs(cfg: Dict[str, Any]) -> None:
@@ -377,6 +426,50 @@ def check_ports(ports: List[int]) -> None:
             add(INFO, f"端口 {port} 已被占用", "若启动服务报 Address already in use，请先停止占用进程或换端口。")
         else:
             add(OK, f"端口 {port} 空闲")
+
+
+def check_orphan_resources(cfg: Dict[str, Any]) -> None:
+    """统计孤儿资源：未被知识库引用的 Chroma collection 与无主 kg 文件。"""
+    try:
+        data_dir = ROOT / "data"
+        kg_files = list(data_dir.glob("kg_*.db"))
+
+        active_names: set = set()
+        try:
+            from sqlalchemy import text as _sa
+            from src.db.database import engine
+
+            with engine.connect() as conn:
+                active_names = {
+                    str(row[0])
+                    for row in conn.execute(
+                        _sa("SELECT collection_name FROM knowledge_bases")
+                    ).fetchall()
+                }
+        except Exception:
+            active_names = set()
+
+        all_names: list = []
+        try:
+            from src.vector_store import get_shared_chroma_client
+
+            persist = str(ROOT / ((cfg.get("vector_store") or {}).get("persist_directory", "data/chroma_db")))
+            client = get_shared_chroma_client(persist)
+            all_names = [str(getattr(c, "name", c)) for c in client.list_collections()]
+        except Exception:
+            all_names = []
+
+        orphan_collections = [n for n in all_names if n and n not in active_names]
+        add(INFO, f"Chroma collection：{len(all_names)} 个（{len(active_names)} 个有归属）")
+        add(INFO, f"图谱文件 kg_*.db：{len(kg_files)} 个")
+        if orphan_collections:
+            add(
+                WARN,
+                f"发现 {len(orphan_collections)} 个孤儿 collection（未被任何知识库引用）",
+                "清理：启动服务后调用 POST /api/v1/system/maintenance/cleanup（dry_run=false 删除）",
+            )
+    except Exception as exc:  # noqa: BLE001
+        add(INFO, f"孤儿资源检查跳过：{type(exc).__name__}")
 
 
 def render() -> int:
@@ -421,7 +514,9 @@ def main() -> int:
         check_llm_backend(cfg)
         check_embedding(cfg)
         check_doc_group(cfg)
+        check_bm25_tokenizer()
         check_writable_dirs(cfg)
+        check_orphan_resources(cfg)
 
     check_dep_group("核心 Web/存储依赖", DEPS_CORE, blocker=True)
     check_dep_group("文档解析依赖", DEPS_DOCS, blocker=False)

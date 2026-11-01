@@ -31,7 +31,7 @@ import socket
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 from .utils import clean_text, get_logger
 

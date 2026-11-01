@@ -25,7 +25,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -173,6 +173,20 @@ def mrr(sources: Sequence[str], expected_sources: Sequence[str]) -> Optional[flo
     return 0.0
 
 
+def percentile(values: Sequence[float], p: float) -> Optional[float]:
+    """线性插值百分位数；空序列返回 None。"""
+    if not values:
+        return None
+    ordered = sorted(float(value) for value in values)
+    if len(ordered) == 1:
+        return ordered[0]
+    index = (len(ordered) - 1) * max(0.0, min(1.0, p))
+    low = int(index)
+    high = min(low + 1, len(ordered) - 1)
+    fraction = index - low
+    return ordered[low] * (1.0 - fraction) + ordered[high] * fraction
+
+
 # ======================================================================
 #  评估主流程
 # ======================================================================
@@ -206,7 +220,6 @@ def evaluate(pipeline: RAGPipeline, items: List[Dict[str, Any]], llm_self_eval: 
 
     for i, item in enumerate(items, 1):
         q = item["question"]
-        ref = item.get("reference_answer", "")
         expected_sources = item.get("expected_sources", []) or []
         keywords = item.get("expected_keywords", []) or []
 
@@ -296,9 +309,11 @@ def evaluate(pipeline: RAGPipeline, items: List[Dict[str, Any]], llm_self_eval: 
             sum(keyword_scores) / len(keyword_scores) if keyword_scores else None
         ),
         "avg_latency_ms": sum(latencies) / len(latencies) if latencies else None,
+        "p95_latency_ms": percentile(latencies, 0.95),
         "ndcg_at_5": sum(ndcgs) / len(ndcgs) if ndcgs else None,
         "mrr": sum(mrrs) / len(mrrs) if mrrs else None,
         "avg_ttft_ms": sum(ttfts) / len(ttfts) if ttfts else None,
+        "p95_ttft_ms": percentile(ttfts, 0.95),
         "avg_tokens_per_sec": (
             sum(tokens_per_sec_values) / len(tokens_per_sec_values) if tokens_per_sec_values else None
         ),
@@ -310,6 +325,9 @@ def evaluate(pipeline: RAGPipeline, items: List[Dict[str, Any]], llm_self_eval: 
             ) if answered else None,
             "unsupported_fact_total": sum(len(v.get("unsupported_facts", [])) for v in verifications),
             "invalid_citation_total": sum(len(v.get("invalid_citations", [])) for v in verifications),
+            "refusal_rate": (len(verifications) - len(answered)) / len(verifications)
+            if verifications
+            else None,
         },
         "details": details,
     }
@@ -457,8 +475,46 @@ def evaluate_retrieval(pipeline: RAGPipeline, items: List[Dict[str, Any]]) -> Di
         "ndcg_at_5": sum(ndcgs) / len(ndcgs) if ndcgs else None,
         "mrr": sum(mrrs) / len(mrrs) if mrrs else None,
         "avg_retrieval_latency_ms": sum(latencies) / len(latencies) if latencies else None,
+        "p95_retrieval_latency_ms": percentile(latencies, 0.95),
         "details": details,
     }
+
+
+def check_thresholds(summary: Dict[str, Any], args: argparse.Namespace) -> List[str]:
+    """返回未达标的阈值说明；空列表表示全部通过。"""
+    failures: List[str] = []
+    samples = int(summary.get("samples", 0) or 0)
+    if args.min_samples and samples < args.min_samples:
+        failures.append(f"samples {samples} < {args.min_samples}")
+
+    hit_rate = float(summary.get("retrieval_hit_rate", 0.0) or 0.0)
+    if args.min_hit_rate is not None and hit_rate < args.min_hit_rate:
+        failures.append(f"retrieval_hit_rate {hit_rate:.3f} < {args.min_hit_rate:.3f}")
+
+    ndcg_value = summary.get("ndcg_at_5")
+    if args.min_ndcg is not None:
+        actual = float(ndcg_value or 0.0)
+        if actual < args.min_ndcg:
+            failures.append(f"ndcg_at_5 {actual:.3f} < {args.min_ndcg:.3f}")
+
+    verified_rate = (summary.get("verifiability") or {}).get("verified_rate")
+    if args.min_verified_rate is not None:
+        actual = float(verified_rate or 0.0)
+        if actual < args.min_verified_rate:
+            failures.append(
+                f"verified_rate {actual:.3f} < {args.min_verified_rate:.3f}"
+            )
+
+    if args.max_p95_latency_ms is not None:
+        latency_value = summary.get("p95_latency_ms")
+        if latency_value is None:
+            latency_value = summary.get("p95_retrieval_latency_ms")
+        actual = float(latency_value or 0.0)
+        if actual > args.max_p95_latency_ms:
+            failures.append(
+                f"p95_latency_ms {actual:.0f} > {args.max_p95_latency_ms:.0f}"
+            )
+    return failures
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -476,6 +532,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--synthesize-from", default="data/raw/rag-intro.md", help="合成使用的 markdown")
     p.add_argument("--no-archive", action="store_true", help="不写历史存档")
+    p.add_argument("--min-samples", type=int, default=0, help="CI：最少样本数")
+    p.add_argument("--min-hit-rate", type=float, default=None, help="CI：最低检索命中率")
+    p.add_argument("--min-ndcg", type=float, default=None, help="CI：最低 NDCG@5")
+    p.add_argument("--min-verified-rate", type=float, default=None, help="CI：最低可验证率")
+    p.add_argument("--max-p95-latency-ms", type=float, default=None, help="CI：P95 延迟上限")
     return p
 
 
@@ -524,6 +585,8 @@ def main():
         with open(out, "w", encoding="utf-8") as f:
             json.dump(summary_top, f, ensure_ascii=False, indent=2)
 
+    threshold_failures = check_thresholds(summary, args)
+
     print("\n========== 评估报告 ==========")
     print(f"样本数            : {summary['samples']}")
     print(f"检索命中率        : {summary['retrieval_hit_rate']:.2%}")
@@ -535,7 +598,12 @@ def main():
         print(f"MRR               : {mr:.3f}" if mr is not None else "MRR               : —")
         rl = summary.get("avg_retrieval_latency_ms")
         print(f"平均检索延迟      : {rl:.0f}ms" if rl is not None else "平均检索延迟      : —")
+        p95 = summary.get("p95_retrieval_latency_ms")
+        print(f"P95 检索延迟      : {p95:.0f}ms" if p95 is not None else "P95 检索延迟      : —")
         print(f"报告已写入        : {out}")
+        if threshold_failures:
+            print("阈值未通过        : " + "; ".join(threshold_failures))
+            return 1
         return 0
     cov = summary.get("avg_keyword_coverage")
     print(f"平均关键词覆盖率  : {cov:.2%}" if cov is not None else "平均关键词覆盖率  : —")
@@ -544,9 +612,13 @@ def main():
     print(f"可验证率          : {vr:.2%}" if vr is not None else "可验证率          : —")
     cr = v.get("avg_cited_sentence_ratio")
     print(f"平均引用覆盖率    : {cr:.2%}" if cr is not None else "平均引用覆盖率    : —")
+    rr = v.get("refusal_rate")
+    print(f"拒答率            : {rr:.2%}" if rr is not None else "拒答率            : —")
     print(f"编造事实/越界引用 : {v.get('unsupported_fact_total', 0)} / {v.get('invalid_citation_total', 0)}")
     lat = summary.get("avg_latency_ms")
     print(f"平均响应时间      : {lat:.0f} ms" if lat is not None else "平均响应时间      : —")
+    p95 = summary.get("p95_latency_ms")
+    print(f"P95 响应时间      : {p95:.0f} ms" if p95 is not None else "P95 响应时间      : —")
     ndcg = summary.get("ndcg_at_5")
     print(f"NDCG@5            : {ndcg:.4f}" if ndcg is not None else "NDCG@5            : —")
     mrr_val = summary.get("mrr")
@@ -558,6 +630,9 @@ def main():
     print(f"报告已写入        : {out}")
     if not args.no_archive:
         print(f"历史存档          : data/eval/reports/{summary_top['ts']}.json")
+    if threshold_failures:
+        print("阈值未通过        : " + "; ".join(threshold_failures))
+        return 1
     return 0
 
 

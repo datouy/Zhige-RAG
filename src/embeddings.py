@@ -18,7 +18,7 @@
 from __future__ import annotations
 
 import os
-from typing import List, Optional, Sequence
+from typing import Optional, Sequence
 
 from .utils import Timer, get_logger, resolve_path, select_torch_device
 

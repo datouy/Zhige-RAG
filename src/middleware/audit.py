@@ -9,9 +9,8 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from sqlalchemy.orm import Session
@@ -87,7 +86,7 @@ class AuditLogger:
     ) -> Dict[str, Any]:
         """格式化审计日志条目。"""
         entry = {
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
             "user_id": user_id,
             "action": action.value if isinstance(action, AuditAction) else action,
             "success": success,

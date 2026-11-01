@@ -14,8 +14,7 @@ Pipeline 复用 LLM / Embedding（P1.4）。
 """
 from __future__ import annotations
 
-import asyncio
-import os
+import hashlib
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -40,12 +39,6 @@ from api.deps import (
     get_runtime_config,
     get_runtime_pipeline,
     get_splitter,
-)
-from api.quota import (
-    CHAT_ENDPOINT,
-    check_chunk_quota,
-    check_query_quota,
-    record_usage,
 )
 from src.data_quality import run_data_pipeline
 from src.db.database import SessionLocal, get_db
@@ -166,21 +159,6 @@ def _check_extension(filename: str) -> str:
     return ext
 
 
-def _delete_stale_chunks(store, sources: List[str]) -> None:
-    """入库前按 source 清理同名文档的旧分块。
-
-    P5 审计修复：分块 id = md5(source|page|chunk_index) 只做 upsert，
-    重新上传内容变少的文件时，超出的旧分块会永久残留并继续参与检索。
-    """
-    for src in set(sources):
-        try:
-            deleted = store.delete_by_metadata({"source": {"$eq": src}})
-            if deleted:
-                logger.info("已清理 %s 的 %d 条旧分块", src, deleted)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("清理旧分块失败（source=%s）: %s", src, exc)
-
-
 def _parse_datetime_safe(raw: Any) -> Optional[Any]:
     """把 metadata 中的 updated_at 字符串转回 datetime（解析失败返回 None）。"""
     from datetime import datetime as _dt
@@ -199,38 +177,70 @@ def _register_documents(db: Session, user_id: str, chunks: List[Any], report: Di
     """
     if not chunks:
         return
-    md = dict(chunks[0].metadata or {})
-    source = str(md.get("source") or md.get("filepath") or "unknown")
-    # 多知识库：同一个文件名可能存在于不同库里，故 kb_id 参与唯一性判定
-    kb_id = md.get("kb_id")
-    hashes = report.get("content_hashes") or []
-    values = {
-        "kb_id": kb_id,
-        "title": md.get("title") or source,
-        "doc_status": str(md.get("doc_status") or "active"),
-        "acl": str(md.get("acl") or "*"),
-        "department": str(md.get("department") or "") or None,
-        "chunk_count": len(chunks),
-        "file_ext": md.get("ext"),
-        "content_hash": hashes[0] if hashes else None,
-        "updated_at_source": _parse_datetime_safe(md.get("updated_at")),
-    }
-    try:
-        query = db.query(DocumentRecord).filter(
-            DocumentRecord.user_id == user_id, DocumentRecord.source == source
+
+    grouped: Dict[tuple[str, Optional[str]], List[Any]] = {}
+    for chunk in chunks:
+        metadata = dict(chunk.metadata or {})
+        source = str(metadata.get("source") or metadata.get("filepath") or "unknown")
+        grouped.setdefault((source, metadata.get("kb_id")), []).append(chunk)
+
+    report_hashes = report.get("content_hashes") or []
+    for index, ((source, kb_id), source_chunks) in enumerate(grouped.items()):
+        metadata = dict(source_chunks[0].metadata or {})
+        content = "\n".join(str(chunk.text or "") for chunk in source_chunks)
+        content_hash = (
+            hashlib.sha256(content.encode("utf-8")).hexdigest()
+            if content
+            else (report_hashes[index] if index < len(report_hashes) else None)
         )
-        if kb_id is not None:
-            query = query.filter(DocumentRecord.kb_id == kb_id)
-        rec = query.first()
-        if rec is None:
+        values = {
+            "kb_id": kb_id,
+            "title": metadata.get("title") or source,
+            "doc_status": str(metadata.get("doc_status") or "active"),
+            "acl": str(metadata.get("acl") or "*"),
+            "department": str(metadata.get("department") or "") or None,
+            "chunk_count": len(source_chunks),
+            "file_ext": metadata.get("ext"),
+            "content_hash": content_hash,
+            "updated_at_source": _parse_datetime_safe(metadata.get("updated_at")),
+        }
+        query = db.query(DocumentRecord).filter(
+            DocumentRecord.user_id == user_id,
+            DocumentRecord.source == source,
+        )
+        query = (
+            query.filter(DocumentRecord.kb_id == kb_id)
+            if kb_id is not None
+            else query.filter(DocumentRecord.kb_id.is_(None))
+        )
+        record = query.first()
+        if record is None:
             db.add(DocumentRecord(user_id=user_id, source=source, **values))
         else:
-            for k, v in values.items():
-                setattr(rec, k, v)
+            for key, value in values.items():
+                setattr(record, key, value)
+    db.flush()
+
+
+def _commit_ingestion_metadata(
+    user_id: str,
+    chunks: List[Any],
+    report: Dict[str, Any],
+    kb_id: str,
+) -> None:
+    """在向量事务回调中一次性提交台账与知识库统计。"""
+    from src.kb_service import refresh_kb_stats
+
+    db = SessionLocal()
+    try:
+        _register_documents(db, user_id, chunks, report)
+        refresh_kb_stats(db, user_id, kb_id, commit=False)
         db.commit()
-    except Exception as exc:  # noqa: BLE001
+    except Exception:
         db.rollback()
-        logger.warning("文档登记失败（source=%s）: %s", source, exc)
+        raise
+    finally:
+        db.close()
 
 
 # =========================== Documents ===========================
@@ -242,29 +252,32 @@ async def list_documents(
     """列出已入库文档（按 source 聚合，合并数据层台账的状态/权限/更新时间）。需要认证。"""
     user: User = current_user
     try:
-        cfg = get_runtime_config()
-        store = TenantAwareFactory.get_chroma_store(user.id, cfg)
-        sources = await run_in_threadpool(store.list_sources)
-        # 数据层台账：补齐 title / doc_status / acl / updated_at（向量库 metadata 之外的可审计信息）
-        records = {
-            r.source: r
-            for r in db.query(DocumentRecord).filter(DocumentRecord.user_id == user.id).all()
+        records = (
+            db.query(DocumentRecord)
+            .filter(DocumentRecord.user_id == user.id)
+            .order_by(DocumentRecord.source.asc(), DocumentRecord.kb_id.asc())
+            .all()
+        )
+        documents = [
+            {
+                "source": record.source,
+                "title": record.title,
+                "kb_id": record.kb_id,
+                "chunks": int(record.chunk_count or 0),
+                "doc_status": record.doc_status,
+                "acl": record.acl,
+                "updated_at_source": record.updated_at_source.strftime("%Y-%m-%d %H:%M:%S")
+                if record.updated_at_source
+                else None,
+                "content_hash": record.content_hash,
+            }
+            for record in records
+        ]
+        return {
+            "documents": documents,
+            "total": len(documents),
+            "total_chunks": sum(item["chunks"] for item in documents),
         }
-        for entry in sources:
-            rec = records.get(str(entry.get("source")))
-            if rec is not None:
-                entry.update(
-                    {
-                        "title": rec.title,
-                        "doc_status": rec.doc_status,
-                        "acl": rec.acl,
-                        "updated_at_source": rec.updated_at_source.strftime("%Y-%m-%d %H:%M:%S")
-                        if rec.updated_at_source
-                        else None,
-                        "content_hash": rec.content_hash,
-                    }
-                )
-        return {"documents": sources, "total": len(sources), "total_chunks": store.count()}
     except HTTPException:
         raise
     except Exception as exc:
@@ -317,6 +330,7 @@ class SearchBody(BaseModel):
 
     query: str
     top_k: int = 4
+    kb_id: Optional[str] = Field(None, description="在指定知识库内检索，缺省为默认知识库")
 
 
 @router.post("/api/v1/search", tags=["文档"])
@@ -328,7 +342,8 @@ async def search_documents(
     user: User = current_user
     try:
         cfg = get_runtime_config()
-        store = TenantAwareFactory.get_chroma_store(user.id, cfg)
+        kb = _resolve_kb(user, cfg, body.kb_id)
+        store = TenantAwareFactory.get_chroma_store_by_name(kb["collection_name"], cfg)
         retrieval_cfg = cfg.get("retrieval", {})
 
         def _query() -> List[Any]:
@@ -347,6 +362,7 @@ async def search_documents(
         hits = await run_in_threadpool(_query)
         return {
             "query": body.query,
+            "kb_id": kb["id"],
             "hits": [
                 {
                     "id": h.id,
@@ -392,10 +408,6 @@ def chat_sync(
     - ACL：检索仅召回用户可见分组的分块。
     """
     user: User = current_user
-    check_query_quota(db, user)
-    started = time.perf_counter()
-    status_code = 200
-    error_detail: Optional[str] = None
     try:
         # 指定知识库时在该库内检索，否则用默认库（行为与之前一致）
         kb = _resolve_kb(user, get_runtime_config(), body.kb_id) if body.kb_id else None
@@ -451,19 +463,8 @@ def chat_sync(
     except HTTPException:
         raise
     except Exception as exc:
-        status_code = 500
-        error_detail = str(exc)
         logger.error("同步问答失败: %s", exc)
         raise HTTPException(status_code=500, detail=str(exc))
-    finally:
-        record_usage(
-            db,
-            user.id,
-            CHAT_ENDPOINT,
-            status_code=status_code,
-            latency_ms=int((time.perf_counter() - started) * 1000),
-            error_message=error_detail,
-        )
 
 
 # =========================== Ingest ===========================
@@ -508,7 +509,6 @@ async def ingest_file(
     安全（P5 审计修复）：
     - 扩展名白名单在写盘前校验；
     - 流式写盘并强制执行 ``ui.max_upload_mb`` 大小上限；
-    - 入库前校验套餐 chunk 配额；
     - 入库前清理同名文档的旧分块，避免内容更新后残留旧块。
     """
     user: User = current_user
@@ -570,26 +570,23 @@ async def ingest_file(
             c.metadata["kb_id"] = kb["id"]
         store = TenantAwareFactory.get_chroma_store_by_name(kb["collection_name"], cfg)
 
-        def _replace_and_add() -> int:
-            _delete_stale_chunks(store, [str(c.metadata.get("source") or c.metadata.get("filepath") or "unknown") for c in all_chunks])
-            return store.add_chunks(all_chunks)
+        sources = sorted(
+            {
+                str(c.metadata.get("source") or c.metadata.get("filepath") or "unknown")
+                for c in all_chunks
+            }
+        )
 
-        # 配额校验：现有块数 + 新增块数 <= 套餐上限
-        existing = await run_in_threadpool(store.count)
-        check_chunk_quota(user, existing, len(all_chunks))
+        def _replace() -> int:
+            return store.replace_chunks_for_sources(
+                all_chunks,
+                sources,
+                on_commit=lambda: _commit_ingestion_metadata(
+                    user.id, all_chunks, report, kb["id"]
+                ),
+            )
 
-        n = await run_in_threadpool(_replace_and_add)
-
-        # 写入成功后更新数据层台账（含准入/去重统计）
-        db = SessionLocal()
-        try:
-            _register_documents(db, user.id, all_chunks, report)
-            # 刷新知识库的文档数/分块数（知识库列表与详情页要展示）
-            from src.kb_service import refresh_kb_stats
-
-            refresh_kb_stats(db, user.id, kb["id"])
-        finally:
-            db.close()
+        n = await run_in_threadpool(_replace)
 
         return {
             "filename": file.filename,
@@ -692,24 +689,16 @@ async def ingest_url(
             c.metadata["kb_id"] = kb["id"]
         store = TenantAwareFactory.get_chroma_store_by_name(kb["collection_name"], cfg)
 
-        # 配额校验：现有块数 + 新增块数 <= 套餐上限
-        existing = await run_in_threadpool(store.count)
-        check_chunk_quota(user, existing, len(chunks))
+        def _replace() -> int:
+            return store.replace_chunks_for_sources(
+                chunks,
+                [source],
+                on_commit=lambda: _commit_ingestion_metadata(
+                    user.id, chunks, report, kb["id"]
+                ),
+            )
 
-        def _replace_and_add() -> int:
-            _delete_stale_chunks(store, [source])
-            return store.add_chunks(chunks)
-
-        n = await run_in_threadpool(_replace_and_add)
-
-        db = SessionLocal()
-        try:
-            _register_documents(db, user.id, chunks, report)
-            from src.kb_service import refresh_kb_stats
-
-            refresh_kb_stats(db, user.id, kb["id"])
-        finally:
-            db.close()
+        n = await run_in_threadpool(_replace)
 
         return {
             "url": page["url"],
@@ -732,6 +721,7 @@ async def ingest_url(
 async def ingest_directory(
     dir_path: str = Form(...),
     recursive: bool = Form(True),
+    kb_id: Optional[str] = Form(None),
     current_user: User = Depends(get_current_user),
 ) -> Dict[str, Any]:
     """批量入库指定目录。需要认证。
@@ -743,6 +733,7 @@ async def ingest_directory(
     user: User = current_user
     try:
         cfg = get_runtime_config()
+        kb = _resolve_kb(user, cfg, kb_id)
 
         raw_root = resolve_path(cfg.get("paths", {}).get("raw_docs", "data/raw"))
         user_scope = raw_root / user.id[:8]
@@ -771,6 +762,8 @@ async def ingest_directory(
             chunks, report = run_data_pipeline(
                 docs, cfg, splitter, decision_provider=_ingest_guard_provider(cfg)
             )
+            for chunk in chunks:
+                chunk.metadata["kb_id"] = kb["id"]
             report["docs"] = len(docs)
             return len(docs), chunks, report
 
@@ -784,28 +777,31 @@ async def ingest_directory(
                 )
             raise HTTPException(status_code=400, detail="目录中没有可入库内容")
 
-        store = TenantAwareFactory.get_chroma_store(user.id, cfg)
+        store = TenantAwareFactory.get_chroma_store_by_name(kb["collection_name"], cfg)
+        sources = sorted(
+            {
+                str(c.metadata.get("source") or c.metadata.get("filepath") or "unknown")
+                for c in all_chunks
+            }
+        )
 
-        def _replace_and_add() -> int:
-            _delete_stale_chunks(store, [str(c.metadata.get("source") or c.metadata.get("filepath") or "unknown") for c in all_chunks])
-            return store.add_chunks(all_chunks)
+        def _replace() -> int:
+            return store.replace_chunks_for_sources(
+                all_chunks,
+                sources,
+                on_commit=lambda: _commit_ingestion_metadata(
+                    user.id, all_chunks, report, kb["id"]
+                ),
+            )
 
-        existing = await run_in_threadpool(store.count)
-        check_chunk_quota(user, existing, len(all_chunks))
-
-        n = await run_in_threadpool(_replace_and_add)
-
-        db = SessionLocal()
-        try:
-            _register_documents(db, user.id, all_chunks, report)
-        finally:
-            db.close()
+        n = await run_in_threadpool(_replace)
 
         return {
             "dir": str(target),
             "docs": docs_count,
             "chunks": len(all_chunks),
             "ingested": n,
+            "kb_id": kb["id"],
             "data_quality": report,
         }
     except HTTPException:
@@ -841,13 +837,6 @@ async def websocket_chat(websocket: WebSocket):
 
             if not query:
                 await websocket.send_json({"event": "error", "data": "query is required"})
-                continue
-
-            # P5 审计修复：WS 问答同样受每日配额约束
-            try:
-                check_query_quota(db, ws_user)
-            except HTTPException as quota_exc:
-                await websocket.send_json({"event": "error", "data": str(quota_exc.detail)})
                 continue
 
             # P0-1 修复：使用 LLMConcurrencyGate 替代已删除的 AsyncLLMExecutor
@@ -957,22 +946,8 @@ async def websocket_chat(websocket: WebSocket):
                         pass
                     except Exception as exc:  # noqa: BLE001
                         logger.warning("WS 会话消息落库失败（已忽略）: %s", exc)
-                record_usage(
-                    db,
-                    ws_user.id,
-                    CHAT_ENDPOINT,
-                    latency_ms=int((time.perf_counter() - started) * 1000),
-                )
             except Exception as exc:
                 logger.error("WebSocket 流式生成失败: %s", exc)
-                record_usage(
-                    db,
-                    ws_user.id,
-                    CHAT_ENDPOINT,
-                    status_code=500,
-                    latency_ms=int((time.perf_counter() - started) * 1000),
-                    error_message=str(exc),
-                )
                 await websocket.send_json({"event": "error", "data": str(exc)})
     except WebSocketDisconnect:
         logger.info("WebSocket 客户端断开")

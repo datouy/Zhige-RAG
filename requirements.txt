@@ -10,8 +10,9 @@
 #       pip install -r requirements-core.txt
 #       pip install -r requirements-optional.txt     # 需要解析 PDF/Word 时
 #
-#   【完全本地推理（无网 / 数据不出内网）】
-#       pip install -r requirements-core.txt -r requirements-local.txt
+#   【无 LLM、完全本地检索/问答（当前默认）】
+#       pip install -r requirements-core.txt -r requirements-optional.txt
+#       运行 python scripts/setup_onnx_embedding.py 准备约 24 MB 的向量模型
 #
 #   【有 NVIDIA GPU，想用 4bit 量化省显存】
 #       pip install -r requirements-gpu.txt          # 单独装，见文件内说明
@@ -24,7 +25,6 @@
 # ============================================================
 
 -r requirements-core.txt
--r requirements-local.txt
 -r requirements-optional.txt
 
 # 说明：requirements-gpu.txt（bitsandbytes）未纳入本文件 ——

@@ -38,7 +38,7 @@ user_template: |
   - 末尾以"参考资料"列出对应的来源编号与标题（不要重复正文中的内容）。
 
 cite_block: |
-  [{index}] {title}（来源：{source}，第 {page} 页）
+  [{index}] {title}（来源：{source}，第 {page}）
 
 context_chunk: |
   [{index}] {title}

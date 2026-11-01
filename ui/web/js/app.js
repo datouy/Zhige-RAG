@@ -62,9 +62,15 @@ class ChatApp {
         
         try {
             const s = await this.api('/settings/model');
-            const llmBackend = (s.llm && s.llm.backend) || 'local';
-            const embBackend = (s.embedding && s.embedding.backend) || 'local';
-            const backendLabel = { local: '本机权重', ollama: '本机 Ollama', openai: '云端 API' };
+            const llmBackend = (s.llm && s.llm.backend) || 'extractive';
+            const embBackend = (s.embedding && s.embedding.backend) || 'onnx';
+            const backendLabel = {
+                extractive: '原文摘录（无 LLM）',
+                onnx: '本地 CPU 向量',
+                local: '本机权重',
+                ollama: '本机 Ollama',
+                openai: '云端 API',
+            };
             let html = '<ul class="status-list">';
 
             html += `<li class="ok">
@@ -79,28 +85,14 @@ class ChatApp {
             html += '</ul>';
 
             // 添加帮助提示
-            if (llmBackend === 'local' || embBackend === 'local') {
-                html += `<div class="status-help">
-                    <p>⚠️ 选择「本机权重」需要先安装 torch 并准备模型文件</p>
-                    <details>
-                        <summary>如何配置模型？</summary>
-                        <div class="help-content">
-                            <p><strong>方式一：使用 Ollama（推荐，无需 GPU）</strong></p>
-                            <ol>
-                                <li>下载 <a href="https://ollama.com/download" target="_blank">Ollama</a></li>
-                                <li>运行: <code>ollama pull qwen3:4b-instruct-2507-q4_K_M</code></li>
-                                <li>运行: <code>ollama pull nomic-embed-text</code></li>
-                            </ol>
-                            <p><strong>方式二：使用云端 API</strong></p>
-                            <ol>
-                                <li>获取 DeepSeek/通义等 API Key</li>
-                                <li>点击左下角「模型设置」进行配置</li>
-                            </ol>
-                        </div>
-                    </details>
+            if (llmBackend === 'extractive' && embBackend === 'onnx') {
+                html += `<div class="status-ready">
+                    ✅ 无 LLM 模式：BM25 + 本地 ONNX 向量混合检索，答案直接引用原文
                 </div>`;
             } else {
-                html += `<div class="status-ready">✅ 模型后端已选定，可在「模型设置」里测试连通性</div>`;
+                html += `<div class="status-help">
+                    <p>当前使用可选的自定义后端，可在「模型设置」里测试连通性。</p>
+                </div>`;
             }
 
             box.innerHTML = html;
@@ -223,11 +215,11 @@ class ChatApp {
             || this.knowledgeBases.find((k) => k.is_default)
             || this.knowledgeBases[0]
             || null;
-        this.renderKnowledgeBases(data.quota);
+        this.renderKnowledgeBases();
         this.renderCurrentKb();
     }
 
-    renderKnowledgeBases(quota) {
+    renderKnowledgeBases() {
         const list = this.el['kb-list'];
         if (!list) return;
         if (!this.knowledgeBases.length) {
@@ -255,9 +247,6 @@ class ChatApp {
             btn.addEventListener('click', () => this.deleteKb(btn.dataset.delKb));
         });
 
-        if (quota !== undefined && quota !== -1) {
-            this.el['kb-meta'].textContent = `${this.knowledgeBases.length}/${quota} 个库`;
-        }
     }
 
     renderCurrentKb() {
@@ -655,7 +644,7 @@ class ChatApp {
     fillSettings(s) {
         ['llm', 'emb'].forEach((k) => {
             const src = (k === 'llm' ? s.llm : s.embedding) || {};
-            const backend = src.backend || 'local';
+            const backend = src.backend || (k === 'llm' ? 'extractive' : 'onnx');
             const select = document.getElementById(`${k}-backend`);
             if (select) select.value = backend;
 
@@ -676,9 +665,9 @@ class ChatApp {
 
     /** 显示/隐藏远程字段，并给常见默认值降低填写成本 */
     syncRemoteFields(k) {
-        const backend = document.getElementById(`${k}-backend`)?.value || 'local';
+        const backend = document.getElementById(`${k}-backend`)?.value || (k === 'llm' ? 'extractive' : 'onnx');
         const box = document.getElementById(`${k}-remote`);
-        if (box) box.hidden = backend === 'local';
+        if (box) box.hidden = !['ollama', 'openai'].includes(backend);
 
         const baseEl = document.getElementById(`${k}-base-url`);
         const modelEl = document.getElementById(`${k}-model`);
@@ -695,9 +684,9 @@ class ChatApp {
 
     /** 收集某一类（llm / emb）的表单值 */
     collectKind(k) {
-        const backend = document.getElementById(`${k}-backend`)?.value || 'local';
+        const backend = document.getElementById(`${k}-backend`)?.value || (k === 'llm' ? 'extractive' : 'onnx');
         const out = { backend };
-        if (backend !== 'local') {
+        if (backend === 'ollama' || backend === 'openai') {
             const sec = {
                 base_url: (document.getElementById(`${k}-base-url`)?.value || '').trim(),
                 model: (document.getElementById(`${k}-model`)?.value || '').trim(),
@@ -779,9 +768,9 @@ class ChatApp {
                 <h4>模型配置</h4>
                 <p>点击「模型设置」可以切换不同的模型后端：</p>
                 <ul>
-                    <li><strong>Ollama（推荐）</strong> - 本地运行，无需 GPU，下载后即可离线使用</li>
-                    <li><strong>云端 API</strong> - 使用 DeepSeek、通义千问等在线服务</li>
-                    <li><strong>本地模型</strong> - 直接加载 HuggingFace 权重，需要 GPU</li>
+                    <li><strong>extractive（当前）</strong> - 无 LLM，直接返回带引用的知识库原文</li>
+                    <li><strong>ONNX 向量</strong> - 本地 CPU 运行中文 BGE 向量模型</li>
+                    <li><strong>可选后端</strong> - 需要时再配置 Ollama、云端 API 或本机生成权重</li>
                 </ul>
                 
                 <h4>数据安全</h4>

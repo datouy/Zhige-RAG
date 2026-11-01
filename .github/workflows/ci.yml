@@ -37,11 +37,15 @@ jobs:
 
       - name: Run linter
         run: |
-          ruff check src/ api/ --output-format=text
+          ruff check src/ api/ --output-format=concise
 
       - name: Check syntax
         run: |
           python -m compileall -q src api scripts tests
+
+      - name: Verify database migrations
+        run: |
+          DB_PATH="$PWD/data/ci_migration.db" alembic upgrade head
 
       - name: Run unit tests
         run: |

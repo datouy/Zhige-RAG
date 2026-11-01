@@ -66,6 +66,12 @@ def fake_xf(monkeypatch):
     bnb_holder: dict = {}
     fake = _make_fake_transformers(bnb_holder)
     monkeypatch.setitem(__import__("sys").modules, "transformers", fake)
+    fake_torch = MagicMock()
+    fake_torch.float16 = "float16"
+    fake_torch.bfloat16 = "bfloat16"
+    fake_torch.float32 = "float32"
+    fake_torch.cuda.is_available.return_value = True
+    monkeypatch.setitem(__import__("sys").modules, "torch", fake_torch)
     return bnb_holder
 
 
@@ -128,10 +134,23 @@ def test_quant_disabled_uses_torch_dtype(fake_xf):
     assert fp_kwargs.get("device_map") == "auto"
 
 
-def test_detect_device_returns_explicit_value():
-    """显式传入 cpu / cuda 不应触发探测。"""
+def test_detect_device_returns_explicit_value(monkeypatch):
+    """CUDA 可用时保留调用方指定的具体设备编号。"""
+    fake_torch = MagicMock()
+    fake_torch.cuda.is_available.return_value = True
+    fake_torch.version.cuda = "12.1"
+    monkeypatch.setitem(__import__("sys").modules, "torch", fake_torch)
     assert _detect_device("cpu") == "cpu"
     assert _detect_device("cuda:0") == "cuda:0"
+
+
+def test_detect_device_explicit_cuda_falls_back_without_cuda(monkeypatch):
+    """显式 CUDA 配置在 CPU-only 环境中安全回落到 CPU。"""
+    fake_torch = MagicMock()
+    fake_torch.cuda.is_available.return_value = False
+    fake_torch.version.cuda = None
+    monkeypatch.setitem(__import__("sys").modules, "torch", fake_torch)
+    assert _detect_device("cuda:0") == "cpu"
 
 
 def test_detect_device_auto_with_torch(monkeypatch):

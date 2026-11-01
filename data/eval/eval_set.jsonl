@@ -11,3 +11,26 @@
 {"question": "去桂林旅游需要注意些什么？", "expected_sources": ["新建 DOCX 文档.docx"], "expected_keywords": ["亚热带季风气候"], "difficulty": "medium"}
 {"question": "旅行社可以调整行程中景点的游览顺序吗？", "expected_sources": ["新建 DOCX 文档.docx"], "expected_keywords": ["协商", "调整"], "difficulty": "medium"}
 {"question": "选题的背景与意义是什么？", "expected_sources": ["开题报告_本科毕业设计.docx"], "expected_keywords": ["背景与意义"], "difficulty": "easy"}
+{"question": "RAG 的全称是什么？", "expected_sources": ["rag-intro.md"], "expected_keywords": ["Retrieval-Augmented Generation", "检索增强生成"], "difficulty": "easy"}
+{"question": "大语言模型存在哪两个显著短板？", "expected_sources": ["rag-intro.md"], "expected_keywords": ["知识陈旧", "幻觉问题"], "difficulty": "easy"}
+{"question": "RAG 是如何缓解大模型幻觉的？", "expected_sources": ["rag-intro.md"], "expected_keywords": ["先检索", "后生成", "真实文档"], "difficulty": "medium"}
+{"question": "RAG 的核心流程包含哪些步骤？", "expected_sources": ["rag-intro.md"], "expected_keywords": ["文档解析", "文本分块", "向量化", "重排序"], "difficulty": "medium"}
+{"question": "RAG 和传统 Fine-tuning 在知识更新上有什么区别？", "expected_sources": ["rag-intro.md"], "expected_keywords": ["即时", "重新训练"], "difficulty": "medium"}
+{"question": "RAG 有哪些典型应用场景？", "expected_sources": ["rag-intro.md"], "expected_keywords": ["企业内部知识库", "客服机器人"], "difficulty": "easy"}
+{"question": "RAG 相比传统 Fine-tuning 在可解释性上有什么优势？", "expected_sources": ["rag-intro.md"], "expected_keywords": ["带引用", "可解释性"], "difficulty": "medium"}
+{"question": "长文档切分给 RAG 带来什么挑战？", "expected_sources": ["rag-intro.md"], "expected_keywords": ["上下文碎片化"], "difficulty": "medium"}
+{"question": "RAG 的核心组件有哪些？", "expected_sources": ["e2e_rag_intro.md"], "expected_keywords": ["向量数据库", "Embedding 模型", "重排序器", "提示词模板"], "difficulty": "easy"}
+{"question": "RAG 为什么适合企业知识库问答？", "expected_sources": ["e2e_rag_intro.md"], "expected_keywords": ["减少幻觉", "答案可溯源"], "difficulty": "easy"}
+{"question": "RAG 相比闭卷生成有哪些部署优势？", "expected_sources": ["e2e_rag_intro.md"], "expected_keywords": ["部署成本低", "本地化运行", "数据隐私"], "difficulty": "medium"}
+{"question": "员工请假需要提前几个工作日申请？", "expected_sources": ["员工手册-演示.md"], "expected_keywords": ["三个工作日", "书面申请"], "difficulty": "easy"}
+{"question": "连续请假超过五个工作日需要做什么？", "expected_sources": ["员工手册-演示.md"], "expected_keywords": ["抄送人力资源部"], "difficulty": "easy"}
+{"question": "突发疾病无法提前请假时应该怎么处理？", "expected_sources": ["员工手册-演示.md"], "expected_keywords": ["电话报备", "补办手续"], "difficulty": "medium"}
+{"question": "差旅报销需要提供哪些材料？", "expected_sources": ["员工手册-演示.md"], "expected_keywords": ["出差申请单", "交通票据", "住宿发票", "工作日报"], "difficulty": "medium"}
+{"question": "单笔报销金额超过多少元需要共同审批？", "expected_sources": ["员工手册-演示.md"], "expected_keywords": ["5000"], "difficulty": "easy"}
+{"question": "员工发现安全漏洞应该怎么做？", "expected_sources": ["员工手册-演示.md"], "expected_keywords": ["上报信息技术部", "不得私自对外披露"], "difficulty": "easy"}
+{"question": "年假需要在什么时候之前使用完毕？", "expected_sources": ["员工手册-演示.md"], "expected_keywords": ["12 月 31 日"], "difficulty": "easy"}
+{"question": "离开工位时对电脑有什么要求？", "expected_sources": ["员工手册-演示.md"], "expected_keywords": ["锁定电脑"], "difficulty": "easy"}
+{"question": "请假", "expected_sources": ["员工手册-演示.md"], "expected_keywords": ["三个工作日"], "difficulty": "easy"}
+{"question": "报销流程是什么？", "expected_sources": ["员工手册-演示.md"], "expected_keywords": ["出差申请", "发票", "审批"], "difficulty": "medium"}
+{"question": "我是一名新员工，想了解公司关于请假、差旅报销和信息安全的规定，请把相关要求整理出来告诉我。", "expected_sources": ["员工手册-演示.md"], "expected_keywords": ["请假", "报销", "信息安全"], "difficulty": "medium"}
+{"question": "RAG 和 RAG 有什么区别吗？", "expected_sources": ["rag-intro.md"], "expected_keywords": ["Retrieval-Augmented Generation"], "difficulty": "medium"}

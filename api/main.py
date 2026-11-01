@@ -45,7 +45,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import os
 import sys
 import threading
@@ -54,7 +53,7 @@ import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, Request
+from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
@@ -63,6 +62,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.base import BaseHTTPMiddleware
 
 # 项目根目录加入 path
@@ -118,12 +118,31 @@ def _warm_up_models() -> None:
         pipeline = get_pipeline()
         logger.info("预热完成：Embedding / 向量库 / Pipeline 已就绪")
 
-        if os.getenv("RAG_PRELOAD_LLM", "0").strip().lower() in ("1", "true", "yes", "on"):
+        if (
+            not pipeline._is_extractive_mode()
+            and os.getenv("RAG_PRELOAD_LLM", "0").strip().lower()
+            in ("1", "true", "yes", "on")
+        ):
             started = time.perf_counter()
             pipeline.ensure_llm()
             logger.info("预热完成：LLM 已加载（%.1fs）", time.perf_counter() - started)
     except Exception as exc:  # noqa: BLE001
         logger.warning("后台预热失败（不影响服务，首次请求时会自行加载）: %s", exc)
+
+
+def _log_orphan_summary() -> None:
+    """启动时记录孤儿资源数量，提示可清理（不阻塞启动）。"""
+    try:
+        data_dir = ROOT / "data"
+        kg_count = len(list(data_dir.glob("kg_*.db"))) if data_dir.exists() else 0
+        if kg_count > 0:
+            logger.warning(
+                "检测到 %d 个图谱文件（data/kg_*.db）。如需清理孤儿资源，"
+                "调用 POST /api/v1/system/maintenance/cleanup（dry_run=true 预览，false 清理）。",
+                kg_count,
+            )
+    except Exception:  # noqa: BLE001
+        pass
 
 
 # =========================== 应用生命周期 ===========================
@@ -150,6 +169,7 @@ async def lifespan(app: FastAPI):
     try:
         init_db()
         logger.info("数据库初始化完成")
+        _log_orphan_summary()
 
         # P1.2: 启动期预热配置缓存，避免首次请求再走 yaml.safe_load
         try:
@@ -161,12 +181,15 @@ async def lifespan(app: FastAPI):
             logger.warning("配置预热失败（继续启动）: %s", cfg_err)
 
         try:
-            from src.config.validator import load_and_validate_config
+            from src.config.validator import validate_config
 
-            load_and_validate_config("config/config.yaml")
+            # 校验最终运行时配置（包含 local_overrides 与环境变量），避免界面
+            # 写入的非法值或字段拼写错误拖到首个真实请求才暴露。
+            validate_config(get_runtime_config())
             logger.info("配置验证通过")
         except Exception as config_err:
-            logger.warning("配置验证失败（继续启动）: %s", config_err)
+            logger.error("配置验证失败，拒绝启动: %s", config_err)
+            raise
 
         # 冷启动预热：放后台线程，服务立刻可应答（见 _warm_up_models）
         if _warmup_enabled():
@@ -292,13 +315,11 @@ from api.routes import (
     kb_router,
     kg_router,
     settings_router,
-    subscription_router,
     system_router,
 )
 
 # 直接使用子路由里写明的 ``Depends(get_current_user)``：每个端点都要拿
 # 当前用户身份（本地单用户），P1 阶段无需 ``dependency_overrides`` hack。
-app.include_router(subscription_router)
 app.include_router(system_router)
 app.include_router(settings_router)
 app.include_router(kb_router)
@@ -341,6 +362,35 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
             "details": _sanitize_validation_errors(exc.errors()),
             "request_id": request_id,
         },
+    )
+
+
+@app.exception_handler(StarletteHTTPException)
+async def http_exception_handler(request: Request, exc: StarletteHTTPException):
+    """统一 HTTP 错误响应，服务端 5xx 不再把内部异常文本返回给客户端。"""
+    request_id = getattr(request.state, "request_id", "N/A")
+    if exc.status_code >= 500:
+        logger.error(
+            "HTTP 服务错误 [request_id=%s, status=%s]: %s",
+            request_id,
+            exc.status_code,
+            exc.detail,
+        )
+        content = {
+            "error": "Internal Server Error",
+            "message": "服务暂时不可用，请稍后重试",
+            "request_id": request_id,
+        }
+    else:
+        content = {
+            "error": "HTTP Error",
+            "message": exc.detail,
+            "request_id": request_id,
+        }
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=content,
+        headers=getattr(exc, "headers", None),
     )
 
 

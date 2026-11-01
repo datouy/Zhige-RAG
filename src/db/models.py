@@ -1,6 +1,6 @@
 """数据库模型。
 
-包含 User、UsageLog 模型及订阅层配置。
+包含 User、UsageLog 等数据库模型。
 
 说明：本服务不需要登录，因此 ``User`` 表里没有口令相关字段，
 也不存在 refresh token 表 —— 全服务只有一个固定的"本地用户"
@@ -14,44 +14,10 @@
 from __future__ import annotations
 import uuid
 from datetime import datetime
-from typing import Dict, Any
 from sqlalchemy import Column, String, Boolean, DateTime, Integer, Text, UniqueConstraint, Index
 from sqlalchemy.orm import declarative_base
 
 Base = declarative_base()
-
-# ======================== 订阅层配置 ========================
-
-SUBSCRIPTION_TIERS: Dict[str, Dict[str, Any]] = {
-    "free": {
-        "max_chunks": 1000,
-        "max_queries_per_day": 50,
-        "available_models": ["Qwen2.5-0.5B-Instruct"],
-        "reranker": False,
-        # 免费用户给 5 个库：个人按主题分库（工作 / 学习 / 资料 / 项目…）是合理需求
-        "max_kb": 5,
-    },
-    "pro": {
-        "max_chunks": 50000,
-        "max_queries_per_day": 5000,
-        "available_models": ["Qwen2.5-1.5B-Instruct", "Qwen2.5-3B-Instruct-GPTQ-Int4"],
-        "reranker": True,
-        "max_kb": 20,
-    },
-    "enterprise": {
-        "max_chunks": -1,  # 无限制
-        "max_queries_per_day": -1,
-        "available_models": ["*"],
-        "reranker": True,
-        "max_kb": -1,
-    },
-}
-
-
-def get_tier_limits(tier: str) -> Dict[str, Any]:
-    """获取指定订阅层的限制配置。"""
-    return SUBSCRIPTION_TIERS.get(tier, SUBSCRIPTION_TIERS["free"])
-
 
 # ======================== 数据模型 ========================
 
@@ -69,9 +35,6 @@ class User(Base):
     id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     username = Column(String(50), unique=True, nullable=False, index=True)
     email = Column(String(255), unique=True, nullable=False, index=True)
-    subscription_tier = Column(String(20), default="free")  # free / pro / enterprise
-    max_chunks = Column(Integer, default=1000)
-    max_queries_per_day = Column(Integer, default=50)
     # 所属部门/分组：与文档 metadata.acl（逗号分隔）配合实现数据层权限过滤；
     # 空串 = 仅可见 acl="*" 的全员文档
     department = Column(String(100), default="", nullable=False)
@@ -128,7 +91,9 @@ class DocumentRecord(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     __table_args__ = (
-        UniqueConstraint("user_id", "source", name="uq_docrecord_user_source"),
+        UniqueConstraint(
+            "user_id", "kb_id", "source", name="uq_docrecord_user_kb_source"
+        ),
     )
 
 

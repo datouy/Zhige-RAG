@@ -188,6 +188,47 @@ def _split_markdown_sections(body: str, fallback_title: str) -> List[Tuple[List[
     return sections
 
 
+_CN_NUM_HEADING_RE = re.compile(
+    r"^[一二三四五六七八九十]+[、，,．.]|^（[一二三四五六七八九十]+）|^\([一二三四五六七八九十]+\)"
+)
+
+
+def _split_chinese_numbered_sections(
+    body: str, fallback_title: str
+) -> List[Tuple[List[str], str, str]]:
+    """按"一、二、三" / "（一）（二）" 这类纯文本中文编号切分小节。
+
+    纯文本（TXT）或未使用井号标题的文档没有样式级标题，但企业手册常以
+    "一、请假制度" 编排章节。这里识别这类编号行，恢复 breadcrumb 语境。
+    """
+    lines = body.splitlines()
+    sections: List[Tuple[List[str], str, str]] = []
+    buf: List[str] = []
+    current_title = fallback_title
+    current_path: List[str] = []
+
+    def _flush() -> None:
+        text = "\n".join(buf).strip("\n")
+        if text.strip():
+            sections.append((list(current_path), current_title, text))
+        buf.clear()
+
+    for line in lines:
+        stripped = line.strip()
+        if _CN_NUM_HEADING_RE.match(stripped):
+            _flush()
+            current_title = stripped
+            current_path = [stripped]
+            buf.append(line)
+        else:
+            buf.append(line)
+    _flush()
+
+    if not sections:
+        return [([], fallback_title, body.strip())]
+    return sections
+
+
 def _iter_docx_blocks(path: Path) -> List[Tuple[Optional[int], str]]:
     """按文档顺序产出 DOCX 段落/表格：(heading_level 或 None, text)。
 
@@ -255,10 +296,10 @@ def _split_docx_sections(
 
 
 def _file_updated_at(path: Path) -> Optional[datetime]:
-    """源文件最后修改时间（本地时区，去 tzinfo 便于入库）。"""
+    """源文件最后修改时间（UTC，与 docx core properties 及 health 时间戳一致）。"""
     try:
         st = path.stat()
-        return datetime.fromtimestamp(st.st_mtime)
+        return datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).replace(tzinfo=None)
     except OSError:
         return None
 
@@ -360,6 +401,8 @@ def enrich_file(
             return []
         front, body = parse_frontmatter(raw)
         sections = _split_markdown_sections(body, fallback_title)
+        if len(sections) == 1 and not sections[0][0]:
+            sections = _split_chinese_numbered_sections(body, fallback_title)
         core_meta: Dict[str, Any] = {}
     elif ext == ".docx":
         try:
@@ -375,13 +418,17 @@ def enrich_file(
         from .document_loader import load_document
 
         docs = load_document(p, clean=True, ocr_cfg=ocr_cfg)
-        outline = _pdf_outline_paths(p) if ext == ".pdf" else {}
-        sections: List[Tuple[List[str], str, str]] = []
-        for d in docs:
-            page0 = (d.page or 1) - 1
-            hpath = list(outline.get(page0, []))
-            sec_title = hpath[-1] if hpath else (d.metadata or {}).get("title") or fallback_title
-            sections.append((hpath, sec_title, d.content))
+        if ext == ".txt":
+            plain = "\n".join(d.content for d in docs)
+            sections = _split_chinese_numbered_sections(plain, fallback_title)
+        else:
+            outline = _pdf_outline_paths(p) if ext == ".pdf" else {}
+            sections = []
+            for d in docs:
+                page0 = (d.page or 1) - 1
+                hpath = list(outline.get(page0, []))
+                sec_title = hpath[-1] if hpath else (d.metadata or {}).get("title") or fallback_title
+                sections.append((hpath, sec_title, d.content))
         core_meta = {}
         body = ""
 

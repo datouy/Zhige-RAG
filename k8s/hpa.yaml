@@ -11,9 +11,10 @@ spec:
     kind: Deployment
     name: chineseragkb-api
 
-  # Replica bounds
+  # 当前存储层是单写文件库。仅在迁移到集中式向量库并补充分布式锁后，
+  # 才允许把 maxReplicas 调高；否则扩容会放大锁冲突和索引损坏风险。
   minReplicas: 1
-  maxReplicas: 10
+  maxReplicas: 1
 
   # Metrics for scaling decisions
   metrics:

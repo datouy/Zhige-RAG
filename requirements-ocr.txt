@@ -15,7 +15,13 @@
 # ============================================================
 
 # PDF 页面渲染（自带渲染引擎，无需 poppler / Ghostscript）
-pymupdf>=1.24.0
+# Keep 1.x: PyMuPDF 2.x currently pulls a separate layout stack that is not
+# needed by this project's fixed-DPI page rendering path.
+pymupdf>=1.24.0,<2.0
 
 # OCR 识别：基于 onnxruntime，比 PaddleOCR 轻得多，安装无编译负担
 rapidocr-onnxruntime>=1.3.0
+
+# OpenCV 5 currently requires NumPy >=2, while ChromaDB and the pinned
+# ONNX runtime stack are validated on NumPy 1.26. Keep the 4.x line.
+opencv-python>=4.5.1.48,<4.12

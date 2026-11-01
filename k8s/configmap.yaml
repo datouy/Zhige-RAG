@@ -23,13 +23,9 @@ data:
   KG_ENABLED: "true"
   KG_BACKEND: "sqlite"
 
-  # LLM settings
-  LLM_DEVICE: "cuda"
-  LLM_MODEL_NAME: "Qwen/Qwen2-7B-Instruct"
-
-  # Embedding settings
-  EMBEDDING_MODEL_NAME: "BAAI/bge-base-zh-v1.5"
-  EMBEDDING_DEVICE: "cuda"
+  # LLM-free answer and local CPU embedding
+  LLM_BACKEND: "extractive"
+  EMBEDDING_BACKEND: "onnx"
 
   # Monitoring settings
   OTEL_SERVICE_NAME: "ChineseRAGKB"

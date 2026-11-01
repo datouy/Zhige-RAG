@@ -6,20 +6,23 @@ from __future__ import annotations
 
 import os
 import re
-import sqlite3
 import time
+from pathlib import Path
 from typing import Any, Dict
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import JSONResponse, Response
+from starlette.concurrency import run_in_threadpool
 
 from api.deps import (
     _get_health_cache,
     _set_health_cache,
     get_health_cache_ttl,
     get_runtime_config,
+    get_vector_store,
     invalidate_health_cache,
 )
+from src.db.models import User
 from src.middleware.identity import get_current_user
 from src.utils import get_logger, resolve_path
 from sqlalchemy import text as _sa_text
@@ -27,6 +30,15 @@ from sqlalchemy import text as _sa_text
 logger = get_logger("api.routes.system")
 
 router = APIRouter()
+
+_ready_cache_at = 0.0
+_ready_cache_payload: Dict[str, Any] | None = None
+
+
+def _clear_readiness_cache() -> None:
+    global _ready_cache_at, _ready_cache_payload
+    _ready_cache_at = 0.0
+    _ready_cache_payload = None
 
 # 递归脱敏时命中这些键名（不区分大小写）的值会被替换为 "***"
 _SENSITIVE_KEY_RE = re.compile(
@@ -77,6 +89,8 @@ async def health_check():
         cfg = get_runtime_config()
         checks: Dict[str, Any] = {}
         overall_healthy = True
+        chunks_total = 0
+        sources_total = 0
 
         # ---- Database ----
         db_status = "unknown"
@@ -86,6 +100,15 @@ async def health_check():
 
             with engine.connect() as conn:
                 conn.execute(_sa_text("SELECT 1"))
+                try:
+                    sources_total = int(
+                        conn.execute(
+                            _sa_text("SELECT COUNT(DISTINCT source) FROM document_records")
+                        ).scalar()
+                        or 0
+                    )
+                except Exception:
+                    sources_total = 0
             db_status = "healthy"
             db_details["type"] = (
                 "postgresql" if str(engine.url).startswith("postgresql") else "sqlite"
@@ -98,46 +121,33 @@ async def health_check():
 
         # ---- Chroma ----
         chunks_total = 0
-        sources_total = 0
         chroma_status = "unknown"
         chroma_details: Dict[str, Any] = {}
         try:
-            persist_dir = resolve_path(cfg["vector_store"]["persist_directory"])
-            # chromadb >=0.4 持久化文件名为 chroma.sqlite3（旧版为 chroma.sqlite）
-            chroma_db = persist_dir / "chroma.sqlite3"
-            if not chroma_db.exists():
-                chroma_db = persist_dir / "chroma.sqlite"
+            from src.vector_store import probe_collections
 
-            if chroma_db.exists():
-                conn = sqlite3.connect(str(chroma_db))
-                cur = conn.cursor()
-                cur.execute("SELECT COUNT(*) FROM embeddings")
-                chunks_total = cur.fetchone()[0]
-                # chromadb >=1.x 把 metadata 拆到 embedding_metadata 表（key/value），
-                # 旧版 (<0.6) 则是 embeddings.metadata JSON 列；按 schema 兼容查询
-                try:
-                    cur.execute(
-                        "SELECT COUNT(DISTINCT string_value) FROM embedding_metadata "
-                        "WHERE key = 'source'"
-                    )
-                    sources_total = cur.fetchone()[0] or 0
-                except sqlite3.OperationalError:
-                    try:
-                        cur.execute(
-                            "SELECT COUNT(DISTINCT metadata->>'$.source') FROM embeddings"
-                        )
-                        sources_total = cur.fetchone()[0] or 0
-                    except sqlite3.OperationalError:
-                        sources_total = 0
-                conn.close()
+            def _probe_vector_store():
+                return probe_collections(get_vector_store().client)
+
+            report = await run_in_threadpool(_probe_vector_store)
+            chunks_total = int(report.get("chunks", 0))
+            if report.get("status") == "healthy":
                 chroma_status = "healthy"
-                chroma_details = {"chunks": chunks_total, "sources": sources_total}
+                chroma_details = {
+                    "collections": report.get("collections", 0),
+                    "chunks": chunks_total,
+                }
             else:
-                chroma_status = "not_initialized"
-                chroma_details = {"message": "ChromaDB not yet initialized"}
+                chroma_status = "unhealthy"
+                chroma_details = {
+                    "collections": report.get("collections", 0),
+                    "errors": len(report.get("errors", [])),
+                }
+                overall_healthy = False
         except Exception as e:
             chroma_status = "unhealthy"
-            chroma_details["error"] = str(e)[:100]
+            chroma_details["error"] = "vector store probe failed"
+            logger.error("健康检查中的向量库探测失败: %s", e)
             overall_healthy = False
         checks["chroma"] = {"status": chroma_status, "details": chroma_details}
 
@@ -146,14 +156,20 @@ async def health_check():
         llm_details: Dict[str, Any] = {}
         try:
             cfg_llm = cfg.get("llm", {})
-            model_name = cfg_llm.get("model_name", "unknown")
-            cache_dir = cfg_llm.get("cache_dir")
-            if cache_dir:
-                cache_path = resolve_path(cache_dir)
-                llm_details["cache_dir"] = str(cache_path)
-                llm_details["cache_exists"] = cache_path.exists()
-            llm_status = "available"
-            llm_details["model"] = model_name
+            backend = str(cfg_llm.get("backend") or "extractive").strip().lower()
+            llm_details["backend"] = backend
+            if backend == "extractive":
+                llm_status = "not_required"
+                llm_details["model"] = "none"
+            else:
+                model_name = cfg_llm.get("model_name", "unknown")
+                cache_dir = cfg_llm.get("cache_dir")
+                if cache_dir:
+                    cache_path = resolve_path(cache_dir)
+                    llm_details["cache_dir"] = str(cache_path)
+                    llm_details["cache_exists"] = cache_path.exists()
+                llm_status = "available"
+                llm_details["model"] = model_name
         except Exception as e:
             llm_status = "not_available"
             llm_details = {"error": str(e)[:100]}
@@ -228,6 +244,43 @@ async def health_check():
             redis_details = {"error": str(e)[:100]}
         checks["redis"] = {"status": redis_status, "details": redis_details}
 
+        # ---- Storage 一致性（孤儿 collection / 遗留图谱文件）----
+        storage_details: Dict[str, Any] = {}
+        try:
+            from src.db.database import engine as _engine
+            from sqlalchemy import text as _sa
+
+            with _engine.connect() as conn:
+                active_names = {
+                    str(row[0])
+                    for row in conn.execute(
+                        _sa("SELECT collection_name FROM knowledge_bases")
+                    ).fetchall()
+                }
+            client = get_vector_store().client
+            all_names = [str(getattr(c, "name", c)) for c in client.list_collections()]
+            orphaned = sorted(n for n in all_names if n and n not in active_names)
+            storage_details["chroma_collections"] = len(all_names)
+            storage_details["chroma_collections_active"] = len(active_names)
+            storage_details["chroma_collections_orphaned"] = len(orphaned)
+            if orphaned:
+                storage_details["orphaned_sample"] = orphaned[:10]
+            data_dir = resolve_path("data")
+            storage_details["kg_files"] = (
+                len(list(data_dir.glob("kg_*.db"))) if data_dir.exists() else 0
+            )
+            if orphaned or storage_details["kg_files"] > 0:
+                storage_details["suggestion"] = (
+                    "存在孤儿资源，可调用 POST /api/v1/system/maintenance/cleanup"
+                    "（dry_run=true 预览，dry_run=false 清理）"
+                )
+        except Exception as e:
+            storage_details["error"] = str(e)[:120]
+        checks["storage"] = {
+            "status": "ok" if "error" not in storage_details else "degraded",
+            "details": storage_details,
+        }
+
         payload: Dict[str, Any] = {
             "status": "ok" if overall_healthy else "degraded",
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -261,12 +314,93 @@ async def health_invalidate(current_user: User = Depends(get_current_user)):
     让健康检查反复穿透缓存。
     """
     invalidate_health_cache()
+    _clear_readiness_cache()
     return {"status": "ok", "message": "health cache invalidated"}
+
+
+@router.post("/api/v1/system/maintenance/cleanup", tags=["系统"])
+async def maintenance_cleanup(
+    dry_run: bool = Query(True, description="true=仅预览；false=实际删除孤儿资源"),
+    current_user: User = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """清理孤儿资源：未被任何知识库引用的 Chroma collection 与无主 KG 文件。
+
+    安全设计：默认 dry_run=true 只返回预览；只有显式传 dry_run=false
+    才真正删除。删除对象仅限：
+
+    - Chroma 中不在 knowledge_bases.collection_name 里的 collection；
+    - data/kg_*.db 中不属于任何 users 记录、且非配置默认 kg.db 的文件。
+    """
+    from sqlalchemy import text as _sa
+    from src.db.database import engine as _engine
+
+    with _engine.connect() as conn:
+        active_names = {
+            str(row[0])
+            for row in conn.execute(
+                _sa("SELECT collection_name FROM knowledge_bases")
+            ).fetchall()
+        }
+        active_users = {
+            str(row[0])
+            for row in conn.execute(_sa("SELECT id FROM users")).fetchall()
+        }
+
+    client = get_vector_store().client
+    all_names = [str(getattr(c, "name", c)) for c in client.list_collections()]
+    orphan_collections = sorted(n for n in all_names if n and n not in active_names)
+
+    data_dir = resolve_path("data")
+    kg_cfg = get_runtime_config().get("knowledge_graph", {}) or {}
+    default_kg_name = Path(str(kg_cfg.get("sqlite_path", "data/kg.db"))).name
+    orphan_kg_files = []
+    for f in sorted(data_dir.glob("kg_*.db")):
+        if f.name == default_kg_name:
+            continue
+        uid = f.name[len("kg_") : -len(".db")]
+        if uid not in active_users:
+            orphan_kg_files.append(str(f))
+
+    preview = {
+        "dry_run": dry_run,
+        "orphaned_collections": len(orphan_collections),
+        "orphaned_collections_sample": orphan_collections[:20],
+        "orphaned_kg_files": len(orphan_kg_files),
+        "orphaned_kg_files_sample": [Path(p).name for p in orphan_kg_files[:20]],
+    }
+    if dry_run:
+        return preview
+
+    removed_collections = 0
+    for name in orphan_collections:
+        try:
+            client.delete_collection(name)
+            removed_collections += 1
+        except Exception as exc:
+            logger.warning("删除孤儿 collection %s 失败: %s", name, exc)
+
+    removed_kg = 0
+    for path in orphan_kg_files:
+        try:
+            Path(path).unlink(missing_ok=True)
+            removed_kg += 1
+        except Exception as exc:
+            logger.warning("删除孤儿 KG 文件 %s 失败: %s", path, exc)
+
+    return {
+        **preview,
+        "removed_collections": removed_collections,
+        "removed_kg_files": removed_kg,
+    }
 
 
 @router.get("/api/ready")
 async def readiness_check():
     """Kubernetes 就绪探针 - 检查所有依赖服务状态。"""
+    global _ready_cache_at, _ready_cache_payload
+    ttl = get_health_cache_ttl()
+    if _ready_cache_payload is not None and time.monotonic() - _ready_cache_at < ttl:
+        return JSONResponse(status_code=200, content=_ready_cache_payload)
     try:
         # 检查数据库连接
         try:
@@ -278,21 +412,23 @@ async def readiness_check():
         except Exception as e:
             db_status = f"error: {str(e)}"
 
-        # 检查 Chroma 向量库
+        # 检查 Chroma 向量库：文件存在不等于 collection 可读。
+        chroma_detail: Dict[str, Any] = {}
         try:
-            cfg = get_runtime_config()
-            persist_dir = resolve_path(cfg["vector_store"]["persist_directory"])
-            chroma_db = persist_dir / "chroma.sqlite3"
-            if not chroma_db.exists():
-                chroma_db = persist_dir / "chroma.sqlite"
-            if chroma_db.exists():
-                conn = sqlite3.connect(str(chroma_db))
-                conn.close()
-                chroma_status = "connected"
-            else:
-                chroma_status = "not_initialized"
+            def _probe_vector_store():
+                return get_vector_store().health_check()
+
+            report = await run_in_threadpool(_probe_vector_store)
+            chroma_status = "connected"
+            chroma_detail = {
+                "collections": report.get("collections", 0),
+                "chunks": report.get("chunks", 0),
+                "query_probe": report.get("query_probe", False),
+            }
         except Exception as e:
-            chroma_status = f"error: {str(e)}"
+            logger.error("向量库就绪探测失败: %s", e)
+            chroma_status = "error"
+            chroma_detail = {"error": "vector store probe failed"}
 
         # 检查 LLM 可用性（仅校验配置）
         try:
@@ -309,18 +445,21 @@ async def readiness_check():
             "not_initialized",
         )
 
-        return JSONResponse(
-            status_code=200 if is_ready else 503,
-            content={
-                "status": "ready" if is_ready else "not_ready",
-                "checks": {
-                    "database": db_status,
-                    "chroma": chroma_status,
-                    "llm": llm_status,
-                },
+        payload = {
+            "status": "ready" if is_ready else "not_ready",
+            "checks": {
+                "database": db_status,
+                "chroma": chroma_status,
+                "chroma_detail": chroma_detail,
+                "llm": llm_status,
             },
-        )
+        }
+        if is_ready:
+            _ready_cache_payload = payload
+            _ready_cache_at = time.monotonic()
+        return JSONResponse(status_code=200 if is_ready else 503, content=payload)
     except Exception as exc:
+        _clear_readiness_cache()
         logger.error("就绪检查失败: %s", exc)
         return JSONResponse(
             status_code=503,

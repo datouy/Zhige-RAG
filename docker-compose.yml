@@ -20,30 +20,23 @@ services:
     environment:
       # Database（口令一律走环境变量，禁止明文写死在 compose 里；
       # 未设置时 compose 会直接报错退出，而不是静默用弱口令启动）
-      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-raguser}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD 必须设置（见 .env.example）}@postgres:5432/${POSTGRES_DB:-chineseragkb}
-      - SYNC_DATABASE_URL=postgresql://${POSTGRES_USER:-raguser}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD 必须设置（见 .env.example）}@postgres:5432/${POSTGRES_DB:-chineseragkb}
+      - DATABASE_URL=postgresql+psycopg://${POSTGRES_USER:-raguser}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD 必须设置（见 .env.example）}@postgres:5432/${POSTGRES_DB:-chineseragkb}
       # ---- 模型后端 ----
-      # 默认走 Ollama：不需要 GPU，也不需要把 torch 打进镜像。
-      # 注意容器内的 localhost 指向容器自身，故默认指向 host.docker.internal。
-      - LLM_BACKEND=${LLM_BACKEND:-ollama}
-      - EMBEDDING_BACKEND=${EMBEDDING_BACKEND:-ollama}
-      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://host.docker.internal:11434/v1}
-      - EMBEDDING_OLLAMA_BASE_URL=${EMBEDDING_OLLAMA_BASE_URL:-http://host.docker.internal:11434/v1}
-      - OLLAMA_MODEL=${OLLAMA_MODEL:-qwen3:4b-instruct-2507-q4_K_M}
-      - EMBEDDING_OLLAMA_MODEL=${EMBEDDING_OLLAMA_MODEL:-nomic-embed-text}
-      # 改用云端 API 时（同样不需要 GPU / Ollama）：
+      # 默认无 LLM：原文摘录 + ONNX 向量，模型已打进 lite 镜像。
+      - LLM_BACKEND=${LLM_BACKEND:-extractive}
+      - EMBEDDING_BACKEND=${EMBEDDING_BACKEND:-onnx}
+      # 改用云端 API 时（可选）：
       #   LLM_BACKEND=openai  EMBEDDING_BACKEND=openai  OPENAI_API_KEY=sk-xxxx
       #   并用 OPENAI_BASE_URL / OPENAI_MODEL 指向你的服务
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - OPENAI_BASE_URL=${OPENAI_BASE_URL:-https://api.deepseek.com/v1}
       - OPENAI_MODEL=${OPENAI_MODEL:-deepseek-chat}
       # Security
-      - ALLOWED_ORIGINS=
-${ALLOWED_ORIGINS:-http://localhost:8000,http://127.0.0.1:8000}
+      - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-http://localhost:8000,http://127.0.0.1:8000}
       # Rate Limiting
       - RATE_LIMIT_STORAGE_URL=redis://redis:6379/0
       # Chroma
-      - CHROMA_PERSIST_DIRECTORY=/app/data/chroma
+      - VECTOR_STORE_PERSIST_DIR=/app/data/chroma
       # Paths
       - DATA_PATH=/app/data/raw
       - LOG_PATH=/app/logs/server.log

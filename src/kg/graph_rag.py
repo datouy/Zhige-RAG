@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from src.kg.retriever import GraphRetriever
-from src.rag_pipeline import RAGPipeline
+from src.kg.schema import Triple
 from src.vector_store import ChromaStore
 
 

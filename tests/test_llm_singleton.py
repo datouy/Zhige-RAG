@@ -29,6 +29,9 @@ def stubbed_deps(monkeypatch):
         return object()
 
     monkeypatch.setattr(RAGPipeline, "_build_llm_from_cfg", classmethod(fake_build))
+    # These tests exercise the optional generative backend. The repository
+    # default is now extractive, so opt this fixture back into LLM loading.
+    monkeypatch.setattr(RAGPipeline, "_is_extractive_mode", lambda self: False)
     monkeypatch.setattr(deps, "get_embedding", lambda: object())
     monkeypatch.setattr(deps, "get_vector_store", lambda: object())
     # reranker 默认已开启（配置里 enabled: true）：单元测试不该为此加载 1.1GB

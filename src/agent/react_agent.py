@@ -423,8 +423,8 @@ class ReActAgent:
                 else:
                     # Agent 自评：没想用工具也没产出 Final Answer，提示它产出结论
                     scratchpad += (
-                        f"\nThought: 我暂时不需要工具，但还没给出最终回答。"
-                        f"请直接给出 Final Answer。\n"
+                        "\nThought: 我暂时不需要工具，但还没给出最终回答。"
+                        "请直接给出 Final Answer。\n"
                     )
                     continue
 

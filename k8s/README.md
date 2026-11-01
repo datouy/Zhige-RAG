@@ -31,11 +31,10 @@ kubectl -n chineseragkb get ingress
 kubectl -n chineseragkb logs -l app=chineseragkb -f
 
 # Scaling
-# Manual scaling
-kubectl -n chineseragkb scale deployment chineseragkb-api --replicas=3
-
-# Enable HPA
-kubectl -n chineseragkb autoscale deployment chineseragkb-api --min=2 --max=10 --cpu-percent=70
+# 当前 Chroma 与用户级知识图谱是本地单写文件库，必须保持 replicas=1。
+# 不要手动扩容，也不要提高 hpa.yaml 的 maxReplicas。
+# 如需多副本，先迁移到集中式向量库/图数据库，并为任务、限流和缓存提供
+# 分布式存储，再同步修改 Deployment 与 HPA。
 
 # Update Strategy
 # Rolling update

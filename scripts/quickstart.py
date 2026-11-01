@@ -6,14 +6,14 @@
     python scripts/quickstart.py                      # 智能检测并启动
     python scripts/quickstart.py --check              # 仅检查环境
     python scripts/quickstart.py --install            # 缺少依赖时自动安装
-    python scripts/quickstart.py --backend ollama     # 强制使用 Ollama 后端
+    python scripts/quickstart.py --backend extractive # 无 LLM 原文摘录
     python scripts/quickstart.py --backend openai     # 强制使用云端 API
     python scripts/quickstart.py --wizard             # 交互式向导
 
 设计说明：
 - 自动检测最佳可用的模型后端
 - 提供清晰的配置指导
-- 优先推荐 Ollama（无需 GPU、无需下载权重）
+- 默认使用 extractive + ONNX，无需 GPU、torch 或 LLM
 """
 from __future__ import annotations
 
@@ -245,53 +245,20 @@ def check_api_key() -> Optional[str]:
 
 
 def auto_detect_backend() -> str:
-    """自动检测最佳可用的后端。"""
-    say(INFO, "正在自动检测可用的模型后端...")
-    
-    # 1. 先检查 Ollama（最推荐）
-    ollama_ok, ollama_info, models = check_ollama()
-    if ollama_ok:
-        # 检查是否有必要的模型
-        has_llm = any(m in models.lower() for m in ["qwen", "llama", "deepseek", "glm"])
-        has_emb = "nomic" in models.lower() or "bge" in models.lower()
-        
-        if has_llm or has_emb:
-            say(OK, f"Ollama 已就绪（{ollama_info}）")
-            return "ollama"
-        else:
-            say(
-                WARN,
-                "Ollama 运行中，但未检测到模型："
-                f"ollama pull {RECOMMENDED_OLLAMA_MODEL} && ollama pull nomic-embed-text",
-            )
-            return "ollama"
-    
-    # 2. 检查 API Key
-    api_key = check_api_key()
-    if api_key:
-        say(OK, f"检测到 API Key（{api_key[:6]}...），可以使用云端 API")
-        return "openai"
-    
-    # 3. 检查本地模型
+    """Keep the configured LLM-free backend unless the user opts in."""
+    say(INFO, "使用配置中的无 LLM 后端（extractive + ONNX）")
     cfg = load_cfg()
-    model_name = cfg.get("llm", {}).get("model_name", "")
-    if model_name:
-        model_path = ROOT / model_name
-        if not model_path.is_absolute():
-            model_path = ROOT / model_name
-        if model_path.exists():
-            say(OK, f"本地模型已就位：{model_name}")
-            return "local"
-    
-    # 4. 无法自动检测
-    say(WARN, "无法自动检测到可用的模型后端")
-    return "unknown"
+    return str((cfg.get("llm") or {}).get("backend") or "extractive").lower()
 
 
 def check_llm_backend(cfg: Dict[str, Any], force_backend: Optional[str] = None) -> bool:
     llm = cfg.get("llm") or {}
-    backend = force_backend or str(os.getenv("LLM_BACKEND") or llm.get("backend") or "local").lower()
+    backend = force_backend or str(os.getenv("LLM_BACKEND") or llm.get("backend") or "extractive").lower()
     say("  ", f"对话模型后端：{backend}")
+
+    if backend == "extractive":
+        say(OK, "无 LLM 模式：直接返回带引用的知识库原文")
+        return True
 
     if backend == "ollama":
         section = llm.get("ollama") or {}
@@ -357,14 +324,31 @@ def check_llm_backend(cfg: Dict[str, Any], force_backend: Optional[str] = None) 
         say(WARN, f"本地模型尚未下载，首次使用会联网拉取：{model_name}")
         return True
 
-    say(FAIL, f"未知后端：{backend}（可选 local / ollama / openai）")
+    say(FAIL, f"未知后端：{backend}（可选 extractive / local / ollama / openai）")
     return False
 
 
 def check_embedding_backend(cfg: Dict[str, Any], force_backend: Optional[str] = None) -> bool:
     emb = cfg.get("embedding") or {}
-    backend = force_backend or str(os.getenv("EMBEDDING_BACKEND") or emb.get("backend") or "ollama").lower()
+    backend = force_backend or str(os.getenv("EMBEDDING_BACKEND") or emb.get("backend") or "onnx").lower()
     say("  ", f"向量模型后端：{backend}")
+
+    if backend == "onnx":
+        section = emb.get("onnx") or {}
+        model_dir = Path(section.get("model_path") or emb.get("model_name") or "models/bge-small-zh-v1.5-onnx")
+        if not model_dir.is_absolute():
+            model_dir = ROOT / model_dir
+        required = [
+            model_dir / section.get("model_file", "onnx/model_quantized.onnx"),
+            model_dir / section.get("tokenizer_file", "tokenizer.json"),
+        ]
+        missing = [str(path) for path in required if not path.exists()]
+        if missing:
+            say(FAIL, "ONNX Embedding 文件缺失：" + "、".join(missing))
+            say("  ", "运行：python scripts/setup_onnx_embedding.py")
+            return False
+        say(OK, f"ONNX Embedding 已就位：{model_dir}")
+        return True
 
     if backend == "ollama":
         section = emb.get("ollama") or {}
@@ -435,18 +419,16 @@ def show_recommendations():
     """显示配置建议。"""
     print()
     print("推荐配置（按推荐程度排序）")
-    print("  1. Ollama（推荐，无需 GPU，完全免费）")
-    print("     - 下载：https://ollama.com/download")
-    print(f"     - 模型：ollama pull {RECOMMENDED_OLLAMA_MODEL}")
-    print("     - 向量：ollama pull nomic-embed-text")
-    print("     - 启动：python scripts\\quickstart.py --backend ollama")
-    print("  2. 云端 API（无需本地模型，按量付费）")
+    print("  1. 无 LLM（当前默认，无需 GPU / torch）")
+    print("     - 回答：带引用的知识库原文摘录")
+    print("     - 向量：ONNX BGE，运行于 CPU")
+    print("     - 准备：python scripts\\setup_onnx_embedding.py")
+    print("  2. 可选云端 API（按量付费）")
     print("     - DeepSeek: https://platform.deepseek.com/")
     print("     - 通义千问: https://dashscope.console.aliyun.com/")
     print("     - 设置环境变量 OPENAI_API_KEY 后启动")
-    print("  3. 本地模型（需要 GPU，完全离线）")
-    print("     - 安装：pip install -r requirements.txt")
-    print("     - 启动：python scripts\\quickstart.py")
+    print("  3. 可选生成式本地模型（需要 torch；本机已移除）")
+    print("     - 安装：pip install -r requirements-core.txt -r requirements-local.txt")
 
 
 def main() -> int:
@@ -461,12 +443,12 @@ def main() -> int:
     parser.add_argument("--wizard", action="store_true", help="交互式配置向导")
     parser.add_argument(
         "--backend",
-        choices=["local", "ollama", "openai"],
+        choices=["extractive", "local", "ollama", "openai"],
         help="指定模型后端（通过环境变量，不改配置文件）",
     )
     parser.add_argument(
         "--embedding-backend",
-        choices=["local", "ollama", "openai"],
+        choices=["onnx", "local", "ollama", "openai"],
         help="单独指定 Embedding 后端",
     )
     args = parser.parse_args()
@@ -474,8 +456,7 @@ def main() -> int:
     extra_env: Dict[str, str] = {}
     if args.backend:
         extra_env["LLM_BACKEND"] = args.backend
-        extra_env["EMBEDDING_BACKEND"] = args.embedding_backend or args.backend
-    elif args.embedding_backend:
+    if args.embedding_backend:
         extra_env["EMBEDDING_BACKEND"] = args.embedding_backend
 
     for key, value in extra_env.items():
@@ -501,10 +482,10 @@ def main() -> int:
     cfg = load_cfg()
     
     # 确定后端
-    backend = args.backend or os.getenv("LLM_BACKEND") or cfg.get("llm", {}).get("backend", "ollama")
-    emb_backend = args.embedding_backend or os.getenv("EMBEDDING_BACKEND") or cfg.get("embedding", {}).get("backend", "ollama")
+    backend = args.backend or os.getenv("LLM_BACKEND") or cfg.get("llm", {}).get("backend", "extractive")
+    emb_backend = args.embedding_backend or os.getenv("EMBEDDING_BACKEND") or cfg.get("embedding", {}).get("backend", "onnx")
     
-    if backend == "unknown" or backend == "local" and not args.backend:
+    if backend == "unknown":
         # 尝试自动检测
         detected = auto_detect_backend()
         if detected != "unknown" and detected != backend:
@@ -512,7 +493,6 @@ def main() -> int:
             backend = detected
             emb_backend = detected
             extra_env["LLM_BACKEND"] = backend
-            extra_env["EMBEDDING_BACKEND"] = emb_backend
     
     llm_ok = check_llm_backend(cfg, backend)
     emb_ok = check_embedding_backend(cfg, emb_backend)

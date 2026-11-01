@@ -11,12 +11,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List
+from typing import Any, Dict
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from src.vector_store import ChromaStore, Hit
+from src.vector_store import ChromaStore, Hit, VectorStoreHealthError, probe_collections
 
 
 # ----------------------------------------------------------------------
@@ -200,6 +200,92 @@ def test_add_chunks_uses_upsert(store_with_mock_client):
     assert all(md["source"] == "a.txt" for md in kwargs["metadatas"])
 
 
+def test_probe_collections_reports_unreadable_collection():
+    class _Collection:
+        name = "broken"
+
+        def count(self):
+            return 0
+
+        def get(self, **_kwargs):
+            raise RuntimeError("metadata segment mismatch")
+
+    class _EmptyCountCollection(_Collection):
+        name = "ok"
+
+        def get(self, **_kwargs):
+            return {"ids": []}
+
+    class _Client:
+        def list_collections(self):
+            return [_Collection(), _EmptyCountCollection()]
+
+    # count=0 时不强制 get，因此 broken 需要返回正数才会触发真实读取。
+    first = _Collection()
+    first.count = lambda: 1
+    report = probe_collections(type("C", (), {"list_collections": lambda self: [first]})())
+    assert report["status"] == "unhealthy"
+    assert report["errors"][0]["name"] == "broken"
+
+
+def test_health_check_raises_on_unhealthy_collection(store_with_mock_client):
+    store, coll = store_with_mock_client
+    coll.count.side_effect = RuntimeError("metadata segment mismatch")
+    coll.name = "test_coll"
+    store.client.list_collections.return_value = [coll]
+    with pytest.raises(VectorStoreHealthError):
+        store.health_check(query_probe=False)
+
+
+def test_replace_chunks_deletes_stale_after_upsert(store_with_mock_client):
+    store, coll = store_with_mock_client
+    coll.get.return_value = {
+        "ids": ["old-1", "old-2"],
+        "documents": ["old one", "old two"],
+        "metadatas": [{"source": "a.txt"}, {"source": "a.txt"}],
+        "embeddings": [[0.1, 0.2], [0.3, 0.4]],
+    }
+    chunks = [_FakeChunk("new", 0, {"source": "a.txt", "page": 1})]
+    replaced = store.replace_chunks_for_sources(chunks, ["a.txt"])
+    assert replaced == 1
+    assert coll.upsert.called
+    assert set(coll.delete.call_args.kwargs["ids"]) == {"old-1", "old-2"}
+
+
+def test_replace_chunks_restores_old_on_write_failure(store_with_mock_client):
+    store, coll = store_with_mock_client
+    coll.get.return_value = {
+        "ids": ["old-1"],
+        "documents": ["old"],
+        "metadatas": [{"source": "a.txt"}],
+        "embeddings": [[0.1, 0.2]],
+    }
+    coll.upsert.side_effect = [RuntimeError("disk full"), None]
+    chunks = [_FakeChunk("new", 0, {"source": "a.txt", "page": 1})]
+    with pytest.raises(RuntimeError, match="disk full"):
+        store.replace_chunks_for_sources(chunks, ["a.txt"])
+    assert coll.upsert.call_count == 2
+    assert coll.upsert.call_args.kwargs["ids"] == ["old-1"]
+
+
+def test_replace_chunks_rolls_back_when_metadata_callback_fails(store_with_mock_client):
+    store, coll = store_with_mock_client
+    coll.get.return_value = {
+        "ids": ["old-1"],
+        "documents": ["old"],
+        "metadatas": [{"source": "a.txt"}],
+        "embeddings": [[0.1, 0.2]],
+    }
+    chunks = [_FakeChunk("new", 0, {"source": "a.txt", "page": 1})]
+
+    def _fail():
+        raise RuntimeError("ledger failed")
+
+    with pytest.raises(RuntimeError, match="ledger failed"):
+        store.replace_chunks_for_sources(chunks, ["a.txt"], on_commit=_fail)
+    assert coll.upsert.call_count == 2
+
+
 def test_make_id_is_deterministic():
     """不同 source/page/index 应给出不同的稳定 id。"""
     from src.vector_store import _make_id
@@ -213,6 +299,7 @@ def test_make_id_is_deterministic():
 
 def test_tokenize_jieba_word_level():
     """装了 jieba 时 CJK 按词切分；停用词（的/了/和…）被过滤。"""
+    pytest.importorskip("jieba")
     from src.vector_store import _tokenize
 
     toks = _tokenize("引用了多少篇参考文献")

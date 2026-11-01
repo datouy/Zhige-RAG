@@ -28,8 +28,8 @@ logger = get_logger("settings_service")
 
 OVERRIDES_RELPATH = "config/local_overrides.yaml"
 
-SUPPORTED_LLM_BACKENDS = ("local", "ollama", "openai")
-SUPPORTED_EMB_BACKENDS = ("local", "ollama", "openai")
+SUPPORTED_LLM_BACKENDS = ("extractive", "local", "ollama", "openai")
+SUPPORTED_EMB_BACKENDS = ("onnx", "local", "ollama", "openai")
 
 
 class SettingsError(ValueError):
@@ -116,13 +116,14 @@ def get_model_settings(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
 
     return {
         "llm": {
-            "backend": llm.get("backend", "local"),
+            "backend": llm.get("backend", "extractive"),
             "local": {"model": llm.get("model_name", ""), "device": llm.get("device", "auto")},
             "ollama": _section(llm, "ollama"),
             "openai": _section(llm, "openai"),
         },
         "embedding": {
-            "backend": emb.get("backend", "local"),
+            "backend": emb.get("backend", "onnx"),
+            "onnx": _section(emb, "onnx"),
             "local": {"model": emb.get("model_name", ""), "device": emb.get("device", "auto")},
             "ollama": _section(emb, "ollama"),
             "openai": _section(emb, "openai"),
@@ -179,7 +180,7 @@ def update_model_settings(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     # 先算出"切换前"的 embedding 后端，用于判断是否需要提醒重新入库
     before = effective_config()
-    before_emb = (before.get("embedding") or {}).get("backend", "local")
+    before_emb = (before.get("embedding") or {}).get("backend", "onnx")
 
     overrides = load_overrides()
     llm_over = dict(overrides.get("llm") or {})
@@ -225,7 +226,7 @@ def update_model_settings(payload: Dict[str, Any]) -> Dict[str, Any]:
     warnings = []
     after = effective_config()
     after_emb = (after.get("embedding") or {}).get("backend", "local")
-    if after_emb != before_emb:
+    if after_emb != before_emb and {after_emb, before_emb} != {"onnx", "local"}:
         warnings.append(
             f"Embedding 后端已从 {before_emb} 切换为 {after_emb}，"
             "向量库会切换到独立 collection —— 之前入库的文档需要重新上传才能被检索到。"
@@ -285,6 +286,33 @@ def test_model_connection(payload: Dict[str, Any]) -> Dict[str, Any]:
     model = str(payload.get("model") or "").strip()
 
     # ---- 本地后端：测的是"依赖与权重就位没有"，不是网络 ----
+    if backend == "extractive":
+        if kind != "llm":
+            return {"ok": False, "detail": "extractive 仅适用于对话回答模式"}
+        return {
+            "ok": True,
+            "detail": "抽取式回答已启用：直接返回带引用的知识库原文，不加载 LLM",
+        }
+
+    if backend == "onnx":
+        if kind != "embedding":
+            return {"ok": False, "detail": "onnx 仅适用于向量模型"}
+        missing = [
+            name
+            for name in ("onnxruntime", "tokenizers")
+            if importlib.util.find_spec(name) is None
+        ]
+        model_path = str(payload.get("model") or "./models/bge-small-zh-v1.5-onnx")
+        onnx_file = resolve_path(model_path) / "onnx/model_quantized.onnx"
+        if not onnx_file.exists():
+            missing.append(str(onnx_file))
+        if missing:
+            return {"ok": False, "detail": "ONNX Embedding 文件或依赖缺失：" + "、".join(missing)}
+        return {
+            "ok": True,
+            "detail": "ONNX Embedding 已就绪（CPU 推理，不需要 LLM / torch）",
+        }
+
     if backend == "local":
         missing = []
         if importlib.util.find_spec("torch") is None:
