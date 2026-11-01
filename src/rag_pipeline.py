@@ -93,6 +93,22 @@ def _strip_breadcrumb(text: str) -> str:
     return s
 
 
+_SENTENCE_END = "。！？!?；;"
+
+
+def _trim_snippet(text: str, max_chars: int = 200) -> str:
+    """Make a citation snippet readable: collapse whitespace and end on a full sentence."""
+    s = _strip_breadcrumb(text)
+    s = re.sub(r"\s+", " ", s).strip()
+    if len(s) <= max_chars:
+        return s
+    s = s[:max_chars]
+    last = max(s.rfind(ch) for ch in _SENTENCE_END)
+    if last > 0:
+        s = s[: last + 1]
+    return s
+
+
 def normalize_query(query: str) -> str:
     """查询归一化：全角→半角（NFKC）、合并空白、剥离中文客套前缀。
 
@@ -870,7 +886,7 @@ class RAGPipeline:
                     # 四条来源全是"相似度 —"。现在带上真实分数与类型。
                     "score": c.get("score", meta.get("_rerank_score")),
                     "score_kind": c.get("score_kind", "dense"),
-                    "snippet": _strip_breadcrumb(c["content"])[:200],
+                    "snippet": _trim_snippet(c["content"], 200),
                 }
             )
         return cites

@@ -7,6 +7,7 @@ from __future__ import annotations
 import os
 import re
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict
 
@@ -33,6 +34,14 @@ router = APIRouter()
 
 _ready_cache_at = 0.0
 _ready_cache_payload: Dict[str, Any] | None = None
+
+
+_CN_TZ = timezone(timedelta(hours=8))
+
+
+def _cn_timestamp() -> str:
+    """返回北京时间（Asia/Shanghai，UTC+8）ISO 风格时间戳。"""
+    return datetime.now(_CN_TZ).strftime("%Y-%m-%dT%H:%M:%S+08:00")
 
 
 def _clear_readiness_cache() -> None:
@@ -283,7 +292,7 @@ async def health_check():
 
         payload: Dict[str, Any] = {
             "status": "ok" if overall_healthy else "degraded",
-            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "timestamp": _cn_timestamp(),
             "version": "0.3.0",
             "chunks": chunks_total,
             "sources": sources_total,
@@ -301,7 +310,7 @@ async def health_check():
             content={
                 "status": "error",
                 "error": str(exc),
-                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "timestamp": _cn_timestamp(),
             },
         )
 
