@@ -396,7 +396,7 @@ llm:
 
 # ------------------ RAG 推理参数 ------------------
 rag:
-  top_k: 4
+  top_k: 8
   use_reranker: false
   max_context_tokens: 1800
   max_history_turns: 3

@@ -18,7 +18,7 @@ class ChatApp {
         this.ws = null;
         this.connected = false;
         this.currentSources = [];
-        this.topK = 4;
+        this.topK = 8;
 
         this.knowledgeBases = [];
         this.currentKb = null;
