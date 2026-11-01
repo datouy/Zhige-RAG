@@ -672,6 +672,15 @@ class ChromaStore:
                 page = int(md.get("page") or 1)
                 cid = _make_id(src, page, c.index)
                 safe_md = {k: (v if isinstance(v, (str, int, float, bool)) else str(v)) for k, v in md.items()}
+                # 落库时记住分块在文档内的原始序号。检索结果默认按相似度排序，
+                # 直接拿它当上下文会把原文顺序打乱 —— 因果链、时间线都断了，
+                # 模型只能做平行罗列。有了 chunk_index，_build_context 才能
+                # 按原文顺序装配上下文（老索引没有该字段，保持原行为）。
+                if "chunk_index" not in safe_md:
+                    try:
+                        safe_md["chunk_index"] = int(getattr(c, "index", 0) or 0)
+                    except (TypeError, ValueError):
+                        pass
                 unique[cid] = {"text": c.text, "metadata": safe_md}
 
             ids = list(unique.keys())
@@ -779,6 +788,38 @@ class ChromaStore:
                     f"（sources={source_set}, write_error={exc}, rollback_error={rollback_exc})"
                 ) from exc
             raise
+
+    def get_by_source(self, source: str, where: Optional[Dict[str, Any]] = None) -> List[Hit]:
+        """读取指定来源文档的全部分块，可叠加安全过滤条件。
+
+        返回**按 chunk_index 升序**（即原文顺序）的分块：``collection.get``
+        不保证顺序，拿乱序分块拼上下文会让"先说结论、后说原因"的叙述错位。
+        老索引没有 ``chunk_index`` 字段时保持存储顺序不动。
+        """
+        filters: List[Dict[str, Any]] = [{"source": source}]
+        if where:
+            filters.append(where)
+        combined = filters[0] if len(filters) == 1 else {"$and": filters}
+        data = self.collection.get(where=combined, include=["documents", "metadatas"])
+        ids = data.get("ids") or []
+        docs = data.get("documents") or []
+        metas = data.get("metadatas") or []
+        hits = [
+            Hit(id=ids[i], text=docs[i] or "", score=1.0,
+                metadata=metas[i] if i < len(metas) else {})
+            for i in range(len(ids))
+        ]
+        if len(hits) <= 1:
+            return hits
+        indices: List[Optional[int]] = []
+        for hit in hits:
+            try:
+                indices.append(int((hit.metadata or {}).get("chunk_index")))
+            except (TypeError, ValueError):
+                indices.append(None)
+        if all(index is not None for index in indices):
+            hits = [h for _, h in sorted(zip(indices, hits), key=lambda pair: pair[0])]
+        return hits
 
     def query(
         self,

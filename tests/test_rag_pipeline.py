@@ -114,6 +114,10 @@ def test_retrieve_min_score_guard():
         p.vector_store = _Store()
         return p
 
+    weak_but_retrieved = _make_pipeline([Hit(id="1", text="答案在片段中", score=0.2, metadata={})])
+    weak_but_retrieved.config = {"retrieval": {"min_score": 0.15}}
+    assert len(weak_but_retrieved._retrieve("具体问题", top_k=3, where=None)) == 1
+
     low = _make_pipeline([Hit(id="1", text="x", score=0.1, metadata={})])
     assert low._retrieve("任意问题", top_k=3, where=None) == []
 
@@ -123,6 +127,49 @@ def test_retrieve_min_score_guard():
     off = _make_pipeline([Hit(id="1", text="x", score=0.1, metadata={})])
     off.config = {"retrieval": {"min_score": 0.0}}
     assert len(off._retrieve("任意问题", top_k=3, where=None)) == 1
+
+
+def test_retrieve_scans_full_collection_before_filtering():
+    """默认 Top-K 不应限制问题相关性检索所覆盖的知识库分块。"""
+    from src.rag_pipeline import RAGPipeline
+    from src.vector_store import Hit
+
+    class _Store:
+        def __init__(self):
+            self.requested_k = None
+
+        def count(self):
+            return 12
+
+        def query(self, query_text, top_k, where=None, score_threshold=0.0):
+            self.requested_k = top_k
+            return [Hit(id="relevant", text="匹配内容", score=0.9, metadata={"source": "a.md"})]
+
+    store = _Store()
+    p = object.__new__(RAGPipeline)
+    p.config = {"retrieval": {"min_score": 0.0}}
+    p.vector_store = store
+
+    hits = p._retrieve("问题", top_k=3, where=None)
+
+    assert store.requested_k == 12
+    assert [hit.id for hit in hits] == ["relevant"]
+
+
+def test_retrieve_preserves_requested_k_when_count_unavailable():
+    """不支持 count() 的后端仍按原 Top-K 方式工作。"""
+    from src.rag_pipeline import RAGPipeline
+    from src.vector_store import Hit
+
+    class _Store:
+        def query(self, query_text, top_k, where=None, score_threshold=0.0):
+            assert top_k == 3
+            return [Hit(id="1", text="内容", score=0.9, metadata={})]
+
+    p = object.__new__(RAGPipeline)
+    p.config = {"retrieval": {"min_score": 0.0}}
+    p.vector_store = _Store()
+    assert len(p._retrieve("问题", top_k=3, where=None)) == 1
 
 
 def test_hybrid_bm25_only_hit_score_normalized():

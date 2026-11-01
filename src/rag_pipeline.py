@@ -50,10 +50,10 @@ DEFAULT_LLM_TIMEOUT = 120.0
 # 最大重试次数
 DEFAULT_MAX_RETRIES = 2
 
-# 检索命中最低分兜底：所有命中都低于该相似度时按"未命中"处理，宁可拒答
-# 也不让小模型对着无关上下文编造。BM25 独有命中已归一到 (0,1)（s/(1+s)），
-# 强词面命中可达 0.7+，不会被误伤；阈值取保守值，只拦截明显无关的查询。
-DEFAULT_MIN_SCORE = 0.25
+# 检索命中最低分兜底：向量相似度与 BM25 归一化分数不是同一量纲，固定高阈值会
+# 把混合检索中真实的弱语义/关键词命中误判为空。默认仅拦截极低分，是否可答由
+# 引用上下文和生成提示共同判断；需要严格拒答时可显式提高 retrieval.min_score。
+DEFAULT_MIN_SCORE = 0.15
 
 # 检索结果短 TTL 缓存（秒）：相同查询在窗口内复用，降低重复的 embedding 编码与
 # 向量检索开销。缓存键含 collection 名，多知识库/多租户之间不会串数据。
@@ -419,6 +419,17 @@ class RAGPipeline:
         where: Optional[Dict[str, Any]],
         allowed_groups: Optional[List[str]] = None,
     ) -> List[Hit]:
+        # 全库扫描是为了"相关分块不因默认 Top-K 太小而进不了候选集"，
+        # 但**候选集不等于上下文**：把这个候选集原样交给 `_build_context`，
+        # 253 块均分 3600 字预算就是每块 14 个字符，模型看到的全是残句，
+        # 引用编号也会跳号（回答里出现 [1]-[5][7][8] 却缺 [6] 就是这么来的）。
+        # 所以这里记下调用方要的 K，最后按分数截回去。
+        requested_k = int(top_k)
+        try:
+            corpus_size = int(self.vector_store.count())
+            top_k = max(requested_k, corpus_size)
+        except (AttributeError, TypeError, ValueError):
+            pass
         security_where = self._security_where(where, allowed_groups)
         norm_query = normalize_query(query)
         hits = self._cached_vector_query(
@@ -457,6 +468,10 @@ class RAGPipeline:
                 norm_query[:50],
             )
             return []
+        # 截回调用方要的 K：全库打分只用来"发现"，不该整包塞进 prompt。
+        # 保持分数降序，下游（全文扩展 / 重排 / 引用）都按这个顺序取。
+        if requested_k > 0 and len(hits) > requested_k:
+            hits = sorted(hits, key=lambda h: h.score, reverse=True)[:requested_k]
         return hits
 
     def _verify(self, answer: str, context_chunks: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -470,8 +485,12 @@ class RAGPipeline:
         from .verifier import verify_answer, verify_answer_with_decision
 
         fallback = self.config.get("rag", {}).get("fallback_answer", FALLBACK_NO_HIT_ANSWER)
-        min_ratio = float(self.config.get("rag", {}).get("verification", {}).get("min_cited_ratio", 0.5))
-        min_grounding = float(self.config.get("rag", {}).get("verification", {}).get("min_grounding", 0.6))
+        vcfg = self.config.get("rag", {}).get("verification", {}) or {}
+        min_ratio = float(vcfg.get("min_cited_ratio", 0.5))
+        min_grounding = float(vcfg.get("min_grounding", 0.6))
+        # synthesis_aware=True 时，"提炼/判断句"不再被词面接地检查误判为编造
+        # （详见 src/verifier.py）。默认 False 保持旧行为。
+        synthesis_aware = bool(vcfg.get("synthesis_aware", False))
 
         provider = None
         if (self.config.get("decision", {}) or {}).get("verify", {}).get("enabled"):
@@ -484,6 +503,7 @@ class RAGPipeline:
                 fallback_answer=fallback,
                 min_cited_ratio=min_ratio,
                 min_grounding=min_grounding,
+                synthesis_aware=synthesis_aware,
             ).to_dict()
         return verify_answer(
             answer,
@@ -491,6 +511,7 @@ class RAGPipeline:
             fallback_answer=fallback,
             min_cited_ratio=min_ratio,
             min_grounding=min_grounding,
+            synthesis_aware=synthesis_aware,
         ).to_dict()
 
     def _recall_long_term(self, user_id: Optional[str]) -> List[Dict[str, str]]:
@@ -807,16 +828,303 @@ class RAGPipeline:
             hits = self._rerank(normalize_query(question), hits, top_n=k)
         return hits
 
+    # ------------------------------------------------------------------
+    def _fulltext_expand_cfg(self) -> Dict[str, Any]:
+        return (self.config.get("rag", {}) or {}).get("fulltext_expand", {}) or {}
+
+    def _expand_to_fulltext(
+        self,
+        question: str,
+        hits: List[Hit],
+        where: Optional[Dict[str, Any]] = None,
+        allowed_groups: Optional[List[str]] = None,
+    ) -> List[Hit]:
+        """总结 / 主旨类问题：把命中到的文档换成它的**全部分块**。
+
+        原实现是写死在 ``answer()`` 里的一段内联代码，``stream_answer()``
+        （Web UI 与异步接口的真实路径）和 ``answer_with_timing()`` 都没有这段。
+        结果是从界面上问"总结一下这一章"，模型拿到的永远只有 Top-K 的几个
+        碎片 —— 它当然只能回答"文中提到 A""文章还提到 B"，给不出论证。
+        """
+        cfg = self._fulltext_expand_cfg()
+        if not cfg.get("enabled", True) or not hits:
+            return hits
+        pattern = str(cfg.get("pattern") or "").strip()
+        if not pattern:
+            return hits
+        try:
+            triggered = bool(re.search(pattern, question or ""))
+        except re.error:
+            logger.warning("rag.fulltext_expand.pattern 不是合法正则，跳过全文扩展：%s", pattern)
+            triggered = False
+        if not triggered:
+            return hits
+        expand = getattr(self.vector_store, "get_by_source", None)
+        if not callable(expand):
+            return hits
+
+        max_docs = max(1, int(cfg.get("max_documents", 3)))
+        max_chars = max(0, int(cfg.get("max_chars", 40000)))
+        try:
+            safe_where = self._security_where(where, allowed_groups)
+        except Exception:  # noqa: BLE001 - 安全过滤构造失败时退化为检索用条件
+            safe_where = where
+
+        # 依命中文档的先后取全文：排最前的文档最相关，预算不够时优先保它完整。
+        by_source: Dict[str, List[Hit]] = {}
+        source_order: List[str] = []
+        for hit in hits:
+            source = str((hit.metadata or {}).get("source") or "")
+            if not source or source in by_source:
+                continue
+            if len(source_order) >= max_docs:
+                break
+            source_order.append(source)
+            try:
+                by_source[source] = list(expand(source, where=safe_where) or [])
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("读取文档全文失败，保留检索片段（%s）: %s", source, exc)
+                by_source[source] = []
+
+        merged: List[Hit] = []
+        used = 0
+        for source in source_order:
+            for hit in by_source.get(source) or []:
+                size = len(hit.text or "")
+                if max_chars and used + size > max_chars:
+                    break
+                merged.append(hit)
+                used += size
+        if not merged:
+            return hits
+        if len(merged) > len(hits):
+            logger.info(
+                "全文扩展：%d → %d 个分块（问题：%s）",
+                len(hits),
+                len(merged),
+                (question or "")[:40],
+            )
+        return merged
+
+    @staticmethod
+    def _order_hits_by_position(hits: List[Hit]) -> List[Hit]:
+        """按"文档内位置"重排分块；多文档时保持文档首次出现的先后。
+
+        新索引入库时会写入 ``chunk_index``；老索引没有这个字段，此时
+        **保持召回顺序不动** —— 不猜顺序，免得把上下文弄得更乱。
+        """
+        if len(hits) <= 1:
+            return list(hits)
+        groups: Dict[str, List[Hit]] = {}
+        for hit in hits:
+            source = str((hit.metadata or {}).get("source") or "")
+            groups.setdefault(source, []).append(hit)
+
+        ordered: List[Hit] = []
+        for members in groups.values():
+            indices: List[int] = []
+            for hit in members:
+                try:
+                    indices.append(int((hit.metadata or {}).get("chunk_index")))
+                except (TypeError, ValueError):
+                    indices = []
+                    break
+            if indices and len(indices) == len(members):
+                members = [m for _, m in sorted(zip(indices, members), key=lambda p: p[0])]
+            ordered.extend(members)
+        return ordered
+
+    @staticmethod
+    def _allocate_budget(sizes: List[int], max_chars: int) -> List[int]:
+        """在分块之间分配字符预算：全装得下就全给，否则均分 + 余量回收。"""
+        n = len(sizes)
+        if n == 0:
+            return []
+        if max_chars <= 0 or sum(sizes) <= max_chars:
+            return list(sizes)
+        share = max_chars / n
+        allow = [min(float(s), share) for s in sizes]
+        leftover = max_chars - sum(allow)
+        # 短块用不完的份额，按顺序补给被截断的长块
+        for idx in range(n):
+            if leftover <= 0:
+                break
+            room = sizes[idx] - allow[idx]
+            if room <= 0:
+                continue
+            extra = min(room, leftover)
+            allow[idx] += extra
+            leftover -= extra
+        return [max(1, int(a)) if a > 0 else 0 for a in allow]
+
+    def _mapreduce_cfg(self) -> Dict[str, Any]:
+        return (self.config.get("rag", {}) or {}).get("mapreduce", {}) or {}
+
+    def _compress_group(self, chunks: List[Dict[str, Any]], index: int, total: int) -> str:
+        """map 阶段：把一组分块压成要点摘要（保留数字与判断）。"""
+        body = "\n".join(f"[{c['index']}] {c['content']}" for c in chunks)
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "你是中文长文摘要器。把给定的一段资料压成要点，供后续汇总使用。"
+                    "要求：①保留全部关键数字、时间、金额、比例、人名机构；②保留作者的判断与因果"
+                    "关系，不要只罗列现象；③只输出要点，不要开场白、不要评价、不要免责说明；"
+                    "④不超过 150 字。"
+                ),
+            },
+            {
+                "role": "user",
+                "content": f"这是全文的第 {index}/{total} 部分：\n\n{body}\n\n请输出这一部分的要点。",
+            },
+        ]
+        result = self.llm.chat(messages, self.llm.gen_cfg, stream=False)
+        return (result or "").strip()
+
+    def _needs_compress(self, context_chunks: List[Dict[str, Any]]) -> bool:
+        cfg = self._mapreduce_cfg()
+        if not cfg.get("enabled", True) or not context_chunks:
+            return False
+        limit = max(1200, int(cfg.get("soft_limit_chars", 6000)))
+        return sum(len(c["content"]) for c in context_chunks) > limit
+
+    def _maybe_compress_context(
+        self,
+        question: str,
+        context_chunks: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """超长上下文分段压缩：map（逐段提要点）→ reduce（合成全文摘要块）。
+
+        为什么需要它：本地/中转推理服务的可用上下文往往远小于"一整章"，
+        超长输入要么被截断、要么直接返回空响应。旧做法是砍掉后面的分块，
+        结果就是"总结整章"只能看到开头几段。这里改成先把全文压成一份
+        带数字的要点地图，再把最相关的原始分块作为细节附后 —— 既不超限，
+        也不丢全文的主干与数据。
+
+        返回新的 context_chunks；未超限或压缩失败时原样返回。
+        """
+        cfg = self._mapreduce_cfg()
+        if not cfg.get("enabled", True) or not context_chunks or self.llm is None:
+            return context_chunks
+
+        soft_limit = max(1200, int(cfg.get("soft_limit_chars", 6000)))
+        total_chars = sum(len(c["content"]) for c in context_chunks)
+        if total_chars <= soft_limit:
+            return context_chunks
+
+        group_chars = max(600, int(cfg.get("group_chars", 3200)))
+        max_groups = max(1, int(cfg.get("max_groups", 8)))
+        detail_limit = max(0, int(cfg.get("detail_chunks", 8)))
+
+        groups: List[List[Dict[str, Any]]] = []
+        current: List[Dict[str, Any]] = []
+        size = 0
+        for chunk in context_chunks:
+            length = len(chunk["content"])
+            if current and size + length > group_chars:
+                groups.append(current)
+                current, size = [], 0
+                if len(groups) >= max_groups:
+                    break
+            current.append(chunk)
+            size += length
+        if current and len(groups) < max_groups:
+            groups.append(current)
+        if len(groups) <= 1:
+            return context_chunks
+
+        summaries: List[str] = []
+        fallback_groups = 0
+        retry_delay = float(cfg.get("retry_delay_sec", 1.0))
+        inter_call_delay = float(cfg.get("inter_call_delay_sec", 1.0))
+        per_group_chars = max(120, int(cfg.get("summary_chars", 150)))
+        for i, group in enumerate(groups, start=1):
+            if i > 1 and inter_call_delay > 0:
+                # 连续高频调用会被推理服务限流，表现是"返回空字符串"。
+                # 主动留间隔，比事后重试便宜。
+                time.sleep(inter_call_delay)
+            piece = ""
+            for attempt in (1, 2):
+                try:
+                    piece = self._compress_group(group, i, len(groups))
+                except Exception as exc:  # noqa: BLE001 - 单段失败不该毁掉整次回答
+                    logger.warning("分段摘要失败（第 %d/%d 段，第 %d 次）：%s", i, len(groups), attempt, exc)
+                    piece = ""
+                if piece:
+                    break
+                if attempt == 1:
+                    time.sleep(retry_delay)
+            if piece:
+                summaries.append(f"（第{i}/{len(groups)}部分）{piece}")
+                continue
+            # 摘要拿不到就退回原文摘录：宁可要一段"未经提炼的原文"，
+            # 也不要整篇上下文被丢弃（那正是旧行为里"只看到开头"的来源）。
+            head = "".join(c["content"] for c in group)[:per_group_chars].strip()
+            if head:
+                summaries.append(f"（第{i}/{len(groups)}部分·原文摘录）{head}…")
+                fallback_groups += 1
+        if not summaries:
+            return context_chunks
+        if fallback_groups:
+            logger.info("上下文压缩：%d/%d 段退回原文摘录", fallback_groups, len(groups))
+
+        logger.info(
+            "上下文压缩：%d 字 / %d 块 → %d 段摘要（%d 字）+ %d 块细节",
+            total_chars,
+            len(context_chunks),
+            len(groups),
+            sum(len(s) for s in summaries),
+            detail_limit,
+        )
+
+        merged: List[Dict[str, Any]] = []
+        if detail_limit:
+            merged.extend(context_chunks[:detail_limit])
+        head = context_chunks[0]
+        merged.insert(
+            0,
+            {
+                "index": 0,  # 占位，下面统一重排编号
+                "title": f"{head['title']}｜全文分段摘要",
+                "content": "\n".join(summaries),
+                "metadata": head.get("metadata", {}),
+                "score": head.get("score", 0.0),
+                "score_kind": head.get("score_kind", "dense"),
+            },
+        )
+        # 重新编号：摘要在前、细节在后，引用编号连续不断号
+        for i, chunk in enumerate(merged, start=1):
+            chunk["index"] = i
+        return merged
+
     def _build_context(self, hits: List[Hit], max_chars: int) -> tuple[List[Dict[str, Any]], str]:
         """构造 prompt 中使用的 context。
 
         Returns:
             (context_chunks 用于 cite, 拼好的 context_str)
+
+        预算分配（2026 改版）：旧实现是"先到先得"地扣预算，``budget <= 0``
+        就 ``break`` —— 长文档永远只有前一两块能进 prompt，后面的全丢，
+        于是"总结整章"只能得到开头几段的内容目录。现改为**均分份额 + 余量
+        回收**：先按 ``max_chars / n`` 给每块一个保底份额（短块用不完的额度
+        回收给被截断的长块），保证每块都有代表，且小块不浪费预算。
         """
         chunks: List[Dict[str, Any]] = []
-        budget = max_chars
-        for i, h in enumerate(hits, start=1):
-            content = h.text
+        if not hits:
+            return chunks, ""
+
+        ordered = self._order_hits_by_position(hits)
+        n = len(ordered)
+        allow = self._allocate_budget([len(h.text or "") for h in ordered], max_chars)
+        # 单文档多分块时给出"第 i/n 段"的位置线索：模型据此判断覆盖是否完整，
+        # 也更容易按原文顺序重建因果链。
+        single_source = len({str((h.metadata or {}).get("source") or "") for h in ordered}) == 1
+        show_position = single_source and n >= 3
+
+        for i, (h, limit) in enumerate(zip(ordered, allow), start=1):
+            if limit <= 0:
+                continue
+            content = h.text or ""
             meta = h.metadata or {}
             # 标题优先用章节名（breadcrumb/chunk_prefix 末级）：文档标题在
             # 每块重复出现会诱导小模型把它当成"文献列表"复读；章节名才
@@ -837,10 +1145,24 @@ class RAGPipeline:
             entry_count = str(meta.get("entry_count") or "").strip()
             if entry_count and section:
                 title = f"{section}（共{entry_count}条）"
-            if budget <= 0:
-                break
-            if len(content) > budget:
-                content = content[: max(0, budget - 1)] + "…"
+            if show_position:
+                # 同一文档的多块会把章节名重复 n 遍（46 块 × 34 字 ≈ 1600 字纯
+                # 噪音）。既然已经标了"第 i/n 段"，章节名只留末级短名即可。
+                short = str(title)
+                if len(short) > 12:
+                    tail = short.split("-")[-1].split("_")[-1].strip()
+                    short = tail if 0 < len(tail) <= 20 else short[:12]
+                title = f"{short}｜第{i}/{n}段"
+            # 分块前缀面包屑（data_quality.breadcrumb_in_chunk）已经在 title 里
+            # 承载过一次，留在 content 里等于每块重复一遍章节名 —— 46 块就是
+            # 上千字的纯噪音，还容易诱导模型复读成"文献列表"。单文档场景下
+            # 标题已能唯一标识来源，直接剥掉。
+            if single_source and content.startswith("【"):
+                end = content.find("】")
+                if 0 < end <= 120:
+                    content = content[end + 1 :].lstrip()
+            if len(content) > limit:
+                content = content[: max(0, limit - 1)] + "…"
             # 分数要跟着走：引用列表得如实告诉用户"这条到底有多相关"。
             # 关键词召回给的不是余弦相似度，用 score_kind 区分开，别混着展示。
             if meta.get("_rerank_score") is not None:
@@ -851,7 +1173,9 @@ class RAGPipeline:
                 score_kind = "keyword" if meta.get("_score_kind") == "keyword" else "dense"
             chunks.append(
                 {
-                    "index": i,
+                    # 用 len(chunks)+1 而不是循环序号：万一有块被判掉，
+                    # 引用编号仍连续，prompt 里的 [n] 不会断号。
+                    "index": len(chunks) + 1,
                     "title": title,
                     "content": content,
                     "metadata": h.metadata,
@@ -859,7 +1183,6 @@ class RAGPipeline:
                     "score_kind": score_kind,
                 }
             )
-            budget -= len(content)
         return chunks, "\n\n".join(c["content"] for c in chunks)
 
     def _format_citations(self, chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -1014,6 +1337,12 @@ class RAGPipeline:
             result.verification = self._verify(fallback, [])
             return result
 
+        # 全文/主旨类问题先把命中文档换成它的全部分块，让模型基于全文综合；
+        # 普通局部事实问题仍保留原有 Top-K 检索行为。
+        hits = self._expand_to_fulltext(
+            question, hits, where=where, allowed_groups=allowed_groups
+        )
+
         # 决策：检索充分性 —— 候选片段明显答不了这个问题时，跳过生成直接拒答。
         # 这正是 d1 的思路：用一次"单次前向决策"省掉一次昂贵的自回归生成，
         # 同时从源头避免"检索不到却硬编"（宁可不答，也不编）。
@@ -1055,6 +1384,9 @@ class RAGPipeline:
         # 只有确定需要自回归生成时才加载 LLM；未命中、拒答和结构化答案
         # 不应为首个无效请求付出模型加载成本。
         self.ensure_llm()
+        # 上下文超限时先做 map-reduce 压缩：本地/中转服务的可用窗口通常装不下
+        # 一整章，整包塞进去只会得到空响应或只剩开头。
+        context_chunks = self._maybe_compress_context(question, context_chunks)
         long_term = self._recall_long_term(user_id)
         messages = self.context_assembler.build(
             question,
@@ -1191,6 +1523,11 @@ class RAGPipeline:
             result.verification = self._verify(fallback, [])
             return result
 
+        # 全文/主旨类问题：把命中文档换成全部分块（与 answer() 保持一致）
+        hits = self._expand_to_fulltext(
+            question, hits, where=where, allowed_groups=allowed_groups
+        )
+
         # 决策：检索充分性（与 answer() 保持一致）——片段明显答不了就跳过生成
         if self._assess_retrieval_sufficiency(question, hits) is False:
             fallback = rag_cfg.get("fallback_answer", FALLBACK_NO_HIT_ANSWER)
@@ -1220,6 +1557,7 @@ class RAGPipeline:
             return self._build_extractive_result(question, context_chunks, hits)
 
         self.ensure_llm()
+        context_chunks = self._maybe_compress_context(question, context_chunks)
         messages = self.context_assembler.build(
             question,
             context_chunks,
@@ -1331,6 +1669,13 @@ class RAGPipeline:
         if self.reranker is not None:
             hits = self._rerank(question, hits, top_n=k)
 
+        # 全文/主旨类问题：把命中文档换成它的全部分块。
+        # Web UI 与异步接口走的都是这条路径，而这里原先完全没有全文扩展——
+        # 于是界面上问"总结这一章"永远只能拿到 Top-K 碎片，回答自然成了内容目录。
+        hits = self._expand_to_fulltext(
+            question, hits, where=None, allowed_groups=allowed_groups
+        )
+
         # 聚合统计类问题（条目数等）：结构化元数据直接作答，不依赖小模型数数
         structured = self._structured_count_answer(question, hits)
         if structured is not None:
@@ -1343,6 +1688,14 @@ class RAGPipeline:
         max_ctx = self.config.get("rag", {}).get("max_context_tokens", 2048)
         context_chunks, _ = self._build_context(hits, max_chars=max_ctx * 2)
         context_chunks = self._augment_with_graph(question, context_chunks)
+
+        # 超长上下文先做 map-reduce 压缩，再算引用（压缩会重排编号，
+        # cites 与 prompt 必须用同一套编号，否则引用会对不上）。
+        # extractive 模式不加载 LLM，压缩无从谈起，上面已提前返回。
+        if self._needs_compress(context_chunks):
+            self.ensure_llm()
+            context_chunks = self._maybe_compress_context(question, context_chunks)
+
         cites = self._format_citations(context_chunks)
 
         yield {"event": "hits", "data": cites}

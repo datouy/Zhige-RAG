@@ -44,6 +44,42 @@ _GROUND_TOKEN_RE = re.compile(r"[A-Za-z0-9]+|[\u4e00-\u9fff]")
 # 引用标记（从句子文本中剥离）
 _CITE_MARKER_RE = re.compile(r"\[[0-9]{1,2}(?:\s*[,，，]\s*[0-9]{1,2})*\]")
 
+# 提炼 / 判断句的标记词。
+#
+# 为什么需要它：接地检查（下面 4.5 节）用"句子词元有多大比例出现在所引
+# 上下文里"来抓编造。但**提炼本身就是用原文没有的词重组原文有的信息**——
+# "受害顺序与受损顺序并不重合""决策是被数据逼出来的，并非主动设计"这类
+# 判断句，词面接地率天然极低，于是被判成 unsupported，两个就 unverified。
+# 结果是任何做了综合的回答都不合格，模型只能退回去逐句摘抄原文。
+# 有了标记词，才能把"会总结"和"在编造"区分开。
+_SYNTHESIS_MARKERS = (
+    # 因果 / 推论
+    "所以", "因此", "因而", "导致", "使得", "意味着", "说明", "表明", "反映", "印证",
+    # 判断 / 归因
+    "本质", "实质", "真正", "核心", "关键", "根源", "动机", "意图", "想表达", "想论证",
+    "目的", "无异于", "并非", "并不", "不是", "而是", "恰恰", "反而",
+    # 对比 / 结构
+    "对比", "相较", "相比", "转折", "矛盾", "悖论", "错位", "代价", "受益", "受损",
+    "总体", "整体", "归纳", "总结", "概括", "层次", "递进",
+    # 程度 / 时间强调
+    "始终", "更大", "越来越", "最终",
+)
+
+
+def _is_synthesis_sentence(sentence: str) -> bool:
+    """该句是否属于"提炼 / 判断"而非对原文的具体陈述。
+
+    判定依据两条，缺一不可：
+
+    1. 句中**不含硬事实**（数字、日期、金额、比例）——带硬事实的句子仍要
+       逐字接地，数字是硬约束，不允许"提炼"。
+    2. 句中带概括性连接词或判断标记（见 :data:`_SYNTHESIS_MARKERS`）。
+    """
+    if _extract_facts(sentence or ""):
+        return False
+    return any(marker in sentence for marker in _SYNTHESIS_MARKERS)
+
+
 
 @dataclass
 class VerificationResult:
@@ -104,6 +140,7 @@ def verify_answer(
     fallback_answer: Optional[str] = None,
     min_cited_ratio: float = 0.5,
     min_grounding: float = 0.6,
+    synthesis_aware: bool = False,
 ) -> VerificationResult:
     """校验答案对上下文的可验证性。
 
@@ -114,7 +151,12 @@ def verify_answer(
         min_cited_ratio: 判定 ``verified`` 所需的最低句子引用覆盖率。
         min_grounding: 引用句的词面接地率下限——句子词元（CJK 字/英文词）
           出现在所引上下文中的最低比例，低于此值视为"引用了但内容无据"。
+        synthesis_aware: 是否区分"提炼句"与"陈事句"。默认 ``False`` 时行为
+          与旧版完全一致。为 ``True`` 时：提炼/判断句豁免词面接地检查，
+          且引用覆盖率只按"带硬事实的句子"计算 —— 否则任何做了综合、
+          因果分析的回答都会被判为不合格，系统实际上在逼模型逐句照抄。
     """
+
     res = VerificationResult()
     answer = (answer or "").strip()
     if not answer:
@@ -153,6 +195,11 @@ def verify_answer(
     # 4.5 句子级词面接地：带引用的句子，其词元必须大部分出现在所引
     # 上下文中——捕获"引用了 [1] 但内容是编造/改写"的情况（如编造的
     # 概念名、与原文相抵触的表述）。
+    #
+    # ``synthesis_aware=True`` 时**提炼句豁免**：判断句（"受害顺序与受损
+    # 顺序并不重合""决策是被数据逼出来的"）的价值恰恰在于用原文没有的词
+    # 重组原文有的信息，词面接地必然很低。豁免它，才不至于把"会总结"
+    # 当成"在编造"。含硬事实的句子不豁免——数字仍是硬约束。
     chunk_tokens: Dict[int, set] = {}
     for c in context_chunks:
         idx = c.get("index")
@@ -161,6 +208,8 @@ def verify_answer(
     for s in sentences:
         cite_nums = {int(x) for x in _CITE_RE.findall(s)}
         if not cite_nums or cite_nums - valid_idx:
+            continue
+        if synthesis_aware and _is_synthesis_sentence(s):
             continue
         s_tokens = _GROUND_TOKEN_RE.findall(_CITE_MARKER_RE.sub("", s))
         if not s_tokens:
@@ -175,9 +224,22 @@ def verify_answer(
             res.unsupported_sentences.append(s[:80])
 
     # 5. 综合评级
+    # 覆盖率只对"带硬事实的句子"提出要求（仅 synthesis_aware 时）：要求过半
+    # 句子都挂引用，等于逼模型逐句照抄原文，而整体概括与因果分析本来就没有
+    # 单一出处可挂。``cited_sentence_ratio`` 字段仍是纯统计值，不受影响。
+    coverage_ratio = res.cited_sentence_ratio
+    if synthesis_aware:
+        fact_sentences = [s for s in sentences if _extract_facts(s)]
+        if fact_sentences:
+            coverage_ratio = sum(
+                1 for s in fact_sentences if _CITE_RE.search(s)
+            ) / len(fact_sentences)
+        else:
+            coverage_ratio = 1.0
+
     if res.invalid_citations or len(res.unsupported_facts) >= 3 or len(res.unsupported_sentences) >= 2:
         res.status = "unverified"
-    elif res.unsupported_facts or res.unsupported_sentences or res.cited_sentence_ratio < min_cited_ratio:
+    elif res.unsupported_facts or res.unsupported_sentences or coverage_ratio < min_cited_ratio:
         res.status = "partial"
     else:
         res.status = "verified"
@@ -271,6 +333,7 @@ def verify_answer_with_decision(
     min_cited_ratio: float = 0.5,
     min_grounding: float = 0.6,
     quality_ladder: Optional[Sequence[str]] = None,
+    synthesis_aware: bool = False,
 ) -> VerificationResult:
     """在规则校验之上叠加 d1 决策校验（``noul`` 接地 + ``score`` 质量）。
 
@@ -297,6 +360,7 @@ def verify_answer_with_decision(
         fallback_answer=fallback_answer,
         min_cited_ratio=min_cited_ratio,
         min_grounding=min_grounding,
+        synthesis_aware=synthesis_aware,
     )
     if provider is None or res.refused or not (answer or "").strip():
         return res

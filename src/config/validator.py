@@ -120,13 +120,18 @@ class RAGConfig(_StrictModel):
     """RAG 配置模型。"""
     top_k: int = Field(4, ge=1, le=50, description="检索 top-k")
     use_reranker: bool = Field(False, description="是否使用重排序")
-    max_context_tokens: int = Field(2000, ge=100, le=16000, description="最大上下文 token 数")
+    max_context_tokens: int = Field(2000, ge=100, le=64000, description="最大上下文 token 数")
     max_history_turns: int = Field(0, ge=0, le=10, description="对话历史轮数")
     score_threshold: float = Field(0.0, ge=0.0, le=1.0, description="相似度阈值")
     answer_citations: bool = Field(True, description="是否包含引用")
     return_sources: bool = Field(True, description="是否返回来源")
     fallback_answer: str = Field("抱歉，知识库中未找到相关信息，无法回答该问题。", description="默认回复")
     extractive: Dict[str, Any] = Field(default_factory=dict)
+    # 全文扩展：总结/主旨类问题把命中文档的全部分块读入上下文。
+    # 之前这段逻辑硬编码在 answer() 里且只有它生效，stream 路径拿不到。
+    fulltext_expand: Dict[str, Any] = Field(default_factory=dict)
+    # 超长上下文的分段压缩（map-reduce），适配可用窗口装不下一整章的服务
+    mapreduce: Dict[str, Any] = Field(default_factory=dict)
     system_prompt_file: str = Field("config/prompts.yaml")
     assistant_name: str = Field("小识")
     org_name: str = Field("企业知识库")

@@ -209,13 +209,13 @@ data_quality:
 # 推荐配置：
 # - top_k: 8（检索数）
 # - rerank_candidates: 24（重排候选数，top_k * 3）
-# - min_score: 0.40（最低分兜底）
+# - min_score: 0.15（向量相似度与 BM25 归一分数量纲不同，默认避免高阈值误拒答）
 #
 retrieval:
   top_k: 8                       # 召回数
   rerank_candidates: 24            # 重排候选数（top_k * 3）
   score_threshold: 0.0
-  min_score: 0.40                 # 命中最低分兜底（过低会让无关问题也硬答）
+  min_score: 0.15                 # 混合检索分数量纲不一致，降低硬阈值误拒答
   status_filter: true
   status_filter_fallback: true
   acl_filter: true
@@ -398,12 +398,61 @@ llm:
 rag:
   top_k: 8
   use_reranker: false
-  max_context_tokens: 1800
+  # 送进 prompt 的上下文预算（token）。原值 1800 ≈ 3600 个中文字符，
+  # 一本普通章节（3000~4000 字）都装不满，而且 _build_context 是"先到先得"
+  # 扣预算，后面的分块直接丢弃 —— 模型只能看到开头两段，于是只能给出
+  # "以…为背景 / 文中提到"这类目录式回答。按"整章可读"重新设定：
+  # 4000 字中文 ≈ 2700 token，12000 给论证、引用和长文档留足余量。
+  max_context_tokens: 12000
   max_history_turns: 3
   score_threshold: 0.0
   answer_citations: true
   return_sources: true
   fallback_answer: "抱歉，知识库中未找到相关信息，无法回答该问题。"
+
+  # 全文扩展：总结 / 主旨类问题先由 Top-K 定位文档，再把该文档的全部分块
+  # 读入上下文再回答。这条逻辑原先只写在 answer() 里，Web UI 走的
+  # stream_answer 完全没有 —— 这是"总结类问题只能给碎片清单"的直接原因。
+  fulltext_expand:
+    enabled: true
+    pattern: "全文|文章|主旨|核心思想|主要表达|总结|概括|整体内容|讲了什么|主要内容|梳理|脉络|想说什么|说明了什么"
+    # 单次扩展取几篇文档的全文。"总结这一章"通常只该拿命中分数最高的那一篇；
+    # 取多篇会把相邻章节也拖进来，反而稀释预算。要"对比两章"时再调大。
+    max_documents: 1
+    # 扩展后的字符总上限：防止误触发时把整个知识库倒进 prompt
+    max_chars: 40000
+
+  # 超长上下文压缩（map-reduce）。
+  # 本地 / 中转推理服务能一次吃下的上下文往往远小于"一整章"：整包塞进去
+  # 要么被服务端截断、要么直接返回空响应。旧做法是砍掉后面的分块，于是
+  # "总结整章"只能看到开头几段。这里改成先分段提要点（强制保留数字与作者
+  # 判断），再把"全文要点地图 + 最相关细节"交给模型综合 —— 既不超窗口，
+  # 也不丢主干。
+  mapreduce:
+    enabled: true
+    # 上下文超过这个字符数才触发压缩 —— 只用来兜"整本书 / 多篇合并"这类
+    # 一次性塞不进窗口的极端情况。正常的一章（3000~6000 字）不压缩、直接
+    # 全量喂给模型，这是回答质量最好的路径。
+    #
+    # 实测（当前中转服务 deepseek-v4.1-flash）：
+    #   · system + 资料合计 3636 字 → 正常回答；
+    #   · 单次问答里连续 6~8 次摘要调用会被限流（表现为返回空字符串），
+    #     所以真正触发压缩时请保持 inter_call_delay_sec 的间隔。
+    # 换成直连大模型（deepseek 官方 / 本地 7B 以上）后可调到 30000 以上。
+    soft_limit_chars: 12000
+    # 每个摘要段最多吃多少字符
+    group_chars: 4000
+    # 最多切几段摘要（护栏：避免一次问答打出十几次模型调用）
+    max_groups: 6
+    # 每段摘要的产出字数上限
+    summary_chars: 150
+    # 摘要之外再附多少块原始分块作为细节（0 = 只给摘要）
+    detail_chunks: 0
+    # 分批调用之间的间隔（秒），防限流
+    inter_call_delay_sec: 1.5
+    # 单段失败后的重试间隔（秒）
+    retry_delay_sec: 2.0
+
   # 无 LLM 模式：只返回最相关的若干原文句子，每条均带 [来源编号]。
   extractive:
     max_chunks: 3
@@ -414,10 +463,16 @@ rag:
   org_name: "企业知识库"
   
   # 可验证性校验
+  # 这套规则的初衷是防编造，副作用是把"提炼"也判成了编造：判断句的词元
+  # 天然不在原文里，min_grounding 会把它算成 unsupported_sentences；
+  # min_cited_ratio 要求过半句子带引用，等于逼模型逐句照抄原文。
+  # 现在引用率仍照常统计（作为观测指标），但不再据此否定一篇做了综合的回答；
+  # synthesis_aware 让"提炼/判断句"豁免词面接地检查（见 src/verifier.py）。
   verification:
     enabled: true
-    min_cited_ratio: 0.5
-    min_grounding: 0.6
+    min_cited_ratio: 0.2
+    min_grounding: 0.3
+    synthesis_aware: true
 
 # ------------------ 上下文与记忆 ------------------
 memory:
