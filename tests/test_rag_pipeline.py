@@ -7,10 +7,6 @@
 为节省 CI 资源，本测试使用 ``chromadb`` 的内存客户端 + 极小的随机向量，验证端到端 API 可用。
 """
 
-import os
-import tempfile
-from pathlib import Path
-
 import numpy as np
 import pytest
 
@@ -81,6 +77,140 @@ def test_prompt_template_assemble():
     # 空上下文
     msgs_empty = tpl.build_messages("x", [])
     assert "无法" in msgs_empty[1]["content"] or "未检索" in msgs_empty[1]["content"]
+
+
+def test_capability_boundary_answer_skips_retrieval():
+    """能力边界问题必须直接回答，不能被向量检索到的相邻文档带偏。"""
+    from src.rag_pipeline import RAGPipeline
+
+    p = object.__new__(RAGPipeline)
+    p.config = {
+        "rag": {"assistant_name": "小识", "org_name": "企业知识库"},
+        "decision": {"query_route": {"enabled": False}},
+    }
+
+    def _should_not_retrieve(*_args, **_kwargs):
+        raise AssertionError("能力边界问题不应触发检索")
+
+    p._retrieve = _should_not_retrieve
+    result = p.answer("你会回答不存在知识库中的问题吗？")
+    assert "知识库中没有相关依据" in result.answer
+    assert result.sources == []
+    assert result.raw_hits == []
+
+    # Web UI / WebSocket 实际走 stream_answer；同样必须在检索前直接返回。
+    events = list(p.stream_answer("你会回答不存在知识库中的问题吗？"))
+    assert [event["event"] for event in events] == ["hits", "token", "done"]
+    assert events[0]["data"] == []
+    assert "会分情况" in events[1]["data"]
+    assert events[2]["data"] == []
+
+
+def test_datetime_question_answers_from_clock_without_retrieval():
+    """当前时间由服务端时钟确定性回答，不应检索知识库或生成引用。"""
+    from src.rag_pipeline import RAGPipeline
+
+    p = object.__new__(RAGPipeline)
+    p.config = {
+        "rag": {"assistant_name": "小识", "org_name": "企业知识库"},
+        "decision": {"query_route": {"enabled": False}},
+    }
+
+    def _should_not_retrieve(*_args, **_kwargs):
+        raise AssertionError("当前时间问题不应触发检索")
+
+    p._retrieve = _should_not_retrieve
+    result = p.answer("现在几点了")
+    assert "当前时间是" in result.answer
+    assert "Asia/Shanghai" in result.answer
+    assert result.sources == []
+    assert result.raw_hits == []
+
+
+def test_visible_citations_only_include_referenced_sources():
+    from src.rag_pipeline import RAGPipeline
+    from src.verifier import verify_answer
+
+    cites = [
+        {"index": 1, "cite": "[1] A"},
+        {"index": 2, "cite": "[2] B"},
+        {"index": 3, "cite": "[3] C"},
+    ]
+    answer = "结论一 [1][3]。"
+    verification = verify_answer(answer, [{"index": 1, "content": "A"}])
+    visible = RAGPipeline._visible_citations(answer, cites, verification)
+    assert [item["index"] for item in visible] == [1, 3]
+
+
+def test_refusal_hides_retrieved_sources():
+    from src.rag_pipeline import RAGPipeline
+    from src.verifier import verify_answer
+
+    cites = [{"index": 1, "cite": "[1] 无关资料"}]
+    answer = "资料无法确定。检索到的材料与问题无关。"
+    verification = verify_answer(answer, [{"index": 1, "content": "无关资料"}])
+    assert verification.refused
+    assert RAGPipeline._visible_citations(answer, cites, verification) == []
+
+
+def test_llm_rewrites_deictic_followup_for_retrieval():
+    from src.llm import GenerationConfig
+    from src.rag_pipeline import RAGPipeline
+
+    class _FakeLLM:
+        gen_cfg = GenerationConfig()
+
+        def __init__(self):
+            self.calls = 0
+
+        def chat(self, messages, generation=None, stream=False, timeout=None):
+            self.calls += 1
+            assert "上一轮问题" in messages[1]["content"]
+            return "这篇论文使用了哪些具体的大语言模型、Embedding 模型和重排模型？"
+
+    llm = _FakeLLM()
+    p = object.__new__(RAGPipeline)
+    p.config = {"retrieval": {"llm_query_rewrite": True}}
+    p.llm = None
+    p._llm_holder = {"llm": llm}
+    history = [
+        {"role": "user", "content": "这篇论文主要讲什么？"},
+        {"role": "assistant", "content": "这是一篇本地化中文 RAG 知识库系统的论文。"},
+    ]
+    rewritten = p._rewrite_retrieval_query("它用了什么模型？", history)
+    assert "大语言模型" in rewritten
+    assert llm.calls == 1
+
+
+def test_llm_query_rewrite_falls_back_on_error():
+    from src.llm import GenerationConfig
+    from src.rag_pipeline import RAGPipeline
+
+    class _BrokenLLM:
+        gen_cfg = GenerationConfig()
+
+        def chat(self, *_args, **_kwargs):
+            raise RuntimeError("offline")
+
+    p = object.__new__(RAGPipeline)
+    p.config = {"retrieval": {"llm_query_rewrite": True}}
+    p.llm = _BrokenLLM()
+    history = [
+        {"role": "user", "content": "这篇论文主要讲什么？"},
+        {"role": "assistant", "content": "论文介绍本地化 RAG 系统。"},
+    ]
+    assert p._rewrite_retrieval_query("它用了什么模型？", history) == (
+        "这篇论文主要讲什么？；它用了什么模型？"
+    )
+
+
+def test_model_question_gets_a_technical_query_variant():
+    from src.rag_pipeline import RAGPipeline
+
+    p = object.__new__(RAGPipeline)
+    p.config = {"retrieval": {"multiquery_enabled": True, "max_query_variants": 3}}
+    variants = p._query_variants("这篇论文用了什么模型？")
+    assert any("参数量" in v and "Embedding" in v for v in variants)
 
 
 def test_utils_merge_and_env(tmp_path, monkeypatch):

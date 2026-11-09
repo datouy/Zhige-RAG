@@ -225,6 +225,9 @@ retrieval:
   hyde_enabled: false             # P1 HyDE：LLM 生成假设答案再检，口语/缩写查询召回+；默认关（需LLM）
   multiquery_enabled: true        # P1 多路召回：原问+去填充词+指代展开取并集RRF，零LLM开销默认开
   max_query_variants: 3           # 多路最多几路（防爆炸）
+  llm_query_rewrite: true         # 多轮指代追问用现有 LLM 改写成独立检索问题（仅追问触发）
+  llm_query_rewrite_max_tokens: 96
+  llm_query_rewrite_timeout_sec: 20
   status_filter: true
   status_filter_fallback: true
   acl_filter: true
@@ -253,10 +256,10 @@ reranker:
   #   的 min_relevance 直接挡掉，不再硬编。
   # 代价：多加载一个 ~1.1GB 的重排模型 + 每次约几十毫秒。
   # 想换回纯向量检索（更快）就把 enabled 改回 false。
-  # P0-2（轻量默认开）：默认开启以保证召回精准；缺模型时 create_reranker 会
-  # 自动降级为 None（见 src/reranker.py），不阻塞问答。想用更小模型可把
-  # model_name 换成 bge-reranker-v2-m3（~280MB，CPU约40ms）。
-  enabled: true
+  # 轻量默认关闭：默认镜像只安装 ONNX Embedding，不含 torch / FlagEmbedding /
+  # sentence-transformers，也没有 ~1.1GB 的重排权重。安装 requirements-local.txt
+  # 并下载 model_name 后再改为 true，避免“配置显示开启、运行实际停用”的假象。
+  enabled: false
   backend: "bge"                   # bge | d1 | auto
   model_name: "./models/bge-reranker-base"
   device: "auto"                   # auto 会优先用显卡；纯 CPU 机器会被自动判为 cpu
@@ -396,7 +399,7 @@ llm:
     cache_dir: "./models/huggingface"
 
   generation:
-    max_new_tokens: 1024
+    max_new_tokens: 2048         # 长总结避免在句子中途被截断；普通回答通常自然停止
     temperature: 0.1               # 更低温度：0.1 更精准（事实型问答推荐）
     top_p: 0.9
     repetition_penalty: 1.05

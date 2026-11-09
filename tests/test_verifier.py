@@ -24,6 +24,16 @@ class TestRefused:
         res = verify_answer("", CHUNKS)
         assert res.status == "refused"
 
+    def test_natural_language_refusal_detected(self):
+        for answer in (
+            "资料无法确定。这批材料没有涉及量子计算。",
+            "现有资料无法回答这个问题——检索到的内容与年假无关。",
+            "资料无法回答这个问题。",
+        ):
+            res = verify_answer(answer, CHUNKS)
+            assert res.refused, answer
+            assert res.status == "refused"
+
 
 class TestCitations:
     def test_valid_citations_verified(self):

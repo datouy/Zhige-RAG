@@ -245,6 +245,9 @@ class RetrievalConfig(_StrictModel):
     hyde_enabled: bool = False
     multiquery_enabled: bool = True
     max_query_variants: int = Field(3, ge=1, le=5)
+    llm_query_rewrite: bool = True
+    llm_query_rewrite_max_tokens: int = Field(96, ge=32, le=256)
+    llm_query_rewrite_timeout_sec: float = Field(20.0, ge=1.0, le=120.0)
 
 
 class RerankerConfig(_StrictModel):

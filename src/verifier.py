@@ -43,6 +43,16 @@ _SENT_SPLIT_RE = re.compile(r"(?<=[。！？!?；;])|\n")
 _GROUND_TOKEN_RE = re.compile(r"[A-Za-z0-9]+|[\u4e00-\u9fff]")
 # 引用标记（从句子文本中剥离）
 _CITE_MARKER_RE = re.compile(r"\[[0-9]{1,2}(?:\s*[,，，]\s*[0-9]{1,2})*\]")
+# 模型用自然语言拒答时，也要识别为 refused，避免把无关检索结果继续当
+# “引用来源”展示。只匹配回答开头，避免把“资料无法确定 X，但可以确定 Y”
+# 这类部分回答误判成整题拒答。
+_REFUSAL_PREFIX_RE = re.compile(
+    r"^(?:抱歉[，,]?\s*)?(?:"
+    r"(?:当前|现有|手头|检索到的)?(?:资料|材料|知识库)(?:中)?"
+    r"(?:没有|未|无法)(?:找到|检索到|确定|回答|提供)"
+    r"|无法回答(?:该|这个)?问题"
+    r")(?:[^。！？!?\n]{0,20})(?:[。！？!?\n]|——|$)"
+)
 
 # 提炼 / 判断句的标记词。
 #
@@ -166,6 +176,10 @@ def verify_answer(
 
     # 0. 拒答识别
     if fallback_answer and answer == str(fallback_answer).strip():
+        res.refused = True
+        res.status = "refused"
+        return res
+    if _REFUSAL_PREFIX_RE.match(answer):
         res.refused = True
         res.status = "refused"
         return res
