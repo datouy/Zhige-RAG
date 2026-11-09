@@ -499,6 +499,7 @@ async def ingest_file(
     file: UploadFile = File(...),
     version: bool = False,
     kb_id: Optional[str] = Form(None),
+    background: bool = Form(False, description="true=异步入库，立即返回job_id，后台解析+upsert"),
     current_user: User = Depends(get_current_user),
 ) -> Dict[str, Any]:
     """上传文件并入库。需要认证。
@@ -510,6 +511,10 @@ async def ingest_file(
     - 扩展名白名单在写盘前校验；
     - 流式写盘并强制执行 ``ui.max_upload_mb`` 大小上限；
     - 入库前清理同名文档的旧分块，避免内容更新后残留旧块。
+
+    P1 异步入库：``background=true`` 时保存文件后立即返回
+    ``{"job_id": ...}``，解析→分块→upsert 在后台线程池执行，
+    通过 ``GET /api/v1/ingest/jobs/{job_id}`` 轮询进度（50MB文件不再超时）。
     """
     user: User = current_user
     try:
@@ -525,6 +530,70 @@ async def ingest_file(
 
         max_bytes = _get_upload_limit_mb(cfg) * 1024 * 1024
         await run_in_threadpool(_save_upload_stream, file, temp_path, max_bytes)
+
+        # P1 异步入库：background=true 时落盘后即返，后台线程做重活
+        if background:
+            from src.ingest_jobs import create_job, submit as _submit_job
+
+            _kb_early = _resolve_kb(user, cfg, kb_id)
+            _uid, _kbid, _cfg_snapshot = user.id, _kb_early["id"], dict(cfg)
+            _orig_name = file.filename
+            _tmp = str(temp_path)
+            job_id = create_job("file", _orig_name or safe_name,
+                               {"kb_id": _kbid, "path": _tmp})
+
+            def _bg_file(reporter) -> Dict[str, Any]:
+                from pathlib import Path as _P
+                reporter(0.1, "parse")
+                _split = get_splitter(_cfg_snapshot)
+                ocr_c = (_cfg_snapshot.get("document_loader", {}).get("ocr")) or {}
+                docs = enrich_file(
+                    _P(_tmp),
+                    default_acl=_cfg_snapshot.get("data_quality", {}).get("default_acl", "*"),
+                    ocr_cfg=ocr_c,
+                )
+                if not docs:
+                    docs = load_document(
+                        _P(_tmp),
+                        pdf_engine=_cfg_snapshot["document_loader"].get("pdf_engine", "pdfplumber"),
+                        encoding=_cfg_snapshot["document_loader"].get("encoding", "utf-8"),
+                        ocr_cfg=ocr_c,
+                    )
+                chunks, rep = run_data_pipeline(
+                    docs, _cfg_snapshot, _split,
+                    decision_provider=_ingest_guard_provider(_cfg_snapshot))
+                rep["docs"] = len(docs)
+                if not chunks:
+                    raise RuntimeError(f"文件解析后没有可用内容: {rep.get('gate', {})}")
+                reporter(0.55, "upsert")
+                for c in chunks:
+                    c.metadata["kb_id"] = _kbid
+                _kb_info = {"id": _kbid,
+                            "collection_name": _kb_early["collection_name"]}
+                _store = TenantAwareFactory.get_chroma_store_by_name(
+                    _kb_info["collection_name"], _cfg_snapshot)
+                _srcs = sorted({str(c.metadata.get("source")
+                                    or c.metadata.get("filepath") or "unknown")
+                                for c in chunks})
+                # 分批128由 add_chunks 内部处理；大文件不一次性爆内存
+                n = _store.replace_chunks_for_sources(
+                    chunks, _srcs,
+                    on_commit=lambda: _commit_ingestion_metadata(
+                        _uid, chunks, rep, _kbid))
+                reporter(0.95, "invalidate")
+                try:
+                    from api.deps import get_runtime_pipeline as _grp
+                    _grp(user_id=_uid).invalidate_answer_cache()
+                except Exception:
+                    pass
+                return {"filename": _orig_name, "docs": len(docs),
+                        "chunks": len(chunks), "ingested": n,
+                        "kb_id": _kbid, "data_quality": rep}
+
+            _submit_job(_bg_file, job_id)
+            return {"job_id": job_id, "status": "queued",
+                    "filename": file.filename, "kb_id": _kb_early["id"],
+                    "poll": f"/api/v1/ingest/jobs/{job_id}"}
 
         splitter = get_splitter(cfg)
 
@@ -588,6 +657,13 @@ async def ingest_file(
 
         n = await run_in_threadpool(_replace)
 
+        # P1：入库成功后失效答案/检索缓存，避免旧答案残留
+        try:
+            from api.deps import get_runtime_pipeline as _grp_sync
+            _grp_sync(user_id=user.id).invalidate_answer_cache()
+        except Exception:
+            pass
+
         return {
             "filename": file.filename,
             "docs": docs_count,
@@ -602,11 +678,30 @@ async def ingest_file(
         raise HTTPException(status_code=500, detail=str(exc))
 
 
+@router.get("/api/v1/ingest/jobs/{job_id}", tags=["文档"])
+def ingest_job_status(
+    job_id: str,
+    current_user: User = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """查询异步入库任务状态（queued/running/done/failed + progress/stage/result）。
+
+    P1 异步入库配套：``POST /api/v1/ingest?background=true`` 返回 job_id 后，
+    前端轮询本接口拿进度，done 后 result 即同步入库同款返回体。
+    """
+    from src.ingest_jobs import get_job
+
+    job = get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"任务不存在: {job_id}")
+    return job
+
+
 class IngestURLBody(BaseModel):
     """网页入库请求。"""
     url: str = Field(..., min_length=4, description="网页地址（可省略协议，默认 https）")
     title: Optional[str] = Field(None, description="自定义标题，默认取网页 <title>")
     kb_id: Optional[str] = Field(None, description="目标知识库，缺省为默认知识库")
+    background: bool = Field(False, description="true=异步入库，立即返回job_id")
     timeout: float = Field(15.0, ge=1.0, le=60.0, description="抓取超时（秒）")
 
 
@@ -630,6 +725,66 @@ async def ingest_url(
     user: User = current_user
     try:
         cfg = get_runtime_config()
+
+        # P1 异步入库：URL抓取也可能慢，先返job_id，后台fetch→分块→upsert
+        if body.background:
+            from src.ingest_jobs import create_job, submit as _submit_job
+
+            _kb_early = _resolve_kb(user, cfg, body.kb_id)
+            _uid, _kbid = user.id, _kb_early["id"]
+            _cfg_snapshot = dict(cfg)
+            _body_url, _body_title = body.url, body.title
+            _body_timeout = body.timeout
+            job_id = create_job("url", _body_url, {"kb_id": _kbid})
+
+            def _bg_url(reporter) -> Dict[str, Any]:
+                from src.document_loader import Document as _Doc
+                from src.web_loader import fetch_and_extract as _fetch2
+                reporter(0.1, "fetch")
+                _url_cfg = (_cfg_snapshot.get("document_loader") or {}).get("url") or {}
+                page = _fetch2(
+                    _body_url, timeout=_body_timeout,
+                    max_bytes=int(_url_cfg.get("max_bytes", 5 * 1024 * 1024)),
+                    allow_private=bool(_url_cfg.get("allow_private", False)),
+                    max_chars=int(_url_cfg.get("max_chars", 200000)))
+                title = (_body_title or page["title"] or page["url"]).strip()
+                source = page["final_url"] or page["url"]
+                docs = [_Doc(page=1, content=page["text"], metadata={
+                    "source": source, "filepath": source, "filename": title,
+                    "title": title, "ext": ".url", "url": page["url"],
+                    "final_url": source,
+                    "acl": _cfg_snapshot.get("data_quality", {}).get("default_acl", "*")})]
+                reporter(0.4, "chunk")
+                _split = get_splitter(_cfg_snapshot)
+                chunks, rep = run_data_pipeline(
+                    docs, _cfg_snapshot, _split,
+                    decision_provider=_ingest_guard_provider(_cfg_snapshot))
+                rep["docs"] = len(docs)
+                if not chunks:
+                    raise RuntimeError("网页正文为空，无法入库")
+                for c in chunks:
+                    c.metadata["kb_id"] = _kbid
+                reporter(0.7, "upsert")
+                _store = TenantAwareFactory.get_chroma_store_by_name(
+                    _kb_early["collection_name"], _cfg_snapshot)
+                n = _store.replace_chunks_for_sources(
+                    chunks, [source],
+                    on_commit=lambda: _commit_ingestion_metadata(
+                        _uid, chunks, rep, _kbid))
+                try:
+                    from api.deps import get_runtime_pipeline as _grp
+                    _grp(user_id=_uid).invalidate_answer_cache()
+                except Exception:
+                    pass
+                return {"url": page["url"], "final_url": source, "title": title,
+                        "chars": int(page["chars"]), "docs": len(docs),
+                        "chunks": len(chunks), "ingested": n, "kb_id": _kbid}
+
+            _submit_job(_bg_url, job_id)
+            return {"job_id": job_id, "status": "queued", "url": body.url,
+                    "kb_id": _kb_early["id"],
+                    "poll": f"/api/v1/ingest/jobs/{job_id}"}
+
         url_cfg = (cfg.get("document_loader") or {}).get("url") or {}
         allow_private = bool(url_cfg.get("allow_private", False))
 
@@ -700,6 +855,13 @@ async def ingest_url(
 
         n = await run_in_threadpool(_replace)
 
+        # P1：入库成功后失效答案/检索缓存，避免旧答案残留
+        try:
+            from api.deps import get_runtime_pipeline as _grp_url
+            _grp_url(user_id=user.id).invalidate_answer_cache()
+        except Exception:
+            pass
+
         return {
             "url": page["url"],
             "final_url": source,
@@ -722,6 +884,7 @@ async def ingest_directory(
     dir_path: str = Form(...),
     recursive: bool = Form(True),
     kb_id: Optional[str] = Form(None),
+    background: bool = Form(False, description="true=异步入库，立即返回job_id"),
     current_user: User = Depends(get_current_user),
 ) -> Dict[str, Any]:
     """批量入库指定目录。需要认证。
@@ -741,6 +904,58 @@ async def ingest_directory(
         if not target.exists():
             raise HTTPException(status_code=404, detail=f"目录不存在: {dir_path}")
         _ensure_within(user_scope, target)
+
+        # P1 异步入库：目录批量同样支持 background=true
+        if background:
+            from src.ingest_jobs import create_job, submit as _submit_job
+
+            _kb_e, _uid, _cfg_s = kb, user.id, dict(cfg)
+            _tgt, _rec = str(target), bool(recursive)
+            job_id = create_job("dir", _tgt, {"kb_id": _kb_e["id"]})
+
+            def _bg_dir(reporter) -> Dict[str, Any]:
+                reporter(0.1, "parse")
+                _split = get_splitter(_cfg_s)
+                docs = enrich_directory(
+                    _tgt,
+                    default_acl=_cfg_s.get("data_quality", {}).get("default_acl", "*"),
+                    recursive=_rec)
+                if not docs:
+                    docs = load_directory(
+                        _tgt,
+                        pdf_engine=_cfg_s["document_loader"].get("pdf_engine", "pdfplumber"),
+                        recursive=_rec,
+                        ocr_cfg=_cfg_s.get("document_loader", {}).get("ocr") or {},
+                        encoding=_cfg_s["document_loader"].get("encoding", "utf-8"))
+                chunks, rep = run_data_pipeline(
+                    docs, _cfg_s, _split,
+                    decision_provider=_ingest_guard_provider(_cfg_s))
+                for ch in chunks:
+                    ch.metadata["kb_id"] = _kb_e["id"]
+                rep["docs"] = len(docs)
+                if not chunks:
+                    raise RuntimeError("目录中没有可入库内容")
+                reporter(0.6, "upsert")
+                _store = TenantAwareFactory.get_chroma_store_by_name(
+                    _kb_e["collection_name"], _cfg_s)
+                _srcs = sorted({str(c.metadata.get("source")
+                                    or c.metadata.get("filepath") or "unknown")
+                                for c in chunks})
+                n = _store.replace_chunks_for_sources(
+                    chunks, _srcs,
+                    on_commit=lambda: _commit_ingestion_metadata(
+                        _uid, chunks, rep, _kb_e["id"]))
+                try:
+                    from api.deps import get_runtime_pipeline as _grp2
+                    _grp2(user_id=_uid).invalidate_answer_cache()
+                except Exception:
+                    pass
+                return {"dir": _tgt, "docs": len(docs), "chunks": len(chunks),
+                        "ingested": n, "kb_id": _kb_e["id"]}
+
+            _submit_job(_bg_dir, job_id)
+            return {"job_id": job_id, "status": "queued", "dir": str(target),
+                    "kb_id": kb["id"], "poll": f"/api/v1/ingest/jobs/{job_id}"}
 
         splitter = get_splitter(cfg)
 
@@ -795,6 +1010,13 @@ async def ingest_directory(
             )
 
         n = await run_in_threadpool(_replace)
+
+        # P1：入库成功后失效答案/检索缓存，避免旧答案残留
+        try:
+            from api.deps import get_runtime_pipeline as _grp_dir
+            _grp_dir(user_id=user.id).invalidate_answer_cache()
+        except Exception:
+            pass
 
         return {
             "dir": str(target),
