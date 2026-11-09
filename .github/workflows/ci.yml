@@ -51,6 +51,16 @@ jobs:
         run: |
           pytest tests/ -v --tb=short
 
+      - name: Eval regression gate (retrieval-only, 0.8/0.7/1500ms)
+        # P1 评估门禁：差评导出评估集后，CI 用阈值卡死回归。
+        # 空库冷启时检索命中为 0 属预期，故 continue-on-error 只告警不卡死；
+        # 有数据（自带 runner 挂载 data/chroma_db）的环境把 continue-on-error
+        # 去掉即变硬门禁：--min-hit-rate 0.8 --min-ndcg 0.7 --max-p95 1500。
+        continue-on-error: true
+        run: |
+          pytest tests/test_evaluate_thresholds.py -v --tb=short
+          python scripts/evaluate.py --retrieval-only --min-hit-rate 0.8 --min-ndcg 0.7 --max-p95-latency-ms 1500 --no-archive || echo "::warning::eval gate未通过，请查看 data/eval/report.json（差评转 eval 见 POST /api/v1/eval/export-feedback）"
+
       - name: Test imports
         run: |
           python -c "from src.factories import TenantAwareFactory; print('Factory module OK')"
