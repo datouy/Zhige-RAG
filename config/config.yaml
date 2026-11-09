@@ -138,7 +138,7 @@ embedding:
   # --- 公共参数 / backend: local ---
   model_name: "./models/bge-small-zh-v1.5-onnx"
   device: "cpu"
-  batch_size: 16
+  batch_size: 32                       # P0-3：批量32，入库吞吐+查询一次编码
   normalize_embeddings: true
   max_seq_length: 512
   # 仅对 bge-*-zh-v1.5 系列等"查询需加指令"的本地模型生效；
@@ -213,9 +213,18 @@ data_quality:
 #
 retrieval:
   top_k: 8                       # 召回数
+  fetch_k: 24                    # 两阶段召回候选数（向量+BM25先取fetch_k做RRF融合，再截回top_k）
   rerank_candidates: 24            # 重排候选数（top_k * 3）
   score_threshold: 0.0
   min_score: 0.15                 # 混合检索分数量纲不一致，降低硬阈值误拒答
+  neighbor_expand: true           # P0-4 small-to-big：命中块前后各补1块，还原文脉
+  neighbor_window: 1              # 前后各补几块（1=三连块，2=五连块，上限2防爆炸）
+  cache_ttl_seconds: 900          # P1 语义缓存：同问 15min 内直接复用（原15s太短）
+  answer_cache_enabled: true      # P1 答案级语义缓存：同问同库24h内直接复用整答，TTFT≈0
+  answer_cache_ttl_seconds: 86400 # 答案缓存TTL（秒），入库后自动失效
+  hyde_enabled: false             # P1 HyDE：LLM 生成假设答案再检，口语/缩写查询召回+；默认关（需LLM）
+  multiquery_enabled: true        # P1 多路召回：原问+去填充词+指代展开取并集RRF，零LLM开销默认开
+  max_query_variants: 3           # 多路最多几路（防爆炸）
   status_filter: true
   status_filter_fallback: true
   acl_filter: true
@@ -244,7 +253,10 @@ reranker:
   #   的 min_relevance 直接挡掉，不再硬编。
   # 代价：多加载一个 ~1.1GB 的重排模型 + 每次约几十毫秒。
   # 想换回纯向量检索（更快）就把 enabled 改回 false。
-  enabled: false
+  # P0-2（轻量默认开）：默认开启以保证召回精准；缺模型时 create_reranker 会
+  # 自动降级为 None（见 src/reranker.py），不阻塞问答。想用更小模型可把
+  # model_name 换成 bge-reranker-v2-m3（~280MB，CPU约40ms）。
+  enabled: true
   backend: "bge"                   # bge | d1 | auto
   model_name: "./models/bge-reranker-base"
   device: "auto"                   # auto 会优先用显卡；纯 CPU 机器会被自动判为 cpu

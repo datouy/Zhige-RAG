@@ -305,6 +305,56 @@ class BM25Index:
             self.tfs.append(tf)
             self.df.update(tf.keys())
 
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "ids": self.ids,
+            "texts": self.texts,
+            "metadatas": self.metadatas,
+            "k1": self.k1,
+            "b": self.b,
+            "version": 1,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "BM25Index":
+        return cls(
+            ids=data.get("ids") or [],
+            texts=data.get("texts") or [],
+            metadatas=data.get("metadatas") or [],
+            k1=float(data.get("k1", 1.5)),
+            b=float(data.get("b", 0.75)),
+        )
+
+    def save(self, path: Any) -> None:
+        try:
+            import pickle
+
+            p = str(path)
+            import os
+
+            os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
+            with open(p, "wb") as f:
+                pickle.dump(self.to_dict(), f)
+        except Exception:
+            pass
+
+    @classmethod
+    def load(cls, path: Any) -> Optional["BM25Index"]:
+        try:
+            import pickle
+            import os
+
+            p = str(path)
+            if not os.path.exists(p):
+                return None
+            with open(p, "rb") as f:
+                data = pickle.load(f)
+            if not isinstance(data, dict):
+                return None
+            return cls.from_dict(data)
+        except Exception:
+            return None
+
     def upsert_documents(
         self,
         ids: Sequence[str],
@@ -519,6 +569,8 @@ class ChromaStore:
         self.hybrid_bm25_weight = max(0.0, float(hybrid_bm25_weight))
         self._bm25: Optional[BM25Index] = None
         self._bm25_lock = threading.Lock()
+        # P1：BM25 磁盘持久化路径（与 collection 同目录，避免冷启全量 get+分词）
+        self._bm25_path = self.persist_directory / f"bm25_{collection_name}.pkl"
 
     def health_check(self, query_probe: bool = True) -> Dict[str, Any]:
         """执行不会写数据的一致性探测，失败时抛出明确异常。"""
@@ -564,7 +616,12 @@ class ChromaStore:
         return report
 
     def _invalidate_bm25(self) -> None:
-        """数据变更后使 BM25 索引失效。"""
+        """数据变更后使 BM25 索引失效（并尽力落盘，下次冷启直接复用）。"""
+        try:
+            if self._bm25 is not None:
+                self._bm25.save(getattr(self, "_bm25_path", "bm25.pkl"))
+        except Exception:
+            pass
         self._bm25 = None
 
     def _ensure_bm25(self) -> BM25Index:
@@ -572,12 +629,29 @@ class ChromaStore:
             # 并发首查时只允许一个线程构建索引，避免重复全量读取和分词。
             with self._bm25_lock:
                 if self._bm25 is None:
+                    # P1：优先读磁盘持久化，N 对不上再全量重建（万级以上冷启分钟级→秒级）
+                    try:
+                        cached = BM25Index.load(getattr(self, "_bm25_path", "bm25.pkl"))
+                        if cached is not None:
+                            try:
+                                cur_n = int(self.collection.count())
+                            except Exception:
+                                cur_n = -1
+                            if cur_n < 0 or int(cached.N) == cur_n:
+                                self._bm25 = cached
+                                return self._bm25
+                    except Exception:
+                        pass
                     got = self.collection.get(include=["documents", "metadatas"])
                     self._bm25 = BM25Index(
                         ids=got.get("ids") or [],
                         texts=got.get("documents") or [],
                         metadatas=got.get("metadatas") or [],
                     )
+                    try:
+                        self._bm25.save(getattr(self, "_bm25_path", "bm25.pkl"))
+                    except Exception:
+                        pass
         return self._bm25
 
     def _fuse_hybrid(

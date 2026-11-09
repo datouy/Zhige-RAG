@@ -130,7 +130,7 @@ def test_retrieve_min_score_guard():
 
 
 def test_retrieve_scans_full_collection_before_filtering():
-    """默认 Top-K 不应限制问题相关性检索所覆盖的知识库分块。"""
+    """两阶段召回：只取 fetch_k 候选做融合，不再全库打分。"""
     from src.rag_pipeline import RAGPipeline
     from src.vector_store import Hit
 
@@ -147,12 +147,12 @@ def test_retrieve_scans_full_collection_before_filtering():
 
     store = _Store()
     p = object.__new__(RAGPipeline)
-    p.config = {"retrieval": {"min_score": 0.0}}
+    p.config = {"retrieval": {"min_score": 0.0, "fetch_k": 24}}
     p.vector_store = store
 
     hits = p._retrieve("问题", top_k=3, where=None)
 
-    assert store.requested_k == 12
+    assert store.requested_k == 24
     assert [hit.id for hit in hits] == ["relevant"]
 
 

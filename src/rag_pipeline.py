@@ -192,6 +192,10 @@ class RAGPipeline:
         # 检索短 TTL 缓存：键含 collection 名，防止跨库/跨租户复用
         self._retrieval_cache: Dict[Any, tuple[float, List[Hit]]] = {}
         self._retrieval_cache_lock = threading.Lock()
+        # P1 答案级语义缓存：同问(归一化后)+同库+同top_k 24h内直接复用整答，
+        # 命中时跳过检索+LLM，TTFT≈0。键含collection/kb防串库；有history/流式不缓存。
+        self._answer_cache: Dict[Any, tuple[float, RAGResult]] = {}
+        self._answer_cache_lock = threading.Lock()
         self.reranker = reranker
         # d1 决策层（可选）：驱动重排 / 路由 / 校验三处增强。
         # 显式注入优先；未注入时 _get_decision_provider 按配置懒加载。
@@ -363,12 +367,15 @@ class RAGPipeline:
     def _cached_vector_query(
         self, query_text: str, top_k: int, security_where: Optional[Dict[str, Any]]
     ) -> List[Hit]:
-        """带短 TTL 缓存的向量检索；失败时降级为未命中（返回空列表）。"""
+        """带 TTL 缓存的向量检索；失败时降级为未命中（返回空列表）。"""
         import json
 
-        score_threshold = float(
-            self.config.get("retrieval", {}).get("score_threshold", 0.0) or 0.0
-        )
+        retrieval_cfg = self.config.get("retrieval", {}) or {}
+        score_threshold = float(retrieval_cfg.get("score_threshold", 0.0) or 0.0)
+        try:
+            ttl = float(retrieval_cfg.get("cache_ttl_seconds", RETRIEVAL_CACHE_TTL_SECONDS) or RETRIEVAL_CACHE_TTL_SECONDS)
+        except (TypeError, ValueError):
+            ttl = RETRIEVAL_CACHE_TTL_SECONDS
         key = (
             getattr(self.vector_store, "collection_name", ""),
             query_text,
@@ -386,7 +393,7 @@ class RAGPipeline:
             self._retrieval_cache = cache
         with lock:
             entry = cache.get(key)
-            if entry is not None and now - entry[0] < RETRIEVAL_CACHE_TTL_SECONDS:
+            if entry is not None and now - entry[0] < ttl:
                 return entry[1]
 
         try:
@@ -406,11 +413,144 @@ class RAGPipeline:
             if len(cache) > RETRIEVAL_CACHE_MAX_ENTRIES:
                 expired = [
                     k for k, v in cache.items()
-                    if now - v[0] >= RETRIEVAL_CACHE_TTL_SECONDS
+                    if now - v[0] >= ttl
                 ]
                 for k in expired:
                     cache.pop(k, None)
         return hits
+
+    # ---------------- P1 答案级语义缓存 ----------------
+    def _answer_cache_key(self, question: str, top_k: int,
+                          where: Optional[Dict[str, Any]],
+                          allowed_groups: Optional[List[str]]) -> Any:
+        import json
+        try:
+            norm = normalize_query(question or "")
+        except Exception:
+            norm = (question or "").strip()
+        try:
+            where_s = json.dumps(where, sort_keys=True, default=str, ensure_ascii=False)
+        except Exception:
+            where_s = str(where)
+        return (
+            getattr(self.vector_store, "collection_name", ""),
+            norm[:500],
+            int(top_k or 0),
+            where_s,
+            tuple(sorted(allowed_groups or [])),
+        )
+
+    def _answer_cache_get(self, key: Any) -> Optional[RAGResult]:
+        try:
+            rcfg = self.config.get("retrieval", {}) or {}
+            if not rcfg.get("answer_cache_enabled", True):
+                return None
+            ttl = float(rcfg.get("answer_cache_ttl_seconds", 86400) or 86400)
+        except (TypeError, ValueError):
+            ttl = 86400.0
+        lock = getattr(self, "_answer_cache_lock", None)
+        cache = getattr(self, "_answer_cache", None)
+        if lock is None or cache is None:
+            return None
+        with lock:
+            ent = cache.get(key)
+            if ent is None:
+                return None
+            ts, res = ent
+            if time.time() - ts >= ttl:
+                cache.pop(key, None)
+                return None
+            return res
+
+    def _answer_cache_put(self, key: Any, res: RAGResult) -> None:
+        try:
+            rcfg = self.config.get("retrieval", {}) or {}
+            if not rcfg.get("answer_cache_enabled", True):
+                return
+        except Exception:
+            pass
+        lock = getattr(self, "_answer_cache_lock", None)
+        cache = getattr(self, "_answer_cache", None)
+        if lock is None or cache is None:
+            return
+        with lock:
+            cache[key] = (time.time(), res)
+            if len(cache) > 200:
+                oldest = next(iter(cache))
+                cache.pop(oldest, None)
+
+    def invalidate_answer_cache(self) -> None:
+        """入库/配置变更后调用，避免旧答案残留。"""
+        try:
+            with self._answer_cache_lock:
+                self._answer_cache.clear()
+            with self._retrieval_cache_lock:
+                self._retrieval_cache.clear()
+        except Exception:
+            pass
+
+    def _query_variants(self, query: str) -> List[str]:
+        """P1 多路召回：原问 + 去填充词 + HyDE假设答案（可选）取并集RRF。
+
+        零LLM开销默认开前两路；hyde_enabled=true 且有llm时再加第三路假设答案。
+        """
+        retrieval_cfg = self.config.get("retrieval", {}) or {}
+        if not retrieval_cfg.get("multiquery_enabled", True):
+            return [query]
+        max_v = max(1, min(5, int(retrieval_cfg.get("max_query_variants", 3) or 3)))
+        variants: List[str] = [query]
+        # 第2路：去填充词（请问一下/帮我查一下…），口语化查询召回最吃这个
+        try:
+            stripped = _QUERY_FILLER_PREFIX_RE.sub("", (query or "").strip()).strip()
+            if stripped and stripped != query and len(stripped) >= 2:
+                variants.append(stripped)
+        except Exception:
+            pass
+        # 第3路：HyDE——用LLM生成假设答案再检（缩写/别称查询召回+明显）
+        if retrieval_cfg.get("hyde_enabled") and len(variants) < max_v:
+            try:
+                hyde = self._hyde_passage(query)
+                if hyde and hyde not in variants:
+                    variants.append(hyde)
+            except Exception as exc:
+                logger.debug("HyDE生成失败，退回双路召回: %s", exc)
+        return variants[:max_v]
+
+    def _hyde_passage(self, query: str) -> str:
+        """生成假设性答案段落（HyDE），无LLM时抛异常由调用方吞掉。"""
+        llm = getattr(self, "llm", None)
+        if llm is None:
+            try:
+                self.ensure_llm()
+                llm = getattr(self, "llm", None)
+            except Exception:
+                llm = None
+        if llm is None:
+            raise RuntimeError("无可用LLM，跳过HyDE")
+        messages = [
+            {"role": "system", "content": "你是中文知识库助手。用2-3句话直接回答问题，假设你知道答案（即使不确定也给出最可能的表述），只输出答案正文，不要解释。"},
+            {"role": "user", "content": (query or "")[:300]},
+        ]
+        try:
+            out = llm.chat(messages, llm.gen_cfg, stream=False)
+            return (out or "").strip()[:600]
+        except Exception as exc:
+            raise RuntimeError(f"HyDE调用失败: {exc}") from exc
+
+    def _rrf_fuse_variants(self, ranked_lists: List[List[Hit]], limit: int) -> List[Hit]:
+        """多路命中按RRF倒数排名融合（K=60，与向量/BM25一致）。"""
+        RRF_K = 60
+        rrf: Dict[str, float] = {}
+        by_id: Dict[str, Hit] = {}
+        for hits in ranked_lists:
+            for rank, h in enumerate(hits):
+                rrf[h.id] = rrf.get(h.id, 0.0) + 1.0 / (RRF_K + rank + 1)
+                # 保留分数最高的原始Hit（分数/文本/元数据以最高分为准）
+                prev = by_id.get(h.id)
+                if prev is None or h.score > prev.score:
+                    by_id[h.id] = h
+        fused_ids = sorted(rrf, key=lambda cid: -rrf[cid])[: max(1, int(limit))]
+        return [by_id[cid] for cid in fused_ids if cid in by_id]
 
     def _retrieve(
         self,
@@ -419,22 +559,45 @@ class RAGPipeline:
         where: Optional[Dict[str, Any]],
         allowed_groups: Optional[List[str]] = None,
     ) -> List[Hit]:
-        # 全库扫描是为了"相关分块不因默认 Top-K 太小而进不了候选集"，
-        # 但**候选集不等于上下文**：把这个候选集原样交给 `_build_context`，
-        # 253 块均分 3600 字预算就是每块 14 个字符，模型看到的全是残句，
-        # 引用编号也会跳号（回答里出现 [1]-[5][7][8] 却缺 [6] 就是这么来的）。
-        # 所以这里记下调用方要的 K，最后按分数截回去。
-        requested_k = int(top_k)
-        try:
-            corpus_size = int(self.vector_store.count())
-            top_k = max(requested_k, corpus_size)
-        except (AttributeError, TypeError, ValueError):
-            pass
+        # 两阶段召回：向量+BM25 先取 fetch_k 候选做 RRF 融合，再截回调用方要的 K。
+        # 旧实现是 max(requested, corpus_size) 全库打分：万级以上直接爆炸，
+        # 且 _build_context 被迫做均分补丁。这里 fetch_k 上限 100，同类两阶段做法。
+        requested_k = max(1, int(top_k))
+        retrieval_cfg = self.config.get("retrieval", {}) or {}
+        if getattr(self, "reranker", None) is not None:
+            fetch_k = max(
+                requested_k,
+                int(retrieval_cfg.get("rerank_candidates", requested_k * 3) or requested_k * 3),
+            )
+        else:
+            fetch_k = max(requested_k, int(retrieval_cfg.get("fetch_k", requested_k) or requested_k))
+        # 硬上限：防止误配 rerank_candidates=500 把整库拖回
+        fetch_k = min(fetch_k, 100)
         security_where = self._security_where(where, allowed_groups)
         norm_query = normalize_query(query)
-        hits = self._cached_vector_query(
-            self._apply_query_instruction(norm_query), top_k, security_where
-        )
+        # P1 多路召回：原问+去填充词(+HyDE)取并集RRF，零LLM默认开两路
+        try:
+            variants = self._query_variants(norm_query)
+        except Exception:
+            variants = [norm_query]
+        if not variants:
+            variants = [norm_query]
+        if len(variants) == 1:
+            hits = self._cached_vector_query(
+                self._apply_query_instruction(variants[0]), fetch_k, security_where
+            )
+        else:
+            ranked_lists: List[List[Hit]] = []
+            for v in variants:
+                try:
+                    ranked_lists.append(
+                        self._cached_vector_query(
+                            self._apply_query_instruction(v), fetch_k, security_where
+                        )
+                    )
+                except Exception:
+                    continue
+            hits = self._rrf_fuse_variants(ranked_lists, fetch_k) if ranked_lists else []
         # 旧索引兼容：doc_status 过滤导致全空时回退一次（仅状态过滤，ACL 不回退）
         if (
             not hits
@@ -445,7 +608,7 @@ class RAGPipeline:
             with Timer("retrieve_unfiltered_fallback"):
                 hits = self.vector_store.query(
                     query_text=self._apply_query_instruction(norm_query),
-                    top_k=top_k,
+                    top_k=fetch_k,
                     where=where,
                     score_threshold=self.config.get("retrieval", {}).get("score_threshold", 0.0),
                 )
@@ -472,7 +635,87 @@ class RAGPipeline:
         # 保持分数降序，下游（全文扩展 / 重排 / 引用）都按这个顺序取。
         if requested_k > 0 and len(hits) > requested_k:
             hits = sorted(hits, key=lambda h: h.score, reverse=True)[:requested_k]
+        # P0-4 small-to-big：命中块回填前后邻居，还原文脉（跨段因果题最吃这个）。
+        hits = self._expand_with_neighbors(hits, where=where, allowed_groups=allowed_groups)
         return hits
+
+    def _expand_with_neighbors(
+        self,
+        hits: List[Hit],
+        where: Optional[Dict[str, Any]] = None,
+        allowed_groups: Optional[List[str]] = None,
+    ) -> List[Hit]:
+        """命中块前后各补1块（同source按chunk_index±1），不断号、不超预算。
+
+        为什么：400字块直接给模型，跨段因果必碎。真正的父子索引要重切入库，
+        老库升级成本高；邻居回填零迁移就能拿到80%收益：召回的是child精度，
+        补上邻居后模型看到的是parent级连续上下文。
+        """
+        try:
+            cfg = self.config.get("retrieval", {}) or {}
+            if not cfg.get("neighbor_expand", True) or not hits:
+                return hits
+            window = max(0, min(2, int(cfg.get("neighbor_window", 1) or 0)))
+            if window == 0:
+                return hits
+            expand = getattr(self.vector_store, "get_by_source", None)
+            if not callable(expand):
+                return hits
+            try:
+                safe_where = self._security_where(where, allowed_groups)
+            except Exception:
+                safe_where = where
+            # 按source分组取全文（命中已按分数排，source首次出现顺序即相关度顺序）
+            seen: Dict[str, List[Hit]] = {}
+            for h in hits:
+                src = str((h.metadata or {}).get("source") or "")
+                if src and src not in seen:
+                    try:
+                        seen[src] = list(expand(src, where=safe_where) or [])
+                    except Exception:
+                        seen[src] = []
+            by_id = {h.id: h for h in hits}
+            extra: List[Hit] = []
+            for h in hits:
+                src = str((h.metadata or {}).get("source") or "")
+                full = seen.get(src) or []
+                if not full:
+                    continue
+                try:
+                    cur = int((h.metadata or {}).get("chunk_index"))
+                except (TypeError, ValueError):
+                    continue
+                idx_map = {}
+                for f in full:
+                    try:
+                        idx_map[int((f.metadata or {}).get("chunk_index"))] = f
+                    except (TypeError, ValueError):
+                        continue
+                for d in range(1, window + 1):
+                    for nb in (cur - d, cur + d):
+                        cand = idx_map.get(nb)
+                        if cand is not None and cand.id not in by_id:
+                            by_id[cand.id] = cand
+                            extra.append(cand)
+            if not extra:
+                return hits
+            # 邻居分数略低于原命中，保证原命中仍排前面，且总量不爆炸
+            base = min((h.score for h in hits), default=0.0)
+            for e in extra:
+                try:
+                    e.score = min(e.score, base * 0.95) if base > 0 else e.score * 0.95
+                except Exception:
+                    pass
+            merged = list(hits) + extra
+            # 按原文顺序排，方便_build_context按序装配
+            try:
+                merged = self._order_hits_by_position(merged)
+            except Exception:
+                pass
+            max_total = max(len(hits) * 2 + 2, len(hits) + len(extra))
+            return merged[:max_total]
+        except Exception:
+            return hits
 
     def _verify(self, answer: str, context_chunks: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         """可验证性校验（可经 rag.verification.enabled 关闭）。
@@ -819,12 +1062,12 @@ class RAGPipeline:
         """
         retrieval_cfg = self.config.get("retrieval", {})
         k = top_k or retrieval_cfg.get("top_k", 5)
-        if self.reranker is not None:
+        if getattr(self, "reranker", None) is not None:
             initial_k = max(k, retrieval_cfg.get("rerank_candidates", k * 3))
         else:
             initial_k = k
         hits = self._retrieve(question, top_k=initial_k, where=where, allowed_groups=allowed_groups)
-        if self.reranker is not None:
+        if getattr(self, "reranker", None) is not None:
             hits = self._rerank(normalize_query(question), hits, top_n=k)
         return hits
 
@@ -857,6 +1100,29 @@ class RAGPipeline:
         except re.error:
             logger.warning("rag.fulltext_expand.pattern 不是合法正则，跳过全文扩展：%s", pattern)
             triggered = False
+        # P0-5 语义触发：正则没命中时再看 top1 集中度与聚合意图，换个问法不丢全文
+        if not triggered:
+            try:
+                from .query_router import is_aggregate_query as _is_agg
+                if _is_agg(question or ""):
+                    triggered = True
+            except Exception:
+                pass
+        if not triggered:
+            try:
+                conc = float(cfg.get("concentration_threshold", 0.6) or 0.6)
+                if len(hits) >= 2:
+                    top_scores = sorted([h.score for h in hits], reverse=True)[:3]
+                    # top1 占前3总分比例高 → 高度聚焦同一文档，值得扩全文
+                    denom = sum(max(0.0, s) for s in top_scores)
+                    if denom > 0 and (max(0.0, top_scores[0]) / denom) >= conc:
+                        # 且 top1 与 top2 拉开差距，避免并列多文档时误扩
+                        if len(top_scores) < 2 or top_scores[0] >= top_scores[1] * 1.2:
+                            triggered = True
+                            logger.info("全文扩展语义触发：top1集中度 %.2f≥%.2f（问题：%s）",
+                                        (top_scores[0] / denom), conc, (question or "")[:40])
+            except Exception:
+                pass
         if not triggered:
             return hits
         expand = getattr(self.vector_store, "get_by_source", None)
@@ -1036,33 +1302,41 @@ class RAGPipeline:
         summaries: List[str] = []
         fallback_groups = 0
         retry_delay = float(cfg.get("retry_delay_sec", 1.0))
-        inter_call_delay = float(cfg.get("inter_call_delay_sec", 1.0))
         per_group_chars = max(120, int(cfg.get("summary_chars", 150)))
-        for i, group in enumerate(groups, start=1):
-            if i > 1 and inter_call_delay > 0:
-                # 连续高频调用会被推理服务限流，表现是"返回空字符串"。
-                # 主动留间隔，比事后重试便宜。
-                time.sleep(inter_call_delay)
+        # P0-6 并行 map：ThreadPool 代替串行 sleep；限流靠 max_workers 控制并发
+        import concurrent.futures as _fut
+        max_workers = max(1, min(4, int(cfg.get("max_workers", 4) or 4)))
+
+        def _summarize_one(args):
+            idx, group = args
             piece = ""
             for attempt in (1, 2):
                 try:
-                    piece = self._compress_group(group, i, len(groups))
+                    piece = self._compress_group(group, idx, len(groups))
                 except Exception as exc:  # noqa: BLE001 - 单段失败不该毁掉整次回答
-                    logger.warning("分段摘要失败（第 %d/%d 段，第 %d 次）：%s", i, len(groups), attempt, exc)
+                    logger.warning("分段摘要失败（第 %d/%d 段，第 %d 次）：%s", idx, len(groups), attempt, exc)
                     piece = ""
                 if piece:
                     break
-                if attempt == 1:
+                if attempt == 1 and retry_delay > 0:
                     time.sleep(retry_delay)
             if piece:
-                summaries.append(f"（第{i}/{len(groups)}部分）{piece}")
-                continue
-            # 摘要拿不到就退回原文摘录：宁可要一段"未经提炼的原文"，
-            # 也不要整篇上下文被丢弃（那正是旧行为里"只看到开头"的来源）。
+                return f"（第{idx}/{len(groups)}部分）{piece}", False
             head = "".join(c["content"] for c in group)[:per_group_chars].strip()
             if head:
-                summaries.append(f"（第{i}/{len(groups)}部分·原文摘录）{head}…")
-                fallback_groups += 1
+                return f"（第{idx}/{len(groups)}部分·原文摘录）{head}…", True
+            return "", False
+
+        ordered_results: List[str] = [""] * len(groups)
+        with _fut.ThreadPoolExecutor(max_workers=max_workers) as ex:
+            for idx, (text, is_fallback) in zip(
+                range(1, len(groups) + 1), ex.map(_summarize_one, list(enumerate(groups, start=1)))
+            ):
+                if text:
+                    ordered_results[idx - 1] = text
+                    if is_fallback:
+                        fallback_groups += 1
+        summaries = [s for s in ordered_results if s]
         if not summaries:
             return context_chunks
         if fallback_groups:
@@ -1307,8 +1581,20 @@ class RAGPipeline:
 
         retrieval_cfg = self.config.get("retrieval", {})
         k = top_k or retrieval_cfg.get("top_k", 5)
+        # P1 答案级语义缓存：无 history、非流式同问同库直接复用整答（TTFT≈0）。
+        _ans_key = None
+        if not stream and not history:
+            try:
+                _ans_key = self._answer_cache_key(question, k, where, allowed_groups)
+                _hit = self._answer_cache_get(_ans_key)
+                if _hit is not None:
+                    _hit.timings = dict(_hit.timings or {})
+                    _hit.timings["cache_hit"] = True
+                    return _hit
+            except Exception:
+                _ans_key = None
         # 重排候选数 = max(k, top_n*3)
-        if self.reranker is not None:
+        if getattr(self, "reranker", None) is not None:
             initial_k = max(k, retrieval_cfg.get("rerank_candidates", retrieval_cfg.get("top_k", 5) * 3))
         else:
             initial_k = k
@@ -1320,7 +1606,7 @@ class RAGPipeline:
             else question
         )
         hits = self._retrieve(search_query, top_k=initial_k, where=where, allowed_groups=allowed_groups)
-        if self.reranker is not None:
+        if getattr(self, "reranker", None) is not None:
             hits = self._rerank(question, hits, top_n=k)
 
         if not hits:
@@ -1420,6 +1706,11 @@ class RAGPipeline:
             result.timings["tokens_per_sec"] = None
             result.timings["retries"] = retries_used
             result.verification = self._verify(result.answer, context_chunks)
+            try:
+                if _ans_key is not None:
+                    self._answer_cache_put(_ans_key, result)
+            except Exception:
+                pass
             return result
 
         # 流式：先抛 chunks，最后用 throw 返回完整 RAGResult
@@ -1490,7 +1781,7 @@ class RAGPipeline:
             )
 
         k = top_k or retrieval_cfg.get("top_k", 5)
-        if self.reranker is not None:
+        if getattr(self, "reranker", None) is not None:
             initial_k = max(k, retrieval_cfg.get("rerank_candidates", k * 3))
         else:
             initial_k = k
@@ -1501,7 +1792,7 @@ class RAGPipeline:
             else question
         )
         hits = self._retrieve(search_query, top_k=initial_k, where=where, allowed_groups=allowed_groups)
-        if self.reranker is not None:
+        if getattr(self, "reranker", None) is not None:
             hits = self._rerank(question, hits, top_n=k)
 
         if not hits:
@@ -1666,7 +1957,7 @@ class RAGPipeline:
             else question
         )
         hits = self._retrieve(search_query, top_k=k, where=None, allowed_groups=allowed_groups)
-        if self.reranker is not None:
+        if getattr(self, "reranker", None) is not None:
             hits = self._rerank(question, hits, top_n=k)
 
         # 全文/主旨类问题：把命中文档换成它的全部分块。

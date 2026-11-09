@@ -85,7 +85,7 @@ class OpenAICompatEmbedding:
         model_name: str,
         base_url: str,
         api_key: Optional[str] = None,
-        batch_size: int = 16,
+        batch_size: int = 32,
         normalize: bool = True,
         timeout: float = 60.0,
         dim: Optional[int] = None,
@@ -106,6 +106,13 @@ class OpenAICompatEmbedding:
         # 0 表示"尚未探测到"。与 EmbeddingModel 一样是普通属性，便于外部读取。
         self.dim: int = int(dim) if dim else 0
         self._expected_dim = int(dim) if dim else 0
+        # P0-3：查询向量缓存（同问 24h 内直接复用，省一次 HTTP/ONNX 编码）
+        import threading as _th
+
+        self._qcache: Dict[str, Any] = {}
+        self._qcache_lock = _th.Lock()
+        self._qcache_ttl = 24 * 3600
+        self._qcache_max = 2000
 
     def __repr__(self) -> str:  # pragma: no cover - 仅调试用
         return (
@@ -135,7 +142,26 @@ class OpenAICompatEmbedding:
         if not texts:
             return np.zeros((0, self.dim or 0), dtype="float32")
 
-        bs = max(1, int(batch_size or self.batch_size))
+        # P0-3：单条查询走 24h 缓存；批量入库仍直调（避免大文本占满缓存）
+        import time as _time
+
+        _cache_key = None
+        _cache_now = 0.0
+        if len(texts) == 1:
+            _cache_key = f"{self.model_name}::{texts[0][:500]}"
+            _cache_now = _time.time()
+            with self._qcache_lock:
+                ent = self._qcache.get(_cache_key)
+                if ent and _cache_now - ent[0] < self._qcache_ttl:
+                    arr = ent[1]
+                    _hit = arr.copy() if isinstance(arr, np.ndarray) else arr
+                    if not convert_to_numpy and isinstance(_hit, np.ndarray):
+                        return _hit.tolist()
+                    if convert_to_numpy and isinstance(_hit, list):
+                        return np.asarray(_hit, dtype="float32")
+                    return _hit
+
+        bs = max(1, int(batch_size or self.batch_size or 32))
         vectors: List[List[float]] = []
         with Timer(f"embedding(api) encode x{len(texts)}"):
             for start in range(0, len(texts), bs):
@@ -150,6 +176,15 @@ class OpenAICompatEmbedding:
 
         if array.size:
             self._remember_dim(int(array.shape[1]))
+        if _cache_key is not None and array.size:
+            try:
+                with self._qcache_lock:
+                    self._qcache[_cache_key] = (_cache_now, array.copy())
+                    if len(self._qcache) > self._qcache_max:
+                        oldest = next(iter(self._qcache))
+                        self._qcache.pop(oldest, None)
+            except Exception:
+                pass
         return array if convert_to_numpy else array.tolist()
 
     def encode_one(self, text: str):

@@ -230,12 +230,21 @@ class TextSplitterConfig(_StrictModel):
 class RetrievalConfig(_StrictModel):
     """检索配置。"""
     top_k: int = Field(4, ge=1, le=50, description="检索 top-k")
+    fetch_k: int = Field(24, ge=1, le=100, description="两阶段召回候选数")
     rerank_candidates: int = Field(12, ge=1, le=100, description="重排候选数")
     score_threshold: float = Field(0.0, ge=0.0, le=1.0, description="相似度阈值")
     min_score: float = Field(0.0, ge=0.0, le=1.0)
     status_filter: bool = True
     status_filter_fallback: bool = True
     acl_filter: bool = True
+    neighbor_expand: bool = True
+    neighbor_window: int = Field(1, ge=0, le=2, description="前后邻居回填窗口")
+    cache_ttl_seconds: float = Field(900.0, ge=0.0, le=86400.0)
+    answer_cache_enabled: bool = True
+    answer_cache_ttl_seconds: float = Field(86400.0, ge=0.0, le=604800.0)
+    hyde_enabled: bool = False
+    multiquery_enabled: bool = True
+    max_query_variants: int = Field(3, ge=1, le=5)
 
 
 class RerankerConfig(_StrictModel):
