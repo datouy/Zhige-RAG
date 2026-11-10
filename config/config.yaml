@@ -545,6 +545,7 @@ ui:
 # ------------------ 知识图谱 ------------------
 knowledge_graph:
   enabled: false                  # 默认关闭
+  auto_build_on_ingest: false     # 入库后异步触发建图；仅 enabled 且配置生成式 LLM 时生效
   backend: sqlite
   sqlite_path: data/kg.db
   neo4j:

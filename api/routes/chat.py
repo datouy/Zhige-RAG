@@ -545,6 +545,51 @@ def _resolve_kb(user: User, cfg: Dict[str, Any], kb_id: Optional[str]) -> Dict[s
         db.close()
 
 
+def _maybe_trigger_kg_build(user_id: str, cfg: Dict[str, Any]) -> None:
+    """入库后按需异步构建知识图谱（P1-6）。
+
+    仅在 knowledge_graph.enabled 且 auto_build_on_ingest 同时开启，
+    并且存在可用的生成式 LLM 时提交后台任务。extractive（无 LLM）模式、
+    LLM 未就绪、raw 目录不存在时静默跳过，绝不影响入库主链路。
+    """
+    kg_cfg = cfg.get("knowledge_graph") or {}
+    if not kg_cfg.get("enabled") or not kg_cfg.get("auto_build_on_ingest"):
+        return
+    try:
+        pipeline = get_runtime_pipeline(user_id=user_id)
+        if pipeline._is_extractive_mode():
+            logger.info("KG 自动构建跳过：extractive 模式无生成式 LLM")
+            return
+        pipeline.ensure_llm()
+        llm = pipeline.llm
+    except Exception as exc:  # noqa: BLE001 - LLM 未就绪不影响入库
+        logger.warning("KG 自动构建跳过（LLM 未就绪）: %s", exc)
+        return
+    if llm is None:
+        return
+    raw_dir = resolve_path(cfg.get("paths", {}).get("raw_docs", "data/raw")) / user_id[:8]
+    if not raw_dir.exists():
+        return
+    try:
+        from src.ingest_jobs import create_job, submit as _submit_job
+        from scripts.build_kg import build as _build_kg
+
+        job_id = create_job("kg_build", "知识图谱自动构建", {"dir": str(raw_dir)})
+
+        def _bg(reporter) -> Dict[str, Any]:
+            reporter(0.05, "extract")
+            kg = TenantAwareFactory.get_kg_store(user_id, cfg)
+            summary = _build_kg(input_dir=str(raw_dir), llm=llm, store=kg)
+            reporter(1.0, "done")
+            return summary
+
+        _submit_job(_bg, job_id)
+        logger.info("已提交知识图谱后台构建任务 %s（%s）", job_id, raw_dir)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("提交 KG 后台构建任务失败: %s", exc)
+
+
+
 @router.post("/api/v1/ingest", tags=["文档"])
 async def ingest_file(
     file: UploadFile = File(...),
@@ -637,6 +682,7 @@ async def ingest_file(
                     _grp(user_id=_uid).invalidate_answer_cache()
                 except Exception:
                     pass
+                _maybe_trigger_kg_build(_uid, _cfg_snapshot)
                 return {"filename": _orig_name, "docs": len(docs),
                         "chunks": len(chunks), "ingested": n,
                         "kb_id": _kbid, "data_quality": rep}
@@ -714,6 +760,8 @@ async def ingest_file(
             _grp_sync(user_id=user.id).invalidate_answer_cache()
         except Exception:
             pass
+
+        _maybe_trigger_kg_build(user.id, cfg)
 
         return {
             "filename": file.filename,
@@ -827,6 +875,7 @@ async def ingest_url(
                     _grp(user_id=_uid).invalidate_answer_cache()
                 except Exception:
                     pass
+                _maybe_trigger_kg_build(_uid, _cfg_snapshot)
                 return {"url": page["url"], "final_url": source, "title": title,
                         "chars": int(page["chars"]), "docs": len(docs),
                         "chunks": len(chunks), "ingested": n, "kb_id": _kbid}
@@ -912,6 +961,8 @@ async def ingest_url(
             _grp_url(user_id=user.id).invalidate_answer_cache()
         except Exception:
             pass
+
+        _maybe_trigger_kg_build(user.id, cfg)
 
         return {
             "url": page["url"],
@@ -1001,6 +1052,7 @@ async def ingest_directory(
                     _grp2(user_id=_uid).invalidate_answer_cache()
                 except Exception:
                     pass
+                _maybe_trigger_kg_build(_uid, _cfg_s)
                 return {"dir": _tgt, "docs": len(docs), "chunks": len(chunks),
                         "ingested": n, "kb_id": _kb_e["id"]}
 
@@ -1068,6 +1120,8 @@ async def ingest_directory(
             _grp_dir(user_id=user.id).invalidate_answer_cache()
         except Exception:
             pass
+
+        _maybe_trigger_kg_build(user.id, cfg)
 
         return {
             "dir": str(target),

@@ -168,6 +168,7 @@ class CORSConfig(_StrictModel):
 class KnowledgeGraphConfig(_StrictModel):
     """知识图谱配置模型。"""
     enabled: bool = Field(True, description="是否启用知识图谱")
+    auto_build_on_ingest: bool = Field(False, description="入库后异步触发建图；仅 enabled 且配置生成式 LLM 时生效")
     backend: str = Field("sqlite", description="存储后端")
     sqlite_path: str = Field("data/kg.db", description="SQLite 数据库路径")
     max_entities_per_chunk: int = Field(20, ge=1, le=100, description="每块最大实体数")
