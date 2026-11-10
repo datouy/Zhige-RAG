@@ -74,6 +74,7 @@ def build(
         pdf_engine=cfg["document_loader"].get("pdf_engine", "pdfplumber"),
         recursive=True,
         ocr_cfg=cfg.get("document_loader", {}).get("ocr") or {},
+        xiaomi_cfg=cfg.get("document_loader", {}).get("xiaomi") or {},
         encoding=cfg["document_loader"].get("encoding", "utf-8"),
     )
     if limit is not None and limit > 0:
@@ -164,6 +165,7 @@ def main() -> int:
             target,
             pdf_engine=cfg["document_loader"].get("pdf_engine", "pdfplumber"),
             ocr_cfg=cfg.get("document_loader", {}).get("ocr") or {},
+            xiaomi_cfg=cfg.get("document_loader", {}).get("xiaomi") or {},
         )
         if args.limit:
             docs = docs[: args.limit]

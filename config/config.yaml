@@ -75,6 +75,27 @@ document_loader:
     #    公网可访问的部署务必保持 false，否则等于开放 SSRF。
     allow_private: false
 
+  # Xiaomi-OCR-0 / Any2Markdown 高质量版面解析（可选，默认关）
+  #
+  # 用小米开源的 Xiaomi-OCR-0（0.8B 文档解析 VLM，Apache-2.0）把 PDF 整页
+  # 转成结构化 Markdown：表格、公式、阅读顺序都比 pdfplumber/pypdf 的纯文本
+  # 提取强一个量级，是扫描件 / 复杂版面的高质量兜底。
+  #
+  # 前置：单独部署 Any2Markdown HTTP 服务（默认 OCR 模型即 Xiaomi-OCR-0）：
+  #   git clone https://github.com/SeerRay-Lab/Any2Markdown && cd Any2Markdown
+  #   pip install -e .
+  #   any2md-server          # 监听 http://127.0.0.1:8088
+  # 其背后再配 vLLM / SGLang / Ollama 跑 Xiaomi-OCR-0（见 Any2Markdown README）。
+  #
+  # 服务不可用 / 未配置时自动回落到 pdfplumber/pypdf + RapidOCR，不影响开箱即用。
+  xiaomi:
+    enabled: false          # 装了 Any2Markdown + 模型服务后再开
+    base_url: "http://127.0.0.1:8088"   # Any2Markdown HTTP server 地址
+    parse_mode: "ocr"       # ocr=每页渲染给模型（最高保真）；auto=有文本层直读；direct=不调模型
+    model: "xiaomi-ocr-0"   # 传给 Any2Markdown 的模型名（须等于 vLLM --served-model-name）
+    timeout: 300.0          # 单文件整体超时（秒），大 PDF 解析较慢
+    fallback_on_error: true # 失败/无产出时回落到传统引擎（建议保持 true）
+
 # ------------------ 文本分块（优化版）------------------
 # 
 # 关键优化：

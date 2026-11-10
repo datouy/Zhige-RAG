@@ -210,6 +210,7 @@ class DocumentLoaderConfig(_StrictModel):
     markdown_extensions: List[str] = Field(default_factory=list)
     ocr: Dict[str, Any] = Field(default_factory=dict)
     url: Dict[str, Any] = Field(default_factory=dict)
+    xiaomi: Dict[str, Any] = Field(default_factory=dict)
 
 
 class TextSplitterConfig(_StrictModel):

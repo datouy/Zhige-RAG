@@ -25,6 +25,7 @@ from fastapi import (
     File,
     Form,
     HTTPException,
+    Request,
     UploadFile,
     WebSocket,
     WebSocketDisconnect,
@@ -47,8 +48,11 @@ from src.document_loader import load_document, load_directory
 from src.document_meta import enrich_directory, enrich_file
 from src.factories import TenantAwareFactory
 from src.memory import SESSION_MEMORY
+from src.middleware.audit import AuditAction, get_audit_logger
 from src.middleware.identity import get_current_user
+from src.monitoring.metrics import metrics_collector
 from src.rag_pipeline import RAGPipeline
+from src.rate_limit import limiter
 from src.utils import SUPPORTED_EXTENSIONS, ensure_dir, get_logger, resolve_path
 
 logger = get_logger("api.routes.chat")
@@ -385,12 +389,15 @@ class SearchBody(BaseModel):
 
 
 @router.post("/api/v1/search", tags=["文档"])
+@limiter.limit("60/minute")
 async def search_documents(
+    request: Request,
     body: SearchBody,
     current_user: User = Depends(get_current_user),
 ) -> Dict[str, Any]:
     """语义检索文档（仅返回 active 且用户有权可见的分块）。需要认证。"""
     user: User = current_user
+    start = time.perf_counter()
     try:
         cfg = get_runtime_config()
         kb = _resolve_kb(user, cfg, body.kb_id)
@@ -411,6 +418,9 @@ async def search_documents(
             return hits
 
         hits = await run_in_threadpool(_query)
+        metrics_collector.record_request(
+            "POST", "/api/v1/search", 200, time.perf_counter() - start
+        )
         return {
             "query": body.query,
             "kb_id": kb["id"],
@@ -441,7 +451,9 @@ class ChatRequest(BaseModel):
 
 
 @router.post("/api/v1/chat", tags=["问答"])
+@limiter.limit("60/minute")
 def chat_sync(
+    request: Request,
     body: ChatRequest,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -459,6 +471,7 @@ def chat_sync(
     - ACL：检索仅召回用户可见分组的分块。
     """
     user: User = current_user
+    start = time.perf_counter()
     try:
         # 指定知识库时在该库内检索，否则用默认库（行为与之前一致）
         kb = _resolve_kb(user, get_runtime_config(), body.kb_id) if body.kb_id else None
@@ -502,6 +515,21 @@ def chat_sync(
             except Exception as exc:  # noqa: BLE001
                 logger.warning("会话消息落库失败（已忽略）: %s", exc)
 
+        # 审计 + 指标：问答成功（审计失败不得影响问答本身）
+        try:
+            get_audit_logger().log(
+                action=AuditAction.CHAT_QUERY,
+                user_id=user.id,
+                resource=(kb or {}).get("id") or "default",
+                details={"query": (body.query or "")[:200], "cited": len(result.sources or [])},
+                db=db,
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug("审计记录失败（已忽略）", exc_info=True)
+        metrics_collector.record_request(
+            "POST", "/api/v1/chat", 200, time.perf_counter() - start
+        )
+
         return {
             "answer": result.answer,
             "sources": result.sources,
@@ -515,6 +543,19 @@ def chat_sync(
         raise
     except Exception as exc:
         logger.error("同步问答失败: %s", exc)
+        try:
+            get_audit_logger().log(
+                action=AuditAction.CHAT_QUERY,
+                user_id=user.id,
+                success=False,
+                error_message=str(exc)[:300],
+                db=db,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        metrics_collector.record_request(
+            "POST", "/api/v1/chat", 500, time.perf_counter() - start
+        )
         raise HTTPException(status_code=500, detail=str(exc))
 
 
@@ -643,10 +684,12 @@ async def ingest_file(
                 reporter(0.1, "parse")
                 _split = get_splitter(_cfg_snapshot)
                 ocr_c = (_cfg_snapshot.get("document_loader", {}).get("ocr")) or {}
+                xiaomi_c = (_cfg_snapshot.get("document_loader", {}).get("xiaomi")) or {}
                 docs = enrich_file(
                     _P(_tmp),
                     default_acl=_cfg_snapshot.get("data_quality", {}).get("default_acl", "*"),
                     ocr_cfg=ocr_c,
+                    xiaomi_cfg=xiaomi_c,
                 )
                 if not docs:
                     docs = load_document(
@@ -654,6 +697,7 @@ async def ingest_file(
                         pdf_engine=_cfg_snapshot["document_loader"].get("pdf_engine", "pdfplumber"),
                         encoding=_cfg_snapshot["document_loader"].get("encoding", "utf-8"),
                         ocr_cfg=ocr_c,
+                        xiaomi_cfg=xiaomi_c,
                     )
                 chunks, rep = run_data_pipeline(
                     docs, _cfg_snapshot, _split,
@@ -701,10 +745,12 @@ async def ingest_file(
             不清的内容被 DataGate 拒绝（拒绝原因返回给调用方便于整改）。
             """
             ocr_cfg = cfg.get("document_loader", {}).get("ocr") or {}
+            xiaomi_cfg = cfg.get("document_loader", {}).get("xiaomi") or {}
             docs = enrich_file(
                 temp_path,
                 default_acl=cfg.get("data_quality", {}).get("default_acl", "*"),
                 ocr_cfg=ocr_cfg,
+                xiaomi_cfg=xiaomi_cfg,
             )
             if not docs:
                 docs = load_document(
@@ -712,6 +758,7 @@ async def ingest_file(
                     pdf_engine=cfg["document_loader"].get("pdf_engine", "pdfplumber"),
                     encoding=cfg["document_loader"].get("encoding", "utf-8"),
                     ocr_cfg=ocr_cfg,
+                    xiaomi_cfg=xiaomi_cfg,
                 )
             chunks, report = run_data_pipeline(
                 docs, cfg, splitter, decision_provider=_ingest_guard_provider(cfg)
@@ -1018,17 +1065,22 @@ async def ingest_directory(
             def _bg_dir(reporter) -> Dict[str, Any]:
                 reporter(0.1, "parse")
                 _split = get_splitter(_cfg_s)
+                _dl_cfg = _cfg_s.get("document_loader", {}) or {}
                 docs = enrich_directory(
                     _tgt,
                     default_acl=_cfg_s.get("data_quality", {}).get("default_acl", "*"),
-                    recursive=_rec)
+                    recursive=_rec,
+                    ocr_cfg=_dl_cfg.get("ocr") or {},
+                    xiaomi_cfg=_dl_cfg.get("xiaomi") or {},
+                )
                 if not docs:
                     docs = load_directory(
                         _tgt,
-                        pdf_engine=_cfg_s["document_loader"].get("pdf_engine", "pdfplumber"),
+                        pdf_engine=_dl_cfg.get("pdf_engine", "pdfplumber"),
                         recursive=_rec,
-                        ocr_cfg=_cfg_s.get("document_loader", {}).get("ocr") or {},
-                        encoding=_cfg_s["document_loader"].get("encoding", "utf-8"))
+                        ocr_cfg=_dl_cfg.get("ocr") or {},
+                        xiaomi_cfg=_dl_cfg.get("xiaomi") or {},
+                        encoding=_dl_cfg.get("encoding", "utf-8"))
                 chunks, rep = run_data_pipeline(
                     docs, _cfg_s, _split,
                     decision_provider=_ingest_guard_provider(_cfg_s))
@@ -1064,18 +1116,22 @@ async def ingest_directory(
 
         def _parse_and_chunk() -> tuple:
             """与单文件入库相同的数据层管线（元数据增强 → 清洗 → 去重 → 准入 → 分块）。"""
+            _dl_cfg = cfg.get("document_loader", {}) or {}
             docs = enrich_directory(
                 target,
                 default_acl=cfg.get("data_quality", {}).get("default_acl", "*"),
                 recursive=recursive,
+                ocr_cfg=_dl_cfg.get("ocr") or {},
+                xiaomi_cfg=_dl_cfg.get("xiaomi") or {},
             )
             if not docs:
                 docs = load_directory(
                     target,
-                    pdf_engine=cfg["document_loader"].get("pdf_engine", "pdfplumber"),
+                    pdf_engine=_dl_cfg.get("pdf_engine", "pdfplumber"),
                     recursive=recursive,
-                    ocr_cfg=cfg.get("document_loader", {}).get("ocr") or {},
-                    encoding=cfg["document_loader"].get("encoding", "utf-8"),
+                    ocr_cfg=_dl_cfg.get("ocr") or {},
+                    xiaomi_cfg=_dl_cfg.get("xiaomi") or {},
+                    encoding=_dl_cfg.get("encoding", "utf-8"),
                 )
             chunks, report = run_data_pipeline(
                 docs, cfg, splitter, decision_provider=_ingest_guard_provider(cfg)

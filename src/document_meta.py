@@ -366,6 +366,7 @@ def enrich_file(
     default_acl: str = "*",
     default_status: str = "active",
     ocr_cfg: Optional[Dict] = None,
+    xiaomi_cfg: Optional[Dict] = None,
 ) -> List[Document]:
     """解析单个文件并产出带完整元数据的小节 Document 列表。
 
@@ -378,6 +379,8 @@ def enrich_file(
         ocr_cfg: 扫描件 OCR 配置（对应 ``config.document_loader.ocr``）。
             **必须在此透传**：PDF 入库走的是本函数而不是直接调 ``load_document``，
             漏传会让扫描件静默提不出文本 —— 用户只看到"入库成功但搜不到"。
+        xiaomi_cfg: Xiaomi-OCR-0 / Any2Markdown 版面解析配置
+            （对应 ``config.document_loader.xiaomi``），同样需透传，仅 PDF 生效。
     """
     p = Path(path)
     if not p.exists():
@@ -418,7 +421,7 @@ def enrich_file(
         # PPTX 按幻灯片、XLSX 按工作表各自成节；CSV/HTML 为单节。
         from .document_loader import load_document
 
-        docs = load_document(p, clean=True, ocr_cfg=ocr_cfg)
+        docs = load_document(p, clean=True, ocr_cfg=ocr_cfg, xiaomi_cfg=xiaomi_cfg)
         if ext == ".txt":
             plain = "\n".join(d.content for d in docs)
             sections = _split_chinese_numbered_sections(plain, fallback_title)
@@ -516,6 +519,8 @@ def enrich_directory(
     root: str | Path,
     default_acl: str = "*",
     recursive: bool = True,
+    ocr_cfg: Optional[Dict] = None,
+    xiaomi_cfg: Optional[Dict] = None,
 ) -> List[Document]:
     """批量增强目录下所有受支持文档。"""
     from .utils import iter_doc_files
@@ -523,6 +528,13 @@ def enrich_directory(
     root_p = Path(root)
     all_docs: List[Document] = []
     for f in iter_doc_files(root_p, recursive=recursive):
-        all_docs.extend(enrich_file(f, default_acl=default_acl))
+        all_docs.extend(
+            enrich_file(
+                f,
+                default_acl=default_acl,
+                ocr_cfg=ocr_cfg,
+                xiaomi_cfg=xiaomi_cfg,
+            )
+        )
     logger.info("目录 %s 元数据增强完成，共 %d 个小节", root_p, len(all_docs))
     return all_docs

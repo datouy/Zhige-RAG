@@ -360,8 +360,12 @@ def page_upload(cfg: dict, embed: EmbeddingModel, store: ChromaStore):
             for i, p in enumerate(saved_paths, 1):
                 progress.progress(i / (len(saved_paths) + 1), text=f"解析 {p.name}…")
                 ocr_cfg = cfg.get("document_loader", {}).get("ocr") or {}
+                xiaomi_cfg = cfg.get("document_loader", {}).get("xiaomi") or {}
                 docs = enrich_file(
-                    p, default_acl=dq_cfg.get("default_acl", "*"), ocr_cfg=ocr_cfg
+                    p,
+                    default_acl=dq_cfg.get("default_acl", "*"),
+                    ocr_cfg=ocr_cfg,
+                    xiaomi_cfg=xiaomi_cfg,
                 )
                 if not docs:
                     docs = load_document(
@@ -369,6 +373,7 @@ def page_upload(cfg: dict, embed: EmbeddingModel, store: ChromaStore):
                         pdf_engine=cfg["document_loader"].get("pdf_engine", "pdfplumber"),
                         encoding=cfg["document_loader"].get("encoding", "utf-8"),
                         ocr_cfg=ocr_cfg,
+                        xiaomi_cfg=xiaomi_cfg,
                     )
                 chunks, _report = run_data_pipeline(docs, cfg, splitter)
                 store.delete_by_metadata({"source": p.name})
@@ -393,7 +398,13 @@ def page_upload(cfg: dict, embed: EmbeddingModel, store: ChromaStore):
     st.code(str(raw_dir))
     if st.button("📥 将 data/raw 全部入库"):
         splitter = get_splitter(cfg)
-        docs = enrich_directory(raw_dir, default_acl=(cfg.get("data_quality", {}) or {}).get("default_acl", "*"))
+        _dl_cfg = cfg.get("document_loader", {}) or {}
+        docs = enrich_directory(
+            raw_dir,
+            default_acl=(cfg.get("data_quality", {}) or {}).get("default_acl", "*"),
+            ocr_cfg=_dl_cfg.get("ocr") or {},
+            xiaomi_cfg=_dl_cfg.get("xiaomi") or {},
+        )
         chunks = []
         sources = set()
         for d in docs:

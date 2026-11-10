@@ -37,8 +37,11 @@
 """
 from __future__ import annotations
 
+import os
+import time
 from typing import Any, Dict, Generator, List, Optional
 
+from src.circuit_breaker import get_circuit_breaker
 from src.http_client import (
     RemoteServiceError,
     build_headers,
@@ -47,6 +50,7 @@ from src.http_client import (
     post_sse,
 )
 from src.llm import DEFAULT_MAX_RETRIES, DEFAULT_TIMEOUT, GenerationConfig, LocalLLM
+from src.monitoring.metrics import metrics_collector
 from src.utils import get_logger
 
 logger = get_logger("llm_provider")
@@ -156,14 +160,31 @@ class OpenAICompatLLM:
     def _chat_once(
         self, messages: List[Dict[str, str]], gen: GenerationConfig, timeout: Optional[float]
     ) -> str:
-        data = post_json(
-            self._endpoint,
-            self._build_payload(messages, gen, stream=False),
-            headers=build_headers(self.api_key),
-            timeout=timeout or self.timeout,
-            label=self.provider_label,
-            model=self.model_name,
+        # 熔断保护：连续失败超过阈值后快速失败，避免对已宕机的模型服务反复空等。
+        breaker = get_circuit_breaker(
+            "llm",
+            failure_threshold=int(os.getenv("CB_LLM_FAILURE_THRESHOLD", "5") or 5),
+            timeout=float(os.getenv("CB_LLM_TIMEOUT", "60") or 60),
         )
+        start = time.perf_counter()
+        try:
+            data = breaker.call(
+                post_json,
+                self._endpoint,
+                self._build_payload(messages, gen, stream=False),
+                headers=build_headers(self.api_key),
+                timeout=timeout or self.timeout,
+                label=self.provider_label,
+                model=self.model_name,
+            )
+            metrics_collector.record_llm_request(
+                "success", self.model_name, time.perf_counter() - start
+            )
+        except Exception:  # noqa: BLE001 - 记录失败并原样抛出，由上层兜底
+            metrics_collector.record_llm_request(
+                "error", self.model_name, time.perf_counter() - start
+            )
+            raise
         return self._parse_content(data)
 
     @staticmethod

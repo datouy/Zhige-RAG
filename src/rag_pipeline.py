@@ -683,16 +683,20 @@ class RAGPipeline:
                 self._apply_query_instruction(variants[0]), fetch_k, security_where
             )
         else:
+            # P0 并发：多路召回各自编码+检索，串行 for 会累加每路 embedding
+            # encode 与 Chroma 查询延迟。ONNX InferenceSession 与 tokenizers
+            # 的 Tokenizer 均线程安全，缓存由 _retrieval_cache_lock 串行保护。
+            from concurrent.futures import ThreadPoolExecutor
+
+            queries = [self._apply_query_instruction(v) for v in variants]
             ranked_lists: List[List[Hit]] = []
-            for v in variants:
-                try:
-                    ranked_lists.append(
-                        self._cached_vector_query(
-                            self._apply_query_instruction(v), fetch_k, security_where
-                        )
-                    )
-                except Exception:
-                    continue
+            with ThreadPoolExecutor(max_workers=max(1, min(len(queries), 4))) as pool:
+                for result in pool.map(
+                    lambda q: self._cached_vector_query(q, fetch_k, security_where),
+                    queries,
+                ):
+                    if result:
+                        ranked_lists.append(result)
             hits = self._rrf_fuse_variants(ranked_lists, fetch_k) if ranked_lists else []
         # 旧索引兼容：doc_status 过滤导致全空时回退一次（仅状态过滤，ACL 不回退）
         if (
@@ -1876,9 +1880,25 @@ class RAGPipeline:
                 buf += notice
                 for piece in notice:
                     yield piece
-            finally:
-                # 收尾时构造完整 result
-                pass
+            # 收尾：与非流式路径一致地构造完整 RAGResult（verification / cites /
+            # timings），通过 generator 的 return 协议交给调用方。
+            answer_text = buf.strip()
+            verification = self._verify(answer_text, context_chunks)
+            cites = self._visible_citations(
+                answer_text,
+                self._format_citations(context_chunks),
+                verification,
+            )
+            result = RAGResult(answer=answer_text, sources=cites, raw_hits=hits)
+            result.verification = verification
+            result.timings["llm_total_ms"] = round(
+                (time.perf_counter() - llm_start) * 1000.0, 2
+            )
+            result.timings["ttft_ms"] = round(ttft_ms, 2) if ttft_ms is not None else None
+            result.timings["tokens_generated"] = None
+            result.timings["tokens_per_sec"] = None
+            result.timings["retries"] = retries_used
+            return result
 
         return _stream()  # UI 中只需迭代字符串片段即可
 

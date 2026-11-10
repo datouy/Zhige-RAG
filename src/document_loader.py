@@ -215,19 +215,150 @@ def _augment_pdf_with_ocr(path: Path, docs: List[Document], ocr_cfg: Dict) -> Li
     return docs
 
 
+# ----------------------------------------------------------------------
+#  Xiaomi-OCR-0 / Any2Markdown 高质量版面解析（可选）
+# ----------------------------------------------------------------------
+def _load_pdf_via_xiaomi(path: Path, cfg: Dict) -> List[Document]:
+    """用本地 Any2Markdown（默认 Xiaomi-OCR-0）把 PDF 解析成 Markdown，再转 Document。
+
+    相比 pdfplumber/pypdf 的纯文本提取，这条路径能还原表格、公式与阅读顺序，
+    是扫描件 / 复杂版面 PDF 的高质量兜底。
+
+    设计：服务不可用 / 返回空时抛异常或返回空列表，由 ``_load_pdf`` 决定是否
+    回落到传统引擎。本函数不引入 requests 等重依赖，全部标准库 + 现有 http_client。
+    """
+    import json as _json
+    import time as _time
+    import urllib.error
+    import urllib.request
+
+    from .http_client import (
+        RemoteServiceError,
+        describe_http_error,
+        describe_url_error,
+        opener_for,
+    )
+
+    base_url = str(cfg.get("base_url") or "http://127.0.0.1:8088").rstrip("/")
+    parse_mode = str(cfg.get("parse_mode") or "ocr")
+    model = str(cfg.get("model") or "xiaomi-ocr-0")
+    timeout = float(cfg.get("timeout", 300.0) or 300.0)
+
+    url = f"{base_url}/convert/file"
+    fields: Dict[str, str] = {"parse_mode": parse_mode}
+    if model:
+        fields["model"] = model
+
+    # 用标准库构造 multipart/form-data（项目远程调用统一不依赖 requests）
+    boundary = "----zhige_xiaomi_%x" % (int(_time.time() * 1000) & 0xFFFFFFFF)
+    payload = path.read_bytes()
+    parts: List[bytes] = []
+    for key, value in fields.items():
+        parts.append(
+            (
+                f"--{boundary}\r\n"
+                f'Content-Disposition: form-data; name="{key}"\r\n\r\n'
+                f"{value}\r\n"
+            ).encode("utf-8")
+        )
+    parts.append(
+        (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="file"; filename="{path.name}"\r\n'
+            f"Content-Type: application/octet-stream\r\n\r\n"
+        ).encode("utf-8")
+    )
+    parts.append(payload)
+    parts.append(f"\r\n--{boundary}--\r\n".encode("utf-8"))
+    body = b"".join(parts)
+
+    request = urllib.request.Request(
+        url,
+        data=body,
+        headers={
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "Content-Length": str(len(body)),
+        },
+        method="POST",
+    )
+    try:
+        with opener_for(url).open(request, timeout=timeout) as response:
+            raw = response.read().decode("utf-8", errors="ignore")
+    except urllib.error.HTTPError as exc:
+        raise RemoteServiceError(
+            describe_http_error(exc, label="Xiaomi 解析", url=url, model=model)
+        ) from exc
+    except urllib.error.URLError as exc:
+        raise RemoteServiceError(
+            describe_url_error(exc, label="Xiaomi 解析", base_url=url, model=model)
+        ) from exc
+
+    # Any2Markdown 可能返回 JSON（含 markdown 字段）或纯 Markdown 文本，兼容两种
+    markdown = ""
+    try:
+        decoded = _json.loads(raw)
+        if isinstance(decoded, dict):
+            markdown = str(decoded.get("markdown") or decoded.get("content") or "")
+        else:
+            markdown = raw
+    except _json.JSONDecodeError:
+        markdown = raw
+
+    markdown = clean_text(markdown) if markdown else ""
+    if not markdown:
+        return []
+
+    total = _pdf_page_count(path, [])
+    # 整份 Markdown 作为一个 Document（page=1）；标题层级交给 text_splitter 恢复。
+    # 需要页码级溯源时走原 pdfplumber 路径，或用 Any2Markdown 的 /convert/file/stream。
+    return [
+        Document(
+            page=1,
+            content=markdown,
+            metadata={
+                "source": str(path.name),
+                "filepath": str(path),
+                "ext": path.suffix.lower(),
+                "page_count": total,
+                "xiaomi_engine": True,
+                "xiaomi_model": model,
+                "parse_mode": parse_mode,
+            },
+        )
+    ]
+
+
 def _load_pdf(
-    path: Path, engine: str = "pdfplumber", ocr_cfg: Optional[Dict] = None
+    path: Path,
+    engine: str = "pdfplumber",
+    ocr_cfg: Optional[Dict] = None,
+    xiaomi_cfg: Optional[Dict] = None,
 ) -> List[Document]:
-    """解析 PDF，每页一个 Document。
+    """解析 PDF，每页一个 Document（xiaomi 路径例外：整份一个 Document）。
 
-    三层保障：
+    优先级：
 
+    0. 可选 ``xiaomi`` 高质量版面解析（Any2Markdown / Xiaomi-OCR-0）；
     1. 主引擎 ``pdfplumber``（对中文更友好）；
     2. 主引擎无输出时，自动换备用引擎 ``pypdf`` 重试；
     3. 仍有「文本过少」的页 → OCR 兜底（需安装 ``requirements-ocr.txt``）。
 
-    第 3 层让扫描件、以及"正文可提取 + 附件页是扫描图"的混合型 PDF 都能入库。
+    第 3 层让扫描件、以及"正文可提取 + 附件页是扫描图"的混合型 PDF 都能入库；
+    第 0 层是更强的兜底：一次调用直接产出带表格/公式/阅读顺序的 Markdown。
     """
+    # 0. Xiaomi-OCR-0 / Any2Markdown（服务不可用时回退，不中断入库）
+    if xiaomi_cfg and xiaomi_cfg.get("enabled"):
+        try:
+            xdocs = _load_pdf_via_xiaomi(path, xiaomi_cfg)
+        except Exception as exc:  # noqa: BLE001 - 远程服务异常必须回退
+            logger.warning("Xiaomi 解析失败，回退传统引擎（%s）: %s", type(exc).__name__, exc)
+            xdocs = []
+        if xdocs:
+            return xdocs
+        if not xiaomi_cfg.get("fallback_on_error", True):
+            logger.warning("Xiaomi 解析无产出且已关闭回退：%s", path.name)
+            return []
+
     docs = _load_pdf_with_engine(path, engine)
     if not docs:
         other = "pypdf" if engine == "pdfplumber" else "pdfplumber"
@@ -335,10 +466,15 @@ def _iter_docx_blocks_ordered(path: Path) -> List[tuple]:
             blocks.append((level, text))
         elif tag.endswith("}tbl"):
             tbl = Table(child, d)
-            for row in tbl.rows:
-                row_text = " | ".join((cell.text or "").strip() for cell in row.cells)
-                if row_text.strip(" |"):
-                    blocks.append((None, row_text))
+            rows = [
+                [re.sub(r"\s+", " ", (cell.text or "").strip()) for cell in row.cells]
+                for row in tbl.rows
+            ]
+            # 表格转标准 Markdown 表（| a | b |），检索/生成侧能识别列结构；
+            # 不再用 " | " 拼成一行让列结构丢失（XLSX/CSV 已是此处理，DOCX 补齐）。
+            md_table = _rows_to_markdown_table(rows)
+            if md_table:
+                blocks.append((None, md_table))
     return blocks
 
 
@@ -674,6 +810,7 @@ def load_document(
     encoding: str = "auto",
     clean: bool = True,
     ocr_cfg: Optional[Dict] = None,
+    xiaomi_cfg: Optional[Dict] = None,
 ) -> List[Document]:
     """根据文件扩展名分发到对应解析器。
 
@@ -683,6 +820,8 @@ def load_document(
         encoding: TXT 编码，``auto`` 时按 utf-8-sig → gb18030 → big5 自动探测。
         clean: 是否清洗文本。
         ocr_cfg: 扫描件 OCR 配置（对应 ``config.document_loader.ocr``）。缺省则不启用 OCR。
+        xiaomi_cfg: Xiaomi-OCR-0 / Any2Markdown 高质量版面解析配置
+            （对应 ``config.document_loader.xiaomi``）。缺省则不启用，仅 PDF 生效。
 
     Returns:
         Document 列表（解析失败时返回空列表）。
@@ -694,7 +833,7 @@ def load_document(
 
     ext = path.suffix.lower()
     if ext == ".pdf":
-        docs = _load_pdf(path, engine=pdf_engine, ocr_cfg=ocr_cfg)
+        docs = _load_pdf(path, engine=pdf_engine, ocr_cfg=ocr_cfg, xiaomi_cfg=xiaomi_cfg)
     elif ext == ".docx":
         docs = _load_docx(path)
     elif ext in (".md", ".markdown"):
@@ -726,6 +865,7 @@ def load_directory(
     recursive: bool = True,
     encoding: str = "utf-8",
     ocr_cfg: Optional[Dict] = None,
+    xiaomi_cfg: Optional[Dict] = None,
 ) -> List[Document]:
     """批量解析目录下所有受支持文档。"""
     from .utils import iter_doc_files
@@ -734,7 +874,13 @@ def load_directory(
     all_docs: List[Document] = []
     for f in iter_doc_files(root, recursive=recursive):
         all_docs.extend(
-            load_document(f, pdf_engine=pdf_engine, encoding=encoding, ocr_cfg=ocr_cfg)
+            load_document(
+                f,
+                pdf_engine=pdf_engine,
+                encoding=encoding,
+                ocr_cfg=ocr_cfg,
+                xiaomi_cfg=xiaomi_cfg,
+            )
         )
     logger.info("目录 %s 共解析 %d 个 Document", root, len(all_docs))
     return all_docs

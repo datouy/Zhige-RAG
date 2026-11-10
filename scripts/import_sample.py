@@ -45,7 +45,13 @@ def main() -> int:
 
     cfg = apply_env_overrides(load_config(str(ROOT / "config" / "config.yaml")))
     splitter = get_splitter(cfg)
-    docs = enrich_file(target, default_acl=(cfg.get("data_quality", {}) or {}).get("default_acl", "*"))
+    _dl_cfg = cfg.get("document_loader", {}) or {}
+    docs = enrich_file(
+        target,
+        default_acl=(cfg.get("data_quality", {}) or {}).get("default_acl", "*"),
+        ocr_cfg=_dl_cfg.get("ocr") or {},
+        xiaomi_cfg=_dl_cfg.get("xiaomi") or {},
+    )
     chunks, report = run_data_pipeline(docs, cfg, splitter)
     print("解析得到", len(docs), "节、", len(chunks), "块")
 

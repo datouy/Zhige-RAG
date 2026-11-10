@@ -536,6 +536,29 @@ def check_doc_group(cfg: Dict[str, Any]) -> None:
         add(INFO, f"已配置支持的文件类型：{' '.join(exts)}")
 
     ocr_cfg = (cfg.get("document_loader") or {}).get("ocr") or {}
+    xiaomi_cfg = (cfg.get("document_loader") or {}).get("xiaomi") or {}
+
+    # Xiaomi-OCR-0 / Any2Markdown 高质量版面解析（可选，默认关）
+    if not xiaomi_cfg.get("enabled"):
+        add(INFO, "Xiaomi-OCR-0 / Any2Markdown 版面解析未启用（默认走 pdfplumber+pypdf）")
+    else:
+        base_url = str(xiaomi_cfg.get("base_url") or "http://127.0.0.1:8088").rstrip("/")
+        status, _ = _probe(f"{base_url}/health", timeout=3.0)
+        if status == 200:
+            add(OK, f"Xiaomi-OCR-0 / Any2Markdown 服务可达（{base_url}），PDF 走高质量版面解析")
+        elif status is None:
+            add(
+                WARN,
+                f"Xiaomi 解析已启用，但无法连接服务 {base_url}，将回退传统引擎",
+                "确认已启动 Any2Markdown：any2md-server（部署见 config.document_loader.xiaomi 注释）",
+            )
+        else:
+            add(
+                WARN,
+                f"Xiaomi 解析已启用，但服务 {base_url} 返回 HTTP {status}，将回退传统引擎",
+                "确认 Any2Markdown 服务正常（GET /health 应返回 200）",
+            )
+
     if not ocr_cfg.get("enabled", True):
         add(INFO, "扫描件 OCR 已在配置中关闭")
         return

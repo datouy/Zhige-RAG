@@ -69,13 +69,23 @@ def ingest_path(
     from src.data_quality import run_data_pipeline
     from src.document_meta import enrich_directory, enrich_file
 
+    _dl_cfg = cfg.get("document_loader", {}) or {}
+    _ocr = _dl_cfg.get("ocr") or {}
+    _xiaomi = _dl_cfg.get("xiaomi") or {}
     if target.is_file():
-        docs = enrich_file(target, default_acl=cfg.get("data_quality", {}).get("default_acl", "*"))
+        docs = enrich_file(
+            target,
+            default_acl=cfg.get("data_quality", {}).get("default_acl", "*"),
+            ocr_cfg=_ocr,
+            xiaomi_cfg=_xiaomi,
+        )
     elif target.is_dir():
         docs = enrich_directory(
             target,
             default_acl=cfg.get("data_quality", {}).get("default_acl", "*"),
             recursive=True,
+            ocr_cfg=_ocr,
+            xiaomi_cfg=_xiaomi,
         )
     else:
         logger.warning("路径不存在: %s", target)
