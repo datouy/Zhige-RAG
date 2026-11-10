@@ -36,6 +36,10 @@ document_loader:
     - .md
     - .markdown
     - .txt
+    - .pptx
+    - .xlsx
+    - .csv
+    - .html
   pdf_engine: "pdfplumber"
   encoding: "auto"
   clean_text: true
@@ -522,6 +526,10 @@ ui:
   allowed_upload_types:
     - pdf
     - docx
+    - pptx
+    - xlsx
+    - csv
+    - html
     - md
     - txt
 

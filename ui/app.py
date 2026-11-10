@@ -329,11 +329,11 @@ def page_chat(pipeline: RAGPipeline, cfg: dict):
 def page_upload(cfg: dict, embed: EmbeddingModel, store: ChromaStore):
     st.header("📤 文档上传与入库")
     _max_mb = (cfg.get("ui", {}) or {}).get("max_upload_mb", 200)
-    st.caption(f"支持 PDF、DOCX、Markdown、TXT；单个文件不超过 {_max_mb}MB")
+    st.caption(f"支持 PDF、DOCX、PPTX、XLSX、CSV、HTML、Markdown、TXT；单个文件不超过 {_max_mb}MB")
 
     uploaded = st.file_uploader(
         "选择文件",
-        type=["pdf", "docx", "md", "markdown", "txt"],
+        type=["pdf", "docx", "pptx", "xlsx", "csv", "html", "md", "markdown", "txt"],
         accept_multiple_files=True,
     )
     if uploaded:

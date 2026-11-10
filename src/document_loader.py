@@ -3,11 +3,18 @@
 支持的格式：
 - PDF  ：使用 pdfplumber（对中文更友好）或 pypdf 作为后备
 - DOCX ：使用 python-docx
+- PPTX ：使用 python-pptx（幻灯片逐页提取，表格转 Markdown 表）
+- XLSX/XLS ：使用 openpyxl（工作表逐表提取，表格转 Markdown 表）
+- CSV  ：标准库 csv（表格转 Markdown 表，自动探测编码/分隔符）
+- HTML ：使用 beautifulsoup4（剥离导航/页脚噪音，保留标题层级）
 - MD   ：使用 markdown 库转 HTML，再剥离标签保留纯文本
 - TXT  ：直接按行读取，按段落合并
 
+表格统一转 Markdown 表（`| a | b |`），让检索/生成侧看到结构；
+HTML 转纯文本时保留 `#` 标题标记，供后续标题切分恢复层级。
+
 统一返回 ``Document`` 列表，每份 ``Document`` 包含：
-    page      : int            页码（txt/md 时为 1）
+    page      : int            页码（txt/md 时为 1；pptx=幻灯片号；xlsx=工作表序号）
     content   : str            正文内容
     metadata  : dict           源文件、文件名、扩展名等
 """
@@ -429,6 +436,189 @@ load_markdown = _load_markdown
 
 
 # ----------------------------------------------------------------------
+#  表格 → Markdown（PPTX / XLSX / CSV 共用）
+# ----------------------------------------------------------------------
+def _rows_to_markdown_table(rows: List[List[str]], max_rows: int = 100,
+                             max_cols: int = 20) -> str:
+    """二维行转 Markdown 表，超限截断并标注。"""
+    rows = [[(c or "").strip() for c in r[:max_cols]] for r in rows[:max_rows]]
+    rows = [r for r in rows if any(c for c in r)]
+    if not rows:
+        return ""
+    width = max(len(r) for r in rows)
+    normed = [r + [""] * (width - len(r)) for r in rows]
+    lines = ["| " + " | ".join(normed[0]) + " |",
+             "| " + " | ".join(["---"] * width) + " |"]
+    for r in normed[1:]:
+        lines.append("| " + " | ".join(r) + " |")
+    return "\n".join(lines)
+
+
+# ----------------------------------------------------------------------
+#  PPTX
+# ----------------------------------------------------------------------
+def _load_pptx(path: Path) -> List[Document]:
+    """逐幻灯片提取：文本框按阅读顺序 + 表格转 Markdown 表。"""
+    docs: List[Document] = []
+    try:
+        from pptx import Presentation  # type: ignore
+    except ImportError:
+        logger.warning("未安装 python-pptx，跳过 %s（pip install python-pptx）", path.name)
+        return []
+    try:
+        prs = Presentation(str(path))
+        for i, slide in enumerate(prs.slides, start=1):
+            parts: List[str] = []
+            for shape in slide.shapes:
+                try:
+                    if shape.has_table:
+                        rows = [[cell.text or "" for cell in row.cells]
+                                for row in shape.table.rows]
+                        tbl = _rows_to_markdown_table(rows)
+                        if tbl:
+                            parts.append(tbl)
+                    elif shape.has_text_frame:
+                        t = (shape.text or "").strip()
+                        if t:
+                            parts.append(t)
+                except Exception:
+                    continue
+            text = clean_text("\n\n".join(parts))
+            if text:
+                docs.append(Document(page=i, content=text, metadata={
+                    "source": str(path.name), "filepath": str(path),
+                    "ext": path.suffix.lower(), "slide": i,
+                    "slide_count": len(prs.slides)}))
+    except Exception as exc:
+        logger.error("解析 PPTX 失败 %s: %s", path, exc)
+    return docs
+
+
+# ----------------------------------------------------------------------
+#  XLSX / XLS
+# ----------------------------------------------------------------------
+def _load_excel(path: Path) -> List[Document]:
+    """逐工作表提取为 Markdown 表，每表一个 Document（page=表序号）。"""
+    docs: List[Document] = []
+    try:
+        import openpyxl  # type: ignore
+    except ImportError:
+        logger.warning("未安装 openpyxl，跳过 %s（pip install openpyxl）", path.name)
+        return []
+    try:
+        wb = openpyxl.load_workbook(str(path), read_only=True, data_only=True)
+        for i, ws in enumerate(wb.worksheets, start=1):
+            rows: List[List[str]] = []
+            for row in ws.iter_rows(values_only=True):
+                vals = [(str(v).strip() if v is not None else "") for v in row]
+                if any(vals):
+                    rows.append(vals)
+                if len(rows) >= 500:
+                    break
+            if not rows:
+                continue
+            tbl = _rows_to_markdown_table(rows, max_rows=500)
+            title = str(ws.title or f"Sheet{i}")
+            text = clean_text(f"# {title}\n\n{tbl}" if tbl else f"# {title}")
+            if text.strip("# \n"):
+                docs.append(Document(page=i, content=text, metadata={
+                    "source": str(path.name), "filepath": str(path),
+                    "ext": path.suffix.lower(), "sheet": title,
+                    "sheet_index": i, "title": title}))
+        try:
+            wb.close()
+        except Exception:
+            pass
+    except Exception as exc:
+        logger.error("解析 Excel 失败 %s: %s", path, exc)
+    return docs
+
+
+# ----------------------------------------------------------------------
+#  CSV
+# ----------------------------------------------------------------------
+def _load_csv(path: Path, encoding: str = "auto") -> List[Document]:
+    """CSV 转 Markdown 表（自动探测编码与分隔符）。"""
+    docs: List[Document] = []
+    try:
+        import csv as _csv
+        import io
+        data = path.read_bytes()
+        if encoding and encoding.lower() != "auto":
+            text = data.decode(encoding, errors="replace")
+            used_enc = encoding
+        else:
+            text, used_enc = _decode_text_bytes(data)
+        sample = text[:4096]
+        try:
+            dialect = _csv.Sniffer().sniff(sample, delimiters=[",", ";", "\t", "|"])
+            delim = dialect.delimiter
+        except Exception:
+            delim = ","
+        reader = _csv.reader(io.StringIO(text), delimiter=delim)
+        rows = [[(c or "").strip() for c in r] for r in reader]
+        rows = [r for r in rows if any(r)][:2000]
+        if not rows:
+            return []
+        tbl = _rows_to_markdown_table(rows, max_rows=2000)
+        if tbl:
+            docs.append(Document(page=1, content=clean_text(tbl), metadata={
+                "source": str(path.name), "filepath": str(path),
+                "ext": path.suffix.lower(), "encoding": used_enc,
+                "delimiter": delim, "rows": len(rows)}))
+    except Exception as exc:
+        logger.error("解析 CSV 失败 %s: %s", path, exc)
+    return docs
+
+
+# ----------------------------------------------------------------------
+#  HTML（本地 .html 文件）
+# ----------------------------------------------------------------------
+def _load_html(path: Path, encoding: str = "auto") -> List[Document]:
+    """本地 HTML 转纯文本：剥离 nav/footer/script，标题转 # 标记。"""
+    docs: List[Document] = []
+    try:
+        data = path.read_bytes()
+        if encoding and encoding.lower() != "auto":
+            text = data.decode(encoding, errors="replace")
+        else:
+            text, _ = _decode_text_bytes(data)
+    except OSError as exc:
+        logger.error("读取 HTML 失败 %s: %s", path, exc)
+        return []
+    try:
+        from bs4 import BeautifulSoup  # type: ignore
+        soup = BeautifulSoup(text, "lxml")
+        for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
+            tag.decompose()
+        lines: List[str] = []
+        title = ""
+        if soup.title and soup.title.string:
+            title = soup.title.string.strip()
+        for el in soup.find_all(["h1", "h2", "h3", "h4", "p", "li", "td", "th", "pre"]):
+            t = el.get_text(" ", strip=True)
+            if not t:
+                continue
+            if el.name.startswith("h"):
+                level = int(el.name[1])
+                lines.append("#" * level + " " + t)
+            else:
+                lines.append(t)
+        body = soup.body
+        plain = clean_text("\n".join(lines) or (body.get_text("\n", strip=True) if body else ""))
+        if plain:
+            docs.append(Document(page=1, content=plain, metadata={
+                "source": str(path.name), "filepath": str(path),
+                "ext": path.suffix.lower(),
+                "title": title or path.stem}))
+    except ImportError:
+        logger.warning("未安装 beautifulsoup4，跳过 %s", path.name)
+    except Exception as exc:
+        logger.error("解析 HTML 失败 %s: %s", path, exc)
+    return docs
+
+
+# ----------------------------------------------------------------------
 #  TXT
 # ----------------------------------------------------------------------
 # 编码探测链：中文场景最常见的乱码来源是 GBK/GB2312 文件被硬按 UTF-8 读。
@@ -511,6 +701,14 @@ def load_document(
         docs = _load_markdown(path)
     elif ext == ".txt":
         docs = _load_txt(path, encoding=encoding)
+    elif ext in (".pptx", ".ppt"):
+        docs = _load_pptx(path)
+    elif ext in (".xlsx", ".xls"):
+        docs = _load_excel(path)
+    elif ext == ".csv":
+        docs = _load_csv(path, encoding=encoding)
+    elif ext in (".html", ".htm", ".xhtml"):
+        docs = _load_html(path, encoding=encoding)
     else:
         logger.warning("不支持的扩展名 %s，已跳过: %s", ext, path)
         return []

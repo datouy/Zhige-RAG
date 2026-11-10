@@ -197,7 +197,8 @@ class PathsConfig(_StrictModel):
 class DocumentLoaderConfig(_StrictModel):
     """文档加载器配置。"""
     supported_extensions: List[str] = Field(
-        default_factory=lambda: [".pdf", ".docx", ".md", ".markdown", ".txt"],
+        default_factory=lambda: [".pdf", ".docx", ".md", ".markdown", ".txt",
+                                 ".pptx", ".xlsx", ".csv", ".html"],
         description="支持的文档扩展名",
     )
     pdf_engine: str = Field("pdfplumber", description="PDF 引擎")

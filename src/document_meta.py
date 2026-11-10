@@ -412,15 +412,29 @@ def enrich_file(
             return []
         body = ""
     else:
-        # PDF / TXT：复用既有解析器（PDF 已按页切分）。PDF 若带书签大纲，
+        # PDF / TXT / Office / HTML：复用既有解析器。PDF 若带书签大纲，
         # 按大纲恢复每页的章节层级（与 MD/DOCX 的 heading_path 对齐）；
         # 无书签则退化为按页平铺、无章节路径。
+        # PPTX 按幻灯片、XLSX 按工作表各自成节；CSV/HTML 为单节。
         from .document_loader import load_document
 
         docs = load_document(p, clean=True, ocr_cfg=ocr_cfg)
         if ext == ".txt":
             plain = "\n".join(d.content for d in docs)
             sections = _split_chinese_numbered_sections(plain, fallback_title)
+        elif ext in (".pptx", ".ppt", ".xlsx", ".xls", ".csv", ".html", ".htm", ".xhtml"):
+            sections = []
+            for d in docs:
+                md = d.metadata or {}
+                hpath = [str(md.get("sheet") or md.get("title") or fallback_title)] \
+                    if ext in (".xlsx", ".xls") and md.get("sheet") else []
+                sec_title = (md.get("sheet") or md.get("title")
+                             or f"幻灯片 {d.page}" if ext in (".pptx", ".ppt")
+                             else fallback_title)
+                sections.append((hpath, str(sec_title), d.content))
+            if not sections and docs:
+                sections = [([], fallback_title,
+                             "\n".join(d.content for d in docs))]
         else:
             outline = _pdf_outline_paths(p) if ext == ".pdf" else {}
             sections = []

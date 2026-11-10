@@ -5,11 +5,14 @@
 # ============================================================
 
 # ---------- 文档解析 ----------
-# 不装：只能处理 .txt / .md，无法上传 PDF / Word。
-# 模块名与 pip 名不一致：python-docx -> docx，beautifulsoup4 -> bs4
+# 不装：只能处理 .txt / .md，无法上传 PDF / Word / Office / 表格。
+# 模块名与 pip 名不一致：python-docx -> docx, python-pptx -> pptx,
+# beautifulsoup4 -> bs4, openpyxl -> openpyxl
 pdfplumber>=0.10.0,<0.11.8   # 0.11.8+ requires Pillow 12; keep Streamlit-compatible
 pypdf>=4.0.0
 python-docx>=1.1.0
+python-pptx>=0.6.21
+openpyxl>=3.1.0
 markdown>=3.6
 beautifulsoup4>=4.12.0
 lxml>=4.9.0
