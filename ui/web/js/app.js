@@ -126,6 +126,8 @@ class ChatApp {
             'settings-modal', 'settings-btn', 'settings-result', 'settings-save', 'settings-reset',
             'llm-backend', 'llm-remote', 'llm-base-url', 'llm-model', 'llm-api-key', 'llm-test',
             'emb-backend', 'emb-remote', 'emb-base-url', 'emb-model', 'emb-api-key', 'emb-test',
+            // 文档管理
+            'docs-modal', 'docs-content', 'docs-kb-name', 'docs-refresh', 'docs-back', 'docs-btn',
         ];
         ids.forEach((id) => { this.el[id] = document.getElementById(id); });
     }
@@ -164,6 +166,11 @@ class ChatApp {
         });
         this.el['settings-save']?.addEventListener('click', () => this.saveSettings());
         this.el['settings-reset']?.addEventListener('click', () => this.resetSettings());
+
+        // ---- 文档管理 ----
+        this.el['docs-btn']?.addEventListener('click', () => this.openDocs());
+        this.el['docs-refresh']?.addEventListener('click', () => this.loadDocs());
+        this.el['docs-back']?.addEventListener('click', () => { this.el['docs-back'].hidden = true; this.loadDocs(); });
 
         // ---- 弹窗关闭（通用 modal 与设置弹窗共用）----
         document.addEventListener('click', (e) => {
@@ -760,6 +767,122 @@ class ChatApp {
         if (!el) return;
         el.textContent = text;
         el.className = 'settings-result' + (kind ? ` settings-${kind}` : '');
+    }
+
+    // ================= 文档管理（预览 / 分块编辑） =================
+
+    async openDocs() {
+        this.el['docs-modal'].classList.add('active');
+        this.el['docs-back'].hidden = true;
+        this.el['docs-kb-name'].textContent = this.currentKb
+            ? ('当前知识库：' + this.currentKb.name) : '全部知识库';
+        await this.loadDocs();
+    }
+
+    async loadDocs() {
+        const box = this.el['docs-content'];
+        box.innerHTML = '<p class="muted small">加载中…</p>';
+        try {
+            const data = await this.api('/documents');
+            this.renderDocs(data.documents || []);
+        } catch (e) {
+            box.innerHTML = '<p class="warn">加载失败：' + this.esc(e.message) + '</p>';
+        }
+    }
+
+    renderDocs(docs) {
+        const box = this.el['docs-content'];
+        if (!docs.length) {
+            box.innerHTML = '<p class="muted small">还没有文档。先「上传文档」或「导入网页」。</p>';
+            return;
+        }
+        // 列表接口返回全部知识库的文档，这里按当前知识库过滤
+        const kbId = this.currentKb ? this.currentKb.id : null;
+        const list = kbId ? docs.filter((d) => d.kb_id === kbId) : docs;
+        if (!list.length) {
+            box.innerHTML = '<p class="muted small">当前知识库还没有文档。</p>';
+            return;
+        }
+        box.innerHTML = '<ul class="docs-list">' + list.map((d) => {
+            const title = this.esc(d.title || d.source);
+            const src = this.esc(d.source);
+            const meta = d.chunks + ' 分块 · ' + this.esc(d.doc_status || 'active');
+            return '<li class="docs-item" data-source="' + src + '">'
+                + '<span class="item-main" title="' + src + '">📄 ' + title + '</span>'
+                + '<span class="item-meta">' + meta + '</span>'
+                + '</li>';
+        }).join('') + '</ul>';
+        box.querySelectorAll('.docs-item').forEach((li) => {
+            li.addEventListener('click', () => this.openDocChunks(li.dataset.source));
+        });
+    }
+
+    async openDocChunks(source) {
+        const box = this.el['docs-content'];
+        box.innerHTML = '<p class="muted small">加载分块…</p>';
+        const params = new URLSearchParams();
+        if (this.currentKb) params.set('kb_id', this.currentKb.id);
+        params.set('limit', '200');
+        const q = params.toString() ? ('?' + params.toString()) : '';
+        try {
+            const data = await this.api('/documents/' + encodeURIComponent(source) + '/chunks' + q);
+            this.renderChunks(source, data.chunks || []);
+            this.el['docs-back'].hidden = false;
+        } catch (e) {
+            box.innerHTML = '<p class="warn">加载分块失败：' + this.esc(e.message) + '</p>';
+        }
+    }
+
+    renderChunks(source, chunks) {
+        const box = this.el['docs-content'];
+        if (!chunks.length) {
+            box.innerHTML = '<p class="muted small">该文档没有分块。</p>';
+            return;
+        }
+        // 按 chunk_index 排序，保持原文顺序（Chroma 返回顺序不保证）
+        const sorted = chunks.slice().sort((a, b) => {
+            const ai = parseInt((a.metadata && a.metadata.chunk_index) ?? 0);
+            const bi = parseInt((b.metadata && b.metadata.chunk_index) ?? 0);
+            return ai - bi;
+        });
+        box.innerHTML = '<h4 class="docs-doc-title">📄 ' + this.esc(source) + '</h4>'
+            + sorted.map((c, i) => {
+                const head = this.esc((c.metadata && (c.metadata.chunk_prefix || c.metadata.breadcrumb)) || '—');
+                return '<div class="chunk-card" data-chunk="' + this.esc(c.id) + '">'
+                    + '<div class="chunk-head">'
+                    + '<span class="muted small">#' + (i + 1) + ' · ' + head + '</span>'
+                    + '<button class="btn btn-primary btn-sm chunk-save" type="button">保存</button>'
+                    + '</div>'
+                    + '<textarea class="chunk-text" rows="4">' + this.esc(c.text || '') + '</textarea>'
+                    + '</div>';
+            }).join('');
+        box.querySelectorAll('.chunk-card').forEach((card) => {
+            const id = card.dataset.chunk;
+            card.querySelector('.chunk-save').addEventListener('click', () => this.saveChunk(id, card));
+        });
+    }
+
+    async saveChunk(chunkId, card) {
+        const textarea = card.querySelector('.chunk-text');
+        const text = textarea.value.trim();
+        if (!text) { this.showAlert('分块内容不能为空', 'error'); return; }
+        const params = new URLSearchParams();
+        if (this.currentKb) params.set('kb_id', this.currentKb.id);
+        const q = params.toString() ? ('?' + params.toString()) : '';
+        const btn = card.querySelector('.chunk-save');
+        btn.disabled = true;
+        btn.textContent = '保存中…';
+        try {
+            await this.api('/documents/chunks/' + encodeURIComponent(chunkId) + q, {
+                method: 'PATCH', body: { text },
+            });
+            this.showAlert('分块已更新并重新向量化', 'success');
+        } catch (e) {
+            this.showAlert('保存失败：' + e.message, 'error');
+        } finally {
+            btn.disabled = false;
+            btn.textContent = '保存';
+        }
     }
 
     // ================= 弹窗 / 提示 =================

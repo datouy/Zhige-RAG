@@ -84,6 +84,7 @@
             <div class="sidebar-foot">
                 <button id="upload-btn" class="btn btn-secondary btn-block" type="button">上传文档</button>
                 <button id="url-btn" class="btn btn-secondary btn-block" type="button">导入网页</button>
+                <button id="docs-btn" class="btn btn-secondary btn-block" type="button">文档管理</button>
                 <button id="settings-btn" class="btn btn-secondary btn-block" type="button">模型设置</button>
                 <button id="guide-btn" class="btn btn-ghost btn-block" type="button">使用指南</button>
             </div>
@@ -116,7 +117,7 @@
 
     <!-- 隐藏的文件选择（上传到当前知识库） -->
     <input type="file" id="file-input" multiple hidden
-           accept=".pdf,.docx,.md,.markdown,.txt">
+           accept=".pdf,.docx,.pptx,.xlsx,.csv,.html,.md,.markdown,.txt">
 
     <!-- 通用弹窗 -->
     <div id="modal" class="modal">
@@ -126,6 +127,24 @@
                 <button class="modal-close" type="button">&times;</button>
             </div>
             <div id="modal-body" class="modal-body"></div>
+        </div>
+    </div>
+
+    <!-- 文档管理弹窗（预览 / 分块编辑） -->
+    <div id="docs-modal" class="modal">
+        <div class="modal-content modal-wide">
+            <div class="modal-header">
+                <h3>文档管理</h3>
+                <button class="modal-close" type="button">&times;</button>
+            </div>
+            <div class="modal-body docs-body">
+                <div class="docs-toolbar">
+                    <span id="docs-kb-name" class="muted small"></span>
+                    <button id="docs-refresh" class="btn btn-secondary btn-sm" type="button">刷新</button>
+                    <button id="docs-back" class="btn btn-ghost btn-sm" type="button" hidden>← 返回文档列表</button>
+                </div>
+                <div id="docs-content" class="docs-content"></div>
+            </div>
         </div>
     </div>
 

@@ -289,13 +289,19 @@ async def list_documents(
 async def get_document_chunks(
     doc_id: str,
     limit: int = 50,
+    kb_id: Optional[str] = None,
     current_user: User = Depends(get_current_user),
 ) -> Dict[str, Any]:
-    """获取指定文档的分块内容。需要认证。"""
+    """获取指定文档的分块内容。需要认证。
+
+    `doc_id` 为文档 source（文件名）。`kb_id` 指定知识库，缺省为默认库；
+    之前这里固定用默认库的 collection，导致非默认库的文档分块读不到。
+    """
     user: User = current_user
     try:
         cfg = get_runtime_config()
-        store = TenantAwareFactory.get_chroma_store(user.id, cfg)
+        kb = _resolve_kb(user, cfg, kb_id)
+        store = TenantAwareFactory.get_chroma_store_by_name(kb["collection_name"], cfg)
 
         def _fetch() -> Dict[str, Any]:
             return store.collection.get(
@@ -321,6 +327,51 @@ async def get_document_chunks(
         return {"doc_id": doc_id, "chunks": chunks, "total": len(chunks)}
     except Exception as exc:
         logger.error("获取分块失败: %s", exc)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+class ChunkUpdateBody(BaseModel):
+    """P1-1 分块编辑：更新分块文本并重嵌。"""
+
+    text: str = Field(..., min_length=1, description="新的分块文本")
+
+
+@router.patch("/api/v1/documents/chunks/{chunk_id}", tags=["文档"])
+async def update_document_chunk(
+    chunk_id: str,
+    body: ChunkUpdateBody,
+    kb_id: Optional[str] = None,
+    current_user: User = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """更新单个分块文本并重嵌向量 + 同步 BM25。需要认证。
+
+    `kb_id` 指定知识库，缺省为默认库；之前固定用默认库 collection，
+    非默认库的分块改不到。
+    """
+    user: User = current_user
+    try:
+        cfg = get_runtime_config()
+        kb = _resolve_kb(user, cfg, kb_id)
+        store = TenantAwareFactory.get_chroma_store_by_name(kb["collection_name"], cfg)
+
+        def _patch() -> Dict[str, Any]:
+            got = store.collection.get(ids=[chunk_id], include=["documents", "metadatas", "embeddings"])
+            ids = got.get("ids") or []
+            if not ids:
+                raise HTTPException(status_code=404, detail=f"分块不存在: {chunk_id}")
+            meta = (got.get("metadatas") or [{}])[0] or {}
+            new_text = body.text.strip()
+            vec = store.embedding_model.encode([new_text], batch_size=1).tolist()[0]
+            store.collection.upsert(ids=[chunk_id], documents=[new_text], embeddings=[vec], metadatas=[meta])
+            if store._bm25 is not None:
+                store._bm25.upsert_documents([chunk_id], [new_text], [meta])
+            return {"id": chunk_id, "text": new_text, "metadata": meta}
+
+        return await run_in_threadpool(_patch)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("更新分块失败: %s", exc)
         raise HTTPException(status_code=500, detail=str(exc))
 
 
