@@ -129,6 +129,47 @@ def keyword_coverage(prediction: str, keywords: Sequence[str]) -> float:
     return hit / len(keywords)
 
 
+def _char_bigrams(text: str) -> Dict[str, int]:
+    """字符 bigram 词袋（无外部依赖的语义相似度代理，RAGAS answer_similarity 轻量版）。"""
+    from collections import Counter as _C
+
+    t = (text or "").strip()
+    if len(t) < 2:
+        return {t: 1} if t else {}
+    return dict(_C(t[i:i + 2] for i in range(len(t) - 1)))
+
+
+def semantic_similarity(a: str, b: str) -> Optional[float]:
+    """RAGAS 风格 answer_similarity 轻量版：bigram 余弦 0~1；任一为空返回 None。"""
+    if not (a or "").strip() or not (b or "").strip():
+        return None
+    ca, cb = _char_bigrams(a), _char_bigrams(b)
+    dot = sum(v * cb.get(k, 0) for k, v in ca.items())
+    na = sum(v * v for v in ca.values()) ** 0.5
+    nb = sum(v * v for v in cb.values()) ** 0.5
+    if na <= 0 or nb <= 0:
+        return 0.0
+    return max(0.0, min(1.0, dot / (na * nb)))
+
+
+def faithfulness_proxy(answer: str, contexts: Sequence[str]) -> Optional[float]:
+    """RAGAS faithfulness 轻量版：答案句在上下文中的字面支撑比例。"""
+    import re as _re
+
+    sents = [s.strip() for s in _re.split(r"[。！？!?；;\\n]+", (answer or "")) if s.strip()]
+    if not sents:
+        return None
+    ctx = "\n".join(contexts or [])
+    if not ctx.strip():
+        return None
+    hit = 0
+    for s in sents:
+        key = s[:12] if len(s) > 12 else s
+        if key and key in ctx:
+            hit += 1
+    return hit / len(sents)
+
+
 def _hits_to_relevance(sources: Sequence[str], expected_sources: Sequence[str]) -> List[int]:
     """把命中来源映射为二元相关性：expected 命中 → 1，否则 → 0。"""
     rel: List[int] = []
@@ -209,6 +250,8 @@ def evaluate(pipeline: RAGPipeline, items: List[Dict[str, Any]], llm_self_eval: 
 
     retrieval_hits = 0
     keyword_scores: List[float] = []
+    sem_sims: List[float] = []
+    faiths: List[float] = []
     latencies: List[float] = []
     ttfts: List[float] = []
     tokens_per_sec_values: List[float] = []
@@ -252,10 +295,18 @@ def evaluate(pipeline: RAGPipeline, items: List[Dict[str, Any]], llm_self_eval: 
         if mrr_val is not None:
             mrrs.append(mrr_val)
 
-        # 关键词覆盖率
+        # 关键词覆盖率 + RAGAS 轻量语义指标（无外部依赖）
         kw_cov = keyword_coverage(result.answer, keywords) if keywords else None
         if kw_cov is not None:
             keyword_scores.append(kw_cov)
+        _ref = str(item.get("reference_answer") or "")
+        _sim = semantic_similarity(result.answer or "", _ref) if _ref else None
+        if _sim is not None:
+            sem_sims.append(_sim)
+        _ctx_texts = [str(s.get("content") or s.get("snippet") or "") for s in (result.sources or [])]
+        _faith = faithfulness_proxy(result.answer or "", _ctx_texts)
+        if _faith is not None:
+            faiths.append(_faith)
 
         # TTFT & tokens
         timings = getattr(result, "timings", {}) or {}
@@ -282,6 +333,8 @@ def evaluate(pipeline: RAGPipeline, items: List[Dict[str, Any]], llm_self_eval: 
                 "tokens_per_sec": round(tps, 2) if isinstance(tps, (int, float)) else None,
                 "retrieval_hit": bool(hit),
                 "keyword_coverage": kw_cov,
+                "answer_similarity": round(_sim, 4) if _sim is not None else None,
+                "faithfulness": round(_faith, 4) if _faith is not None else None,
                 "ndcg_at_5": ndcg,
                 "mrr": mrr_val,
                 "verification": verification,
@@ -308,6 +361,9 @@ def evaluate(pipeline: RAGPipeline, items: List[Dict[str, Any]], llm_self_eval: 
         "avg_keyword_coverage": (
             sum(keyword_scores) / len(keyword_scores) if keyword_scores else None
         ),
+        # P1-2 RAGAS 语义指标（无外部依赖轻量版；有 ragas 时可用其官方值替换）
+        "avg_answer_similarity": (sum(sem_sims) / len(sem_sims) if sem_sims else None),
+        "avg_faithfulness": (sum(faiths) / len(faiths) if faiths else None),
         "avg_latency_ms": sum(latencies) / len(latencies) if latencies else None,
         "p95_latency_ms": percentile(latencies, 0.95),
         "ndcg_at_5": sum(ndcgs) / len(ndcgs) if ndcgs else None,
