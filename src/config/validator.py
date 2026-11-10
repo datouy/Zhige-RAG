@@ -288,6 +288,9 @@ class MemoryConfig(_StrictModel):
     session_ttl_minutes: float = Field(30.0, gt=0)
     retrieval_rewrite: bool = True
     long_term_inject_limit: int = Field(10, ge=0, le=100)
+    # P1-3 历史压缩：token 预算 + 超限摘要
+    max_history_tokens: int = Field(2000, ge=0, le=32000, description="历史最大token预算，0=不限")
+    summary_max_tokens: int = Field(300, ge=50, le=2000, description="历史摘要最大长度")
 
 
 class EvaluationConfig(_StrictModel):

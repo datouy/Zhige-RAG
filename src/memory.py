@@ -302,6 +302,71 @@ class ContextAssembler:
             + "\n".join(lines)
         )
 
+    @staticmethod
+    def estimate_tokens(text: str) -> int:
+        """P1-3 token 估算（无 tokenizer 依赖）：中日韩字符按 1 token，ASCII 按 4 字符 1 token。"""
+        if not text:
+            return 0
+        cjk = sum(1 for ch in text if "\u4e00" <= ch <= "\u9fff" or "\u3400" <= ch <= "\u4dbf" or "\u3040" <= ch <= "\u30ff" or "\uac00" <= ch <= "\ud7af")
+        other = len(text) - cjk
+        return cjk + max(1, other // 4) if text else 0
+
+    def compress_history(
+        self,
+        history: List[Dict[str, str]],
+        budget_tokens: int = 0,
+        summarizer: Optional[Any] = None,
+    ) -> tuple[List[Dict[str, str]], Optional[str]]:
+        """P1-3 历史压缩：超预算时旧轮压成摘要，返回 (保留历史, 摘要或None)。
+
+        - 按 session_turns 先裁窗口，再按 token 预算从旧到新丢弃；
+        - 被丢弃的旧轮拼成摘要（有 summarizer/LLM 时调 LLM，否则规则截断），
+          调用方将其注入 system，避免直接丢上下文导致指代断裂。
+        """
+        hist = list(history or [])
+        if not hist:
+            return [], None
+        max_turns = int(self.memory_cfg.get("session_turns", 3) or 0)
+        if max_turns > 0:
+            hist = hist[-(max_turns * 2):]
+        budget = int(budget_tokens or self.memory_cfg.get("max_history_tokens", 0) or 0)
+        if budget <= 0:
+            # 无预算限制：仅做单条截断
+            return ([{"role": h.get("role", "user"), "content": str(h.get("content", ""))[:1500]} for h in hist], None)
+        # 从最新往最旧累加，超预算的旧轮转为摘要素材
+        kept: List[Dict[str, str]] = []
+        used = 0
+        overflow: List[Dict[str, str]] = []
+        for h in reversed(hist):
+            c = str(h.get("content", "") or "")[:1500]
+            t = self.estimate_tokens(c)
+            if kept and used + t > budget:
+                overflow.append(h)
+            else:
+                kept.append({"role": h.get("role", "user"), "content": c})
+                used += t
+        kept.reverse()
+        overflow.reverse()
+        if not overflow:
+            return kept, None
+        # 摘要：优先 LLM，失败/无 LLM 时规则截断
+        summary: Optional[str] = None
+        if summarizer is not None:
+            try:
+                if callable(summarizer):
+                    summary = str(summarizer(overflow) or "").strip()[: int(self.memory_cfg.get("summary_max_tokens", 300) or 300)]
+                elif hasattr(summarizer, "chat"):
+                    msgs = [{"role": "system", "content": "把以下多轮对话压成不超过150字的要点摘要，保留人名/时间/结论。"}, {"role": "user", "content": "\n".join(f"{m.get('role')}: {str(m.get('content',''))[:300]}" for m in overflow)}]
+                    summary = str(summarizer.chat(msgs, stream=False) or "").strip()[:300]
+            except Exception:
+                summary = None
+        if not summary:
+            parts = []
+            for m in overflow[:6]:
+                parts.append(f"{m.get('role','')}:{str(m.get('content',''))[:80]}")
+            summary = "；".join(parts)[:300]
+        return kept, summary
+
     def build(
         self,
         question: str,
@@ -337,9 +402,16 @@ class ContextAssembler:
             final_user = user_content
 
         messages: List[Dict[str, str]] = [{"role": "system", "content": system}]
-        # 即时记忆：历史轮次（最多保留窗口，超长内容截断）
+        # 即时记忆：历史轮次（P1-3 token预算+超限摘要，避免长会话挤爆上下文）
         if self.enabled and history:
-            for h in history[-(int(self.memory_cfg.get("session_turns", 3)) * 2):]:
+            try:
+                kept, _sum = self.compress_history(list(history))
+            except Exception:
+                kept, _sum = list(history)[-(int(self.memory_cfg.get("session_turns", 3)) * 2):], None
+            if _sum:
+                system = f"{system}\n\n【历史摘要】{_sum}"
+                messages = [{"role": "system", "content": system}]
+            for h in kept:
                 messages.append({"role": h.get("role", "user"), "content": str(h.get("content", ""))[:1500]})
         messages.append({"role": "user", "content": final_user})
         return messages
