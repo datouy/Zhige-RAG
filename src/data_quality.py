@@ -322,7 +322,20 @@ def run_data_pipeline(
 
     # 4. 分块（先在"裸文本"上去重，再注入 breadcrumb 前缀——前缀含章节路径，
     #    若先拼前缀，不同文档的相同正文会因前缀不同而漏判）
+    #    P0-4 父子索引：child 精确检索 + parent 上下文组装。child=分块本身（向量索引），
+    #    parent=同小节全文（截断存 metadata.parent_text，parent_id=md5(source|page)）。
+    #    检索仍命中 child（精度不丢），_expand_with_neighbors 在查询时按 parent 组装邻居；
+    #    生成侧可用 parent_text 拿到完整小节上下文，跨段因果题不再碎。
+    import hashlib as _hl
+
     add_breadcrumb = bool(dq_cfg.get("breadcrumb_in_chunk", True))
+    parent_truncate = int(dq_cfg.get("parent_text_chars", 2000) or 2000)
+    _parent_text_by_key: Dict[str, str] = {}
+    for d in docs:
+        _md = dict(d.metadata or {})
+        _src = str(_md.get("source") or _md.get("filepath") or "unknown")
+        _key = f"{_src}|{_md.get('page', d.page)}"
+        _parent_text_by_key[_key] = (d.content or "")[:parent_truncate]
     chunks: List[Any] = []
     for d in docs:
         # page 必须随 metadata 下传：分块 id = md5(source|page|chunk_index)，
@@ -330,7 +343,16 @@ def run_data_pipeline(
         # 的同序号块 id 碰撞，upsert 会静默覆盖（137 块只剩 19 块的事故根源）。
         md = dict(d.metadata or {})
         md.setdefault("page", d.page)
-        chunks.extend(splitter.split_text(d.content, metadata=md))
+        _src = str(md.get("source") or md.get("filepath") or "unknown")
+        _key = f"{_src}|{md.get('page', d.page)}"
+        _pid = _hl.md5(_key.encode("utf-8")).hexdigest()[:16]
+        for ck in splitter.split_text(d.content, metadata=md):
+            ck_md = dict(ck.metadata or {})
+            ck_md.setdefault("parent_id", _pid)
+            if "parent_text" not in ck_md:
+                ck_md["parent_text"] = _parent_text_by_key.get(_key, "") or ""
+            ck.metadata = ck_md
+            chunks.append(ck)
 
     # 5. 分块级去重
     chunks, chunk_dups = dedup_chunks(chunks, near_dup_threshold=float(dq_cfg.get("near_dup_threshold", 0.0) or 0.0))
