@@ -1,13 +1,16 @@
 """重排序（Reranker）模型封装。
 
-提供两种可替换的重排后端（由 ``reranker.backend`` 决定）：
+提供三种可替换的重排后端（由 ``reranker.backend`` 决定）：
 
 - ``bge``：基于 ``FlagEmbedding`` / ``sentence-transformers`` 的 CrossEncoder，
   默认模型 ``BAAI/bge-reranker-base``（轻量、中文表现好）。
 - ``d1`` ：基于 d1 **决策模型**的 ``score`` 原语（见 :mod:`src.decision_provider`），
   对每个候选做一次"单次前向"的相关度分级打分。优势是毫秒级、0 输出 token，
   且在无 GPU 的 CPU 机器上通常比交叉编码器更快；代价是需要 d1 权重（或退化为
-  用现有 LLM 模拟）。两种后端输出接口完全一致，可无缝互换。
+  用现有 LLM 模拟）。
+- ``api`` ：在线重排 API（Cohere / 硅基流动 / DashScope 兼容的 ``/rerank``），
+  零本地依赖，适合无 GPU 机器。失败时按初检顺序降级返回。
+  三种后端输出接口完全一致，可无缝互换。
 
 两者都返回"按相关度降序、分数归一到 0~1"的 Hit 列表，因此上层
 ``RAGPipeline._rerank`` 的 ``min_relevance`` 二次过滤对两者同样生效。
@@ -267,6 +270,99 @@ class D1Reranker:
 
 
 # ======================================================================
+#  在线重排 API（P0-5：Cohere / 硅基流动 / DashScope 兼容 /rerank）
+# ======================================================================
+class ApiReranker:
+    """在线重排：POST {base_url}/rerank，零本地依赖。
+
+    兼容两种主流返回体：
+    - Cohere 风格：{"results": [{"index": i, "relevance_score": s}]}
+    - 硅基流动/BGE-API 风格：{"results": [...]} 或 {"data": [{"index": i, "score": s}]}
+    失败时按初检顺序降级返回，绝不拖垮问答链路。
+    """
+
+    def __init__(
+        self,
+        base_url: str = "",
+        model_name: str = "BAAI/bge-reranker-v2-m3",
+        api_key: str = "",
+        timeout: float = 15.0,
+        max_candidates: int = 24,
+    ) -> None:
+        import os as _os
+
+        self.base_url = (base_url or _os.getenv("RERANK_BASE_URL", "")).rstrip("/")
+        self.model_name = model_name or _os.getenv("RERANK_MODEL", "BAAI/bge-reranker-v2-m3")
+        self.api_key = api_key or _os.getenv("RERANK_API_KEY", "") or _os.getenv("SILICONFLOW_API_KEY", "")
+        self.timeout = float(timeout or 15.0)
+        self.max_candidates = max(1, int(max_candidates or 24))
+
+    def rerank(
+        self,
+        query: str,
+        hits: Sequence[Hit],
+        top_n: int = 3,
+    ) -> List[Hit]:
+        if not hits:
+            return []
+        top_n = max(1, min(top_n, len(hits)))
+        if not self.base_url:
+            logger.warning("在线重排未配置 base_url，按初检顺序返回")
+            return list(hits)[:top_n]
+        head = list(hits)[: self.max_candidates]
+        tail = list(hits)[self.max_candidates :]
+        try:
+            from .http_client import build_headers, post_json
+
+            payload = {
+                "model": self.model_name,
+                "query": query,
+                "documents": [h.text for h in head],
+                "top_n": min(len(head), max(top_n, len(head))),
+            }
+            data = post_json(
+                f"{self.base_url}/rerank",
+                payload,
+                headers=build_headers(self.api_key),
+                timeout=self.timeout,
+                label="rerank",
+                model=self.model_name,
+            )
+            results = data.get("results") or data.get("data") or []
+            scores = [None] * len(head)
+            for r in results:
+                try:
+                    idx = int(r.get("index", -1))
+                    s = r.get("relevance_score", r.get("score", r.get("relevance", 0.0)))
+                    if 0 <= idx < len(head):
+                        scores[idx] = float(s)
+                except Exception:
+                    continue
+            # 缺失打分的候选沿用初检分，保证可排序
+            scored = []
+            for h, s in zip(head, scores):
+                scored.append((h, float(s) if s is not None else float(h.score)))
+            scored.sort(key=lambda t: -t[1])
+            reranked: List[Hit] = []
+            for i, (h, s) in enumerate(scored):
+                reranked.append(
+                    Hit(
+                        id=h.id,
+                        text=h.text,
+                        score=float(s),
+                        metadata={**h.metadata, "_rerank_score": float(s), "_rerank_rank": i, "_rerank_backend": "api"},
+                    )
+                )
+            for h in tail:
+                reranked.append(h)
+            logger.info("在线重排完成：%d → %d", len(hits), len(reranked))
+            return reranked[:top_n] if top_n < len(reranked) else reranked
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("在线重排失败，按初检顺序降级返回: %s", exc)
+            return list(hits)[:top_n]
+
+
+# ======================================================================
 #  工厂
 # ======================================================================
 def create_reranker(
@@ -301,6 +397,27 @@ def create_reranker(
         return None
 
     backend = str(rcfg.get("backend") or "bge").strip().lower()
+
+    # ---- 在线重排 API（P0-5）：无 GPU 机器首选，失败自动回落 bge ----
+    if backend in ("api", "auto"):
+        import os as _os
+
+        _base = str(rcfg.get("base_url") or _os.getenv("RERANK_BASE_URL", "") or "").strip()
+        if _base:
+            try:
+                return ApiReranker(
+                    base_url=_base,
+                    model_name=str(rcfg.get("model_name") or "BAAI/bge-reranker-v2-m3"),
+                    api_key=str(rcfg.get("api_key") or ""),
+                    timeout=float(rcfg.get("timeout", 15.0) or 15.0),
+                    max_candidates=int(rcfg.get("max_candidates", 24) or 24),
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("在线重排构造失败，回落本地: %s", exc)
+        elif backend == "api":
+            logger.warning("reranker.backend=api 但未配置 base_url，重排停用。")
+            return None
+        # auto 且无 base_url：继续走 d1/bge
 
     # ---- d1 决策重排 ----
     if backend in ("d1", "auto"):
@@ -348,6 +465,7 @@ def create_reranker(
 __all__ = [
     "BgeReranker",
     "D1Reranker",
+    "ApiReranker",
     "DEFAULT_RELEVANCE_LADDER",
     "create_reranker",
 ]

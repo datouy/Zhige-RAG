@@ -255,7 +255,7 @@ class RetrievalConfig(_StrictModel):
 class RerankerConfig(_StrictModel):
     """重排序配置。"""
     enabled: bool = Field(False, description="是否启用")
-    backend: str = Field("bge")
+    backend: str = Field("bge", description="bge | d1 | api | auto")
     model_name: str = Field("BAAI/bge-reranker-base", description="模型名称")
     device: str = Field("cuda", description="设备类型")
     top_n: int = Field(3, ge=1, le=20, description="重排返回数")
@@ -263,6 +263,10 @@ class RerankerConfig(_StrictModel):
     cache_dir: Optional[str] = Field(None, description="缓存目录")
     min_relevance: float = Field(0.05, ge=0.0, le=1.0)
     max_candidates: int = Field(24, ge=1, le=500)
+    # P0-5 在线重排 API（Cohere / 硅基流动 / DashScope 兼容 /rerank）
+    base_url: str = Field("", description="在线重排服务根地址（含/v1前缀）")
+    api_key: str = Field("", description="在线重排 API 密钥（建议走环境变量）")
+    timeout: float = Field(15.0, ge=1.0, le=120.0, description="单次请求超时秒")
 
 
 class UIConfig(_StrictModel):

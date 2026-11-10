@@ -265,8 +265,12 @@ reranker:
   # sentence-transformers，也没有 ~1.1GB 的重排权重。安装 requirements-local.txt
   # 并下载 model_name 后再改为 true，避免“配置显示开启、运行实际停用”的假象。
   enabled: false
-  backend: "bge"                   # bge | d1 | auto
-  model_name: "./models/bge-reranker-base"
+  backend: "bge"                   # bge | d1 | api | auto（auto: 有RERANK_BASE_URL走api→d1→bge）
+  model_name: "./models/bge-reranker-base"  # backend=api时为在线模型名，如BAAI/bge-reranker-v2-m3
+  # P0-5 在线重排：Cohere/硅基流动/DashScope兼容/rerank，密钥优先走环境变量RERANK_API_KEY
+  base_url: ""                     # 如 https://api.siliconflow.cn/v1；留空则api/auto回落本地
+  api_key: ""                      # 留空走 RERANK_API_KEY / SILICONFLOW_API_KEY 环境变量
+  timeout: 15.0
   device: "auto"                   # auto 会优先用显卡；纯 CPU 机器会被自动判为 cpu
   top_n: 3                        # 最终返回数
   max_length: 256
