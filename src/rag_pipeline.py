@@ -1624,10 +1624,13 @@ class RAGPipeline:
         """Create a cited answer from the strongest retrieved sentences."""
         extract_cfg = (self.config.get("rag") or {}).get("extractive") or {}
         max_chunks = max(1, int(extract_cfg.get("max_chunks", 3)))
-        answer_chunks = context_chunks[:max_chunks]
+        min_term_hits = max(0, int(extract_cfg.get("min_term_hits", 1)))
+        # 传全部命中块给 build_extractive_answer：它内部按词面重叠重排后再截取
+        # max_chunks，这样相关性兜底能看到所有检索结果，且选中的是「最相关」
+        # 的块而不是「文档里排最前」的块。
         answer = build_extractive_answer(
             question,
-            answer_chunks,
+            context_chunks,
             max_chunks=max_chunks,
             max_sentences_per_chunk=int(
                 extract_cfg.get("max_sentences_per_chunk", 2)
@@ -1635,6 +1638,7 @@ class RAGPipeline:
             max_chars_per_passage=int(
                 extract_cfg.get("max_chars_per_passage", 260)
             ),
+            min_term_hits=min_term_hits,
         ).strip()
         fallback = (self.config.get("rag") or {}).get(
             "fallback_answer", FALLBACK_NO_HIT_ANSWER
@@ -1642,6 +1646,10 @@ class RAGPipeline:
         if not answer:
             answer = fallback
             answer_chunks = []
+        else:
+            # 来源只保留答案真正引用的分块（[n] 命中的 index），避免把邻居回填
+            # 或无关块误列为来源。
+            answer_chunks = self._cited_chunks(answer, context_chunks)
         result = RAGResult(
             answer=answer,
             sources=self._format_citations(answer_chunks),
@@ -1656,6 +1664,14 @@ class RAGPipeline:
         )
         result.verification = self._verify(answer, answer_chunks)
         return result
+
+    @staticmethod
+    def _cited_chunks(answer: str, context_chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """返回答案 `[n]` 引用对应的分块，保持上下文顺序。"""
+        cited = {int(n) for n in re.findall(r"\[(\d{1,3})\]", answer or "")}
+        if not cited:
+            return []
+        return [c for c in context_chunks if int(c.get("index", 0) or 0) in cited]
 
     # ------------------------------------------------------------------
     def answer(

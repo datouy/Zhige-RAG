@@ -94,8 +94,16 @@ def select_passages(
     max_chunks: int = 3,
     max_sentences_per_chunk: int = 2,
     max_chars_per_passage: int = 260,
+    min_term_hits: int = 1,
 ) -> List[str]:
-    """Select the most query-relevant source sentences from each chunk."""
+    """Select the most query-relevant source sentences from each chunk.
+
+    `min_term_hits` is the relevance floor: when no retrieved chunk shares
+    at least this many query terms (surface tokens/bigrams), the function
+    returns an empty list so the caller can fall back to the honest
+    "no relevant content" answer instead of quoting an unrelated passage.
+    Set to 0 to restore the previous "always return the top chunk" behavior.
+    """
     terms = _query_terms(question)
     selected: List[str] = []
     seen: set[str] = set()
@@ -104,6 +112,9 @@ def select_passages(
     chunk_scores = [
         _term_hits(terms, str(chunk.get("content") or "")) for chunk in chunks
     ]
+    # 相关性兜底：所有命中块的词面重叠都不足阈值时，直接拒答，绝不硬答。
+    if chunk_scores and max(chunk_scores, default=0) < max(0, int(min_term_hits)):
+        return []
     has_relevant_chunk = any(score > 0 for score in chunk_scores)
     if has_relevant_chunk:
         ordered = sorted(
@@ -174,6 +185,7 @@ def build_extractive_answer(
     max_chunks: int = 3,
     max_sentences_per_chunk: int = 2,
     max_chars_per_passage: int = 260,
+    min_term_hits: int = 1,
 ) -> str:
     """Return a compact evidence answer where every fact carries a citation."""
     passages = select_passages(
@@ -182,6 +194,7 @@ def build_extractive_answer(
         max_chunks=max_chunks,
         max_sentences_per_chunk=max_sentences_per_chunk,
         max_chars_per_passage=max_chars_per_passage,
+        min_term_hits=min_term_hits,
     )
     return "\n".join(passages)
 

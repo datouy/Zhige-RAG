@@ -478,6 +478,10 @@ rag:
     max_chunks: 3
     max_sentences_per_chunk: 2
     max_chars_per_passage: 260
+    # 相关性兜底：所有命中块与问题的词面重叠（token/bigram 命中数）都低于
+    # 该阈值时，直接返回 rag.fallback_answer 拒答，而不是硬答一篇无关原文。
+    # 默认 1 = 至少命中 1 个词面；调 0 恢复旧行为（无 LLM 模式下总返回 top 块）。
+    min_term_hits: 1
   system_prompt_file: "config/prompts.yaml"
   assistant_name: "小识"
   org_name: "企业知识库"
