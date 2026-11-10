@@ -96,7 +96,8 @@ class EmbeddingConfig(_StrictModel):
 
 class VectorStoreConfig(_StrictModel):
     """向量存储配置模型。"""
-    backend: str = Field("chroma", description="向量存储后端")
+    backend: str = Field("chroma", description="向量存储后端: chroma | pgvector")
+    pgvector_dsn: str = Field("", description="pgvector 连接串，为空则用 chroma")
     collection_name: str = Field("chinese_rag_kb", description="集合名称")
     persist_directory: str = Field("data/chroma_db", description="持久化目录")
     distance_fn: str = Field("cosine", description="距离函数")

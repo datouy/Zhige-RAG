@@ -160,7 +160,8 @@ embedding:
 
 # ------------------ 向量数据库 ------------------
 vector_store:
-  backend: "chroma"
+  backend: "chroma"  # chroma | pgvector（pgvector需配pgvector_dsn并安装psycopg+pgvector扩展）
+  pgvector_dsn: ""   # 如 postgresql://user:pass@localhost:5432/zhige
   collection_name: "chinese_rag_kb"
   persist_directory: "data/chroma_db"
   distance_fn: "cosine"

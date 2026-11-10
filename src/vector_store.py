@@ -69,6 +69,59 @@ class VectorStoreHealthError(RuntimeError):
     """向量库 collection 无法完成基础读写探测。"""
 
 
+# ======================================================================
+#  P1-4 向量库抽象：BaseStore 接口 + pgvector 选项
+# ======================================================================
+class BaseVectorStore:
+    """向量库统一接口（Chroma / pgvector 共用）。
+
+    RAGFlow/Dify 均用抽象层隔离 pg/vector 引擎，业务只依赖本接口，
+    切换引擎无需改检索链路。新增引擎只需实现这 6 个方法。
+    """
+
+    def add_chunks(self, chunks, embeddings=None, batch_size: int = 128) -> int:  # pragma: no cover
+        raise NotImplementedError
+
+    def replace_chunks_for_sources(self, chunks, sources, on_commit=None) -> int:  # pragma: no cover
+        raise NotImplementedError
+
+    def query(self, query_text: str, top_k: int = 5, where=None, score_threshold: float = 0.0):  # pragma: no cover
+        raise NotImplementedError
+
+    def delete_by_ids(self, ids) -> int:  # pragma: no cover
+        raise NotImplementedError
+
+    def delete_by_metadata(self, where) -> int:  # pragma: no cover
+        raise NotImplementedError
+
+    def count(self) -> int:  # pragma: no cover
+        raise NotImplementedError
+
+
+def create_vector_store(
+    backend: str = "chroma",
+    pgvector_dsn: str = "",
+    **kwargs,
+) -> "BaseVectorStore":
+    """按 backend 创建向量库：chroma（默认）| pgvector（需 psycopg + pgvector 扩展）。
+
+    pgvector 未安装/无 DSN 时抛错并提示安装方式，不静默回落，避免“以为切库成功
+    实际还在 chroma”的数据分裂。
+    """
+    backend = (backend or "chroma").strip().lower()
+    if backend in ("pgvector", "pg", "postgres"):
+        if not pgvector_dsn:
+            raise VectorStoreHealthError("backend=pgvector 但未配置 pgvector_dsn")
+        try:
+            from .vector_store_pgvector import PgVectorStore  # type: ignore
+        except Exception as exc:  # noqa: BLE001
+            raise VectorStoreHealthError(
+                f"pgvector 后端不可用：{exc}（需 pip install psycopg[binary] pgvector）"
+            ) from exc
+        return PgVectorStore(dsn=pgvector_dsn, **kwargs)
+    return ChromaStore(**kwargs)
+
+
 def probe_collections(client: Any) -> Dict[str, Any]:
     """探测客户端中的全部 collection。
 
@@ -518,7 +571,7 @@ def _metadata_matches(metadata: Dict[str, Any], where: Optional[Dict[str, Any]])
     return True
 
 
-class ChromaStore:
+class ChromaStore(BaseVectorStore):
     """Chroma 向量库封装。"""
 
     def __init__(
