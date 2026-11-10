@@ -164,10 +164,14 @@ class OpenAICompatLLM:
             label=self.provider_label,
             model=self.model_name,
         )
+        return self._parse_content(data)
+
+    @staticmethod
+    def _parse_content(data: Dict[str, Any]) -> str:
         choices = data.get("choices") or []
         if not choices:
             raise LLMProviderError(
-                f"{self.provider_label} 返回体缺少 choices 字段：{str(data)[:200]}"
+                f"返回体缺少 choices 字段：{str(data)[:200]}"
             )
         message = choices[0].get("message") or {}
         content = message.get("content")
@@ -175,6 +179,83 @@ class OpenAICompatLLM:
             # 部分推理模型把正文放在 reasoning_content，content 为空
             content = message.get("reasoning_content") or ""
         return str(content).strip()
+
+    def chat_with_tools(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: List[Dict[str, Any]],
+        generation: Optional[GenerationConfig] = None,
+        timeout: Optional[float] = None,
+        tool_choice: str = "auto",
+    ) -> Dict[str, Any]:
+        """带 Function Calling 的对话（OpenAI tools 协议）。
+
+        Args:
+            messages: OpenAI 风格消息列表（含历史 assistant/tool 消息）。
+            tools: ``ToolRegistry.to_openai_schemas()`` 格式的 tools 列表。
+            tool_choice: ``"auto"`` / ``"none"`` / ``{"type":"function",...}``。
+
+        Returns:
+            ``{"content": str, "tool_calls": [{"id": str, "name": str,
+            "arguments": dict}]}``。无工具调用时 ``tool_calls`` 为空列表。
+
+        Raises:
+            LLMProviderError: 服务端拒绝 tools 参数（老模型/不支持时），
+                调用方可捕获后回退到文本 ReAct。
+        """
+        import json as _json
+
+        gen = generation or self.gen_cfg
+        payload = self._build_payload(messages, gen, stream=False)
+        payload["tools"] = tools
+        payload["tool_choice"] = tool_choice
+        data = post_json(
+            self._endpoint,
+            payload,
+            headers=build_headers(self.api_key),
+            timeout=timeout or self.timeout,
+            label=self.provider_label,
+            model=self.model_name,
+        )
+        choices = data.get("choices") or []
+        if not choices:
+            raise LLMProviderError(
+                f"{self.provider_label} 返回体缺少 choices 字段：{str(data)[:200]}"
+            )
+        message = choices[0].get("message") or {}
+        content = message.get("content") or message.get("reasoning_content") or ""
+        tool_calls: List[Dict[str, Any]] = []
+        for tc in message.get("tool_calls") or []:
+            fn = (tc or {}).get("function") or {}
+            name = str(fn.get("name") or "").strip()
+            raw_args = fn.get("arguments") or "{}"
+            if isinstance(raw_args, dict):
+                args = raw_args
+            else:
+                try:
+                    args = _json.loads(raw_args) if str(raw_args).strip() else {}
+                    if not isinstance(args, dict):
+                        args = {"value": args}
+                except Exception:
+                    args = {"_raw": str(raw_args)}
+            if name:
+                tool_calls.append({
+                    "id": str(tc.get("id") or name),
+                    "name": name,
+                    "arguments": args,
+                })
+        # 兼容单 function_call 风格（部分国产兼容层）
+        fc = message.get("function_call")
+        if not tool_calls and isinstance(fc, dict) and fc.get("name"):
+            raw_args = fc.get("arguments") or "{}"
+            try:
+                args = _json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+                if not isinstance(args, dict):
+                    args = {"value": args}
+            except Exception:
+                args = {"_raw": str(raw_args)}
+            tool_calls.append({"id": fc.get("name"), "name": fc.get("name"), "arguments": args})
+        return {"content": str(content or "").strip(), "tool_calls": tool_calls}
 
     def _stream_chat(
         self,

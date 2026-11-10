@@ -3,11 +3,12 @@
 设计要点
 --------
 
-- **不依赖 OpenAI / function-calling 协议**：当前 ``LocalLLM`` 仅暴露标准的
-  ``chat(messages, generation, stream)``。因此本实现走"文本 ReAct"路线——
-  在 prompt 中描述工具，让 LLM 输出 ``Thought/Action/ActionInput/Observation``
-  标记，再用正则解析。优点：对任何 chat 兼容模型都可用；缺点：要靠 LLM 严格
-  按照指定格式输出。
+- **Function Calling 优先，文本 ReAct 兜底**：若 ``llm`` 提供
+  ``chat_with_tools``（见 :class:`src.llm_provider.OpenAICompatLLM`），则优先走
+  OpenAI tools 协议——LLM 直接返回结构化 ``tool_calls``，不再依赖正则解析
+  ``Action:/ActionInput:``；只有当后端不支持 tools 参数（老模型/兼容层报错）
+  或 ``llm`` 根本没有该方法时，才回退到文本 ReAct 路线。本地 ``LocalLLM``
+  无此方法，行为与改造前完全一致。
 
 - **事件流**：ReActAgent.run(...) 是生成器（也支持 stream 标记），逐 yield
   ``{"event": ..., "data": ...}`` 事件，便于 UI / WebSocket 实时展示。
@@ -97,6 +98,11 @@ Final Answer: 你的最终中文回答
 3. 若工具出错，按 Observation 中的错误提示继续推理或改用其它工具；
 4. 当不需要工具也能直接回答时，Action 写 None 并在下一行直接给 Final Answer。
 """
+
+FC_SYSTEM_PROMPT = """你是中文知识库助手。当前日期：{current_date}。
+你可以使用工具回答用户问题。涉及"今天/现在/当前时间/日期"的问题，必须调用 get_current_time 工具，禁止凭记忆猜测。
+回答只依据工具返回结果；工具没有提供的信息，明确说明无法得知。
+不需要工具时直接用中文回答。"""
 
 
 @dataclass
@@ -281,6 +287,108 @@ class ReActAgent:
             current_date=datetime.now().strftime("%Y年%m月%d日"),
         )
 
+    def _build_fc_system_prompt(self) -> str:
+        from datetime import datetime
+
+        return FC_SYSTEM_PROMPT.format(
+            current_date=datetime.now().strftime("%Y年%m月%d日"),
+        )
+
+    def _supports_function_calling(self) -> bool:
+        return callable(getattr(self.llm, "chat_with_tools", None))
+
+    def run(self, query: str, stream: bool = True) -> Iterator[Dict[str, Any]]:
+        if self._supports_function_calling():
+            yield from self._run_fc(query, stream=stream)
+        else:
+            yield from self._run_text_react(query, stream=stream)
+
+    def _run_fc(self, query: str, stream: bool = True) -> Iterator[Dict[str, Any]]:
+        self.history = []
+        tools_used: List[str] = []
+        if not query or not isinstance(query, str):
+            yield {"event": "error", "data": "query 不能为空"}
+            return
+        if _DATETIME_INTENT_RE.search(query):
+            from datetime import datetime
+            now = datetime.now()
+            answer = f"今天是 {now.strftime('%Y年%m月%d日')}，当前时间 {now.strftime('%H:%M:%S')}。"
+            yield {"event": "done", "data": {"steps": 1, "tools_used": ["local_clock"], "answer": answer}}
+            return
+        self._ensure_llm_loaded()
+        tool_names = self.tools.list_names()
+        schemas = self.tools.to_openai_schemas()
+        msgs: List[Dict[str, Any]] = [
+            {"role": "system", "content": self._build_fc_system_prompt()},
+            {"role": "user", "content": query.strip()},
+        ]
+        steps = 0
+        try:
+            for step_idx in range(self.max_steps):
+                steps = step_idx + 1
+                try:
+                    resp = self.llm.chat_with_tools(msgs, schemas)
+                except Exception as exc:
+                    msg = str(exc)
+                    if "tool" in msg.lower() or "function" in msg.lower() or "400" in msg or "422" in msg:
+                        logger.warning("FC不可用回退文本ReAct: %s", exc)
+                        yield from self._run_text_react(query, stream=stream)
+                        return
+                    raise
+                if isinstance(resp, str):
+                    logger.warning("FC返回str回退文本ReAct")
+                    yield from self._run_text_react(query, stream=stream)
+                    return
+                content = (resp.get("content") or "").strip()
+                calls = resp.get("tool_calls") or []
+                self.history.append({"step": steps, "fc_content": content, "calls": calls})
+                if content:
+                    yield {"event": "thought", "data": content}
+                if not calls:
+                    final = content or "已完成。"
+                    if stream:
+                        for piece in self._yield_tokens(final):
+                            yield {"event": "token", "data": piece}
+                    yield {"event": "done", "data": {"steps": steps, "tools_used": tools_used, "answer": final}}
+                    return
+                for tc in calls[:3]:
+                    name = tc.get("name", "")
+                    args = tc.get("arguments") or {}
+                    if name not in tool_names:
+                        obs = f"未知工具 '{name}'，可用：{tool_names}"
+                        yield {"event": "observation", "data": {"result": obs, "ok": False}}
+                        msgs.append({"role": "assistant", "content": content or ""})
+                        msgs.append({"role": "user", "content": f"工具名错误：{obs}，请重试或直接回答。"})
+                        continue
+                    tool = self.tools.get(name)
+                    yield {"event": "action", "data": {"tool": name, "input": args}}
+                    t0 = time.perf_counter()
+                    try:
+                        result = tool.safe_run(**(args if isinstance(args, dict) else {}))
+                    except Exception as exc:
+                        result = ToolResult(success=False, content=None, error=f"{type(exc).__name__}: {exc}")
+                    ms = round((time.perf_counter() - t0) * 1000.0, 2)
+                    if result.success and name not in tools_used:
+                        tools_used.append(name)
+                    obs = self._format_observation(result)
+                    yield {"event": "observation", "data": {"result": obs, "ok": result.success, "latency_ms": ms}}
+                    msgs.append({"role": "assistant", "content": content or "", "tool_calls": [{"id": tc.get("id", name), "type": "function", "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}}]})
+                    msgs.append({"role": "tool", "tool_call_id": tc.get("id", name), "name": name, "content": obs})
+            try:
+                end = self.llm.chat(msgs + [{"role": "user", "content": "请综合以上工具结果，给出最终中文回答。"}], stream=False)
+            except Exception:
+                end = "抱歉，Agent 达到最大步数仍未得出最终结论。"
+            if not isinstance(end, str):
+                end = str(end)
+            if stream:
+                for piece in self._yield_tokens(end.strip()):
+                    yield {"event": "token", "data": piece}
+            yield {"event": "done", "data": {"steps": steps, "tools_used": tools_used, "answer": end.strip(), "truncated": True}}
+        except Exception as exc:
+            logger.exception("FC链路失败回退文本ReAct")
+            yield from self._run_text_react(query, stream=stream)
+            return
+
     def _ensure_llm_loaded(self) -> None:
         """若 LLM 是 :class:`LocalLLM` 风格懒加载的，触发 ensure。"""
         if hasattr(self.llm, "ensure_llm"):
@@ -296,16 +404,8 @@ class ReActAgent:
                 pass
 
     # ------------------------------------------------------------------
-    def run(self, query: str, stream: bool = True) -> Iterator[Dict[str, Any]]:
-        """执行一次 ReAct 循环，yield 事件字典。
-
-        Args:
-            query: 用户原始问题。
-            stream: 是否使用流式 token 输出最终答案。
-
-        Yields:
-            ``{"event": str, "data": Any}``
-        """
+    def _run_text_react(self, query: str, stream: bool = True) -> Iterator[Dict[str, Any]]:
+        """文本 ReAct 路线（LocalLLM / 不支持 tools 时的兜底）。"""
         self.history = []
         tools_used: List[str] = []
         steps = 0
