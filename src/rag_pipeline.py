@@ -1687,6 +1687,7 @@ class RAGPipeline:
         history: Optional[List[Dict[str, str]]] = None,
         user_id: Optional[str] = None,
         allowed_groups: Optional[List[str]] = None,
+        direct: bool = False,
     ) -> RAGResult | Generator[str, None, RAGResult]:
         """执行一次 RAG 问答。
 
@@ -1704,6 +1705,41 @@ class RAGPipeline:
         """
         rag_cfg = self.config.get("rag", {})
         history = history or []
+
+        # 直连通用问答：跳过意图路由与知识库检索，直接把问题发给生成式 LLM。
+        # 仅生成式后端（openai/ollama/local）可用；extractive 模式无 LLM 会抛错。
+        if direct:
+            self.ensure_llm()
+            llm_cfg = self.config.get("llm", {})
+            timeout = llm_cfg.get("timeout", DEFAULT_LLM_TIMEOUT)
+            gen_cfg = self.llm.gen_cfg
+            messages = [{"role": "user", "content": question}]
+            if stream:
+                def _direct_gen():
+                    buf = ""
+                    llm_start = time.perf_counter()
+                    for piece in self.llm.chat(messages, gen_cfg, stream=True):
+                        buf += piece
+                        yield piece
+                    _r = RAGResult(
+                        answer=buf.strip(),
+                        sources=[],
+                        raw_hits=[],
+                        timings={"llm_total_ms": round((time.perf_counter() - llm_start) * 1000, 2)},
+                    )
+                    return _r
+                return _direct_gen()
+            llm_start = time.perf_counter()
+            text = self.llm.chat(messages, gen_cfg, stream=False, timeout=timeout)
+            llm_total_ms = (time.perf_counter() - llm_start) * 1000
+            answer_text = text.strip() if isinstance(text, str) else str(text)
+            result = RAGResult(
+                answer=answer_text,
+                sources=[],
+                raw_hits=[],
+                timings={"llm_total_ms": round(llm_total_ms, 2)},
+            )
+            return result
 
         # 意图路由：寒暄/身份类直接模板回应，不花检索与生成资源（也无需加载 LLM）
         decision = self._classify(question)
@@ -2090,6 +2126,7 @@ class RAGPipeline:
         history: Optional[List[Dict[str, str]]] = None,
         user_id: Optional[str] = None,
         allowed_groups: Optional[List[str]] = None,
+        direct: bool = False,
     ) -> Dict[str, Any]:
         """流式问答的高级封装：返回 ``{"event":..., "data":...}`` 事件流。
 
@@ -2102,6 +2139,23 @@ class RAGPipeline:
         retrieval_cfg = self.config.get("retrieval", {})
         k = top_k or retrieval_cfg.get("top_k", 5)
         history = history or []
+
+        # 直连通用问答：跳过路由与检索，直接流式输出 LLM 答案
+        if direct:
+            yield {"event": "hits", "data": []}
+            self.ensure_llm()
+            buf = ""
+            try:
+                for piece in self.llm.chat(
+                    [{"role": "user", "content": question}], self.llm.gen_cfg, stream=True
+                ):
+                    buf += piece
+                    yield {"event": "token", "data": piece}
+            except Exception as exc:
+                yield {"event": "error", "data": str(exc)}
+                return
+            yield {"event": "done", "data": [], "verification": None}
+            return
 
         # 意图路由：寒暄/身份类直接模板回应（不加载 LLM）
         decision = self._classify(question)
@@ -2214,6 +2268,7 @@ class RAGPipeline:
         history: Optional[List[Dict[str, str]]] = None,
         user_id: Optional[str] = None,
         allowed_groups: Optional[List[str]] = None,
+        direct: bool = False,
     ):
         """异步流式问答：yield ``{"event":..., "data":...}`` 事件。
 
@@ -2272,6 +2327,7 @@ class RAGPipeline:
                     history=history,
                     user_id=user_id,
                     allowed_groups=allowed_groups,
+                    direct=direct,
                 ):
                     if not _post(event):
                         return

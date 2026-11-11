@@ -448,6 +448,7 @@ class ChatRequest(BaseModel):
     top_k: int = Field(4, ge=1, le=50, description="检索 Top-K")
     session_id: str = Field("", description="会话 ID；同一会话的多轮问答共享即时记忆")
     kb_id: Optional[str] = Field(None, description="在指定知识库内检索，缺省为默认知识库")
+    direct: bool = Field(False, description="true=直连 LLM 通用问答，跳过知识库检索")
 
 
 @router.post("/api/v1/chat", tags=["问答"])
@@ -494,6 +495,7 @@ def chat_sync(
             history=history,
             user_id=user.id,
             allowed_groups=_allowed_groups(user),
+            direct=body.direct,
         )
 
         # 回写即时记忆（user + assistant 各一条）
@@ -1217,6 +1219,7 @@ async def websocket_chat(websocket: WebSocket):
             top_k = data.get("top_k", 4)
             session_id = str(data.get("session_id") or "default")
             kb_id = data.get("kb_id")
+            direct = data.get("direct", False)
 
             if not query:
                 await websocket.send_json({"event": "error", "data": "query is required"})
@@ -1265,6 +1268,7 @@ async def websocket_chat(websocket: WebSocket):
                     history=history,
                     user_id=user_id,
                     allowed_groups=_allowed_groups(ws_user),
+                    direct=direct,
                 ):
                     event_type = event.get("event")
                     
