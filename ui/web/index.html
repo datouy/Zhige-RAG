@@ -97,7 +97,14 @@
                     <strong id="current-kb-name">默认知识库</strong>
                     <span id="kb-meta" class="muted small"></span>
                 </div>
-                <span id="status" class="status">连接中…</span>
+                <div class="topbar-actions">
+                    <label class="direct-toggle" id="direct-toggle-label"
+                           title="开启：直接调用大模型通用问答（跳过本地知识库检索）；关闭：本地知识库 RAG">
+                        <input type="checkbox" id="direct-toggle">
+                        <span class="direct-toggle-text">直连 LLM</span>
+                    </label>
+                    <span id="status" class="status">连接中…</span>
+                </div>
             </header>
 
             <div id="messages" class="messages">

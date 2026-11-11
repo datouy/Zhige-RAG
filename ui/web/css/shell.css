@@ -309,6 +309,28 @@
 }
 .topbar-title { display: flex; align-items: baseline; gap: 0.6rem; min-width: 0; }
 .topbar-title strong { font-size: 1rem; }
+.topbar-actions { display: flex; align-items: center; gap: 1rem; }
+.direct-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    font-size: 0.85rem;
+    color: var(--text-muted);
+    cursor: pointer;
+    user-select: none;
+    padding: 0.28rem 0.7rem;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    background: var(--bg);
+    transition: color 0.12s, border-color 0.12s, background 0.12s;
+}
+.direct-toggle input { cursor: pointer; }
+.direct-toggle.on {
+    color: var(--primary);
+    border-color: var(--primary);
+    background: #e0edff;
+    font-weight: 600;
+}
 
 /* 消息区（覆盖 main.css 的居中容器设定） */
 #messages {

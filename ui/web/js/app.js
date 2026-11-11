@@ -19,6 +19,7 @@ class ChatApp {
         this.connected = false;
         this.currentSources = [];
         this.topK = 8;
+        this.directMode = false;
 
         this.knowledgeBases = [];
         this.currentKb = null;
@@ -122,6 +123,7 @@ class ChatApp {
             'messages', 'chat-input', 'send-btn', 'status', 'current-kb-name',
             'kb-meta', 'file-input', 'modal', 'modal-title', 'modal-body',
             'welcome-state', 'welcome-overlay',
+            'direct-toggle',
             // 模型设置
             'settings-modal', 'settings-btn', 'settings-result', 'settings-save', 'settings-reset',
             'llm-backend', 'llm-remote', 'llm-base-url', 'llm-model', 'llm-api-key', 'llm-test',
@@ -153,6 +155,13 @@ class ChatApp {
             if (e.key === 'Enter' && !e.shiftKey) {
                 e.preventDefault();
                 this.sendMessage();
+            }
+        });
+        this.el['direct-toggle']?.addEventListener('change', (e) => {
+            this.directMode = !!e.target.checked;
+            const label = document.getElementById('direct-toggle-label');
+            if (label) {
+                label.classList.toggle('on', this.directMode);
             }
         });
 
@@ -465,6 +474,7 @@ class ChatApp {
             top_k: this.topK,
             session_id: this.currentSession.id,
             kb_id: this.currentKb ? this.currentKb.id : null,
+            direct: this.directMode,
         }));
     }
 
