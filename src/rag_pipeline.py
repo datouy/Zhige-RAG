@@ -62,6 +62,16 @@ DEFAULT_MAX_RETRIES = 2
 # 引用上下文和生成提示共同判断；需要严格拒答时可显式提高 retrieval.min_score。
 DEFAULT_MIN_SCORE = 0.15
 
+# 纯关键词召回时的最低分门槛（只在"一个向量命中都没有"时才生效）。
+# 关键词分 s/(1+s) 天然虚高（命中词越多、文档越长分数越高），所以门槛
+# 必须比语义阈值更高，否则"字面沾边但毫不相关"的长文档会轻松越过门槛，
+# 让系统在没真正匹配上的问题上硬答。
+DEFAULT_KEYWORD_MIN_SCORE = 0.60
+
+# 检索条数的兜底默认值（配置里 retrieval.top_k 缺失时用）。
+# 与 config/config.yaml 的 retrieval.top_k 保持一致（8）。
+DEFAULT_TOP_K = 8
+
 # 检索结果短 TTL 缓存（秒）：相同查询在窗口内复用，降低重复的 embedding 编码与
 # 向量检索开销。缓存键含 collection 名，多知识库/多租户之间不会串数据。
 RETRIEVAL_CACHE_TTL_SECONDS = 15.0
@@ -151,6 +161,41 @@ class RAGResult:
             "timings": self.timings,
             "verification": self.verification,
         }
+
+
+def _copy_result(res: RAGResult) -> RAGResult:
+    """深拷贝一个 :class:`RAGResult`，用于缓存出入。
+
+    为什么必须深拷贝：缓存命中时调用方会就地修改返回对象
+    （``res.timings["cache_hit"] = True``、追加引用、改 metadata）。
+    如果直接返回缓存里的那一份对象，第一次命中就把**缓存本身**改了：
+    - timings 会被越写越乱（每次命中叠加一次统计）；
+    - raw_hits 的 metadata 被改后，后续所有命中都带着上一次的脏数据；
+    - 引用列表被外部追加后越滚越大。
+
+    这里连 Hit 一起复制 —— Hit 本身是 dataclass，metadata 是可变 dict。
+    """
+    import copy as _copy
+
+    try:
+        return _copy.deepcopy(res)
+    except Exception:
+        # 深拷贝失败（比如塞了不可拷贝的对象）时，退到手工浅层重建：
+        # 至少保证容器本身不是共享的。
+        return RAGResult(
+            answer=res.answer,
+            sources=_copy.deepcopy(res.sources) if isinstance(res.sources, list) else list(res.sources or []),
+            raw_hits=[
+                Hit(id=h.id, text=h.text, score=h.score, metadata=dict(h.metadata or {}))
+                for h in (res.raw_hits or [])
+            ],
+            timings=dict(res.timings or {}),
+            verification=(
+                _copy.deepcopy(res.verification)
+                if isinstance(res.verification, dict)
+                else res.verification
+            ),
+        )
 
 
 class RAGPipeline:
@@ -510,6 +555,25 @@ class RAGPipeline:
         return hits
 
     # ---------------- P1 答案级语义缓存 ----------------
+    def _collection_version(self) -> Any:
+        """知识库的"内容版本号"，用于答案缓存键。
+
+        为什么需要：答案缓存 TTL 是 24 小时，而入库/删除/重建索引的路径
+        未必都会调用 :meth:`invalidate_answer_cache`（例如直接改库、换 embedding
+        模型重灌、后台任务入库）。一旦漏掉失效，旧答案会在 24 小时内继续
+        被复用 —— 用户明明已经补了文档，系统还在答"没找到相关信息"。
+
+        这里用**分块总数**做版本号：任何入库/删除都会改变总数，于是缓存键
+        自然变化，旧答案自动失效，不需要谁来记得调 invalidate。
+        取不到时返回 None（退化成"只靠 TTL + 显式失效"，不会更差）。
+        """
+        try:
+            store = self.vector_store
+            n = store.count()
+            return int(n) if n is not None else None
+        except Exception:
+            return None
+
     def _answer_cache_key(self, question: str, top_k: int,
                           where: Optional[Dict[str, Any]],
                           allowed_groups: Optional[List[str]]) -> Any:
@@ -524,6 +588,7 @@ class RAGPipeline:
             where_s = str(where)
         return (
             getattr(self.vector_store, "collection_name", ""),
+            self._collection_version(),
             norm[:500],
             int(top_k or 0),
             where_s,
@@ -535,7 +600,9 @@ class RAGPipeline:
             rcfg = self.config.get("retrieval", {}) or {}
             if not rcfg.get("answer_cache_enabled", True):
                 return None
-            ttl = float(rcfg.get("answer_cache_ttl_seconds", 86400) or 86400)
+            # 注意：不能用 `or 86400` —— 那会把"显式配成 0"（= 立即过期）
+            # 当成"没配置"而回退到 24 小时，配置项形同虚设。
+            ttl = float(rcfg.get("answer_cache_ttl_seconds", 86400))
         except (TypeError, ValueError):
             ttl = 86400.0
         lock = getattr(self, "_answer_cache_lock", None)
@@ -550,7 +617,11 @@ class RAGPipeline:
             if time.time() - ts >= ttl:
                 cache.pop(key, None)
                 return None
-            return res
+            # 必须返回**副本**：调用方会就地改写返回对象（如给 timings 加
+            # cache_hit 标记），若直接返回缓存里的那一份，第一次命中就把
+            # 缓存本身改了 —— 后面所有命中都会带着上一次调用的脏数据，
+            # 计时信息也会被越写越乱。
+            return _copy_result(res)
 
     def _answer_cache_put(self, key: Any, res: RAGResult) -> None:
         try:
@@ -564,7 +635,9 @@ class RAGPipeline:
         if lock is None or cache is None:
             return
         with lock:
-            cache[key] = (time.time(), res)
+            # 存副本：调用方后续对 res 的任何就地修改都不应影响缓存内容
+            # （否则"第一次入库的答案"和"缓存里的答案"会慢慢分叉）。
+            cache[key] = (time.time(), _copy_result(res))
             if len(cache) > 200:
                 oldest = next(iter(cache))
                 cache.pop(oldest, None)
@@ -634,7 +707,13 @@ class RAGPipeline:
             raise RuntimeError(f"HyDE调用失败: {exc}") from exc
 
     def _rrf_fuse_variants(self, ranked_lists: List[List[Hit]], limit: int) -> List[Hit]:
-        """多路命中按RRF倒数排名融合（K=60，与向量/BM25一致）。"""
+        """多路命中按RRF倒数排名融合（K=60，与向量/BM25一致）。
+
+        融合序写进 metadata 的 ``_fusion_rank`` / ``_fusion_score``。
+        **不要**再按 ``h.score`` 重排：多路召回的 score 量纲并不统一
+        （向量路是余弦相似度、关键词路是 BM25 压缩分），重排等于推翻
+        RRF 的名次语义，bm25_weight 的保护作用也就形同虚设。
+        """
         RRF_K = 60
         rrf: Dict[str, float] = {}
         by_id: Dict[str, Hit] = {}
@@ -646,7 +725,16 @@ class RAGPipeline:
                 if prev is None or h.score > prev.score:
                     by_id[h.id] = h
         fused_ids = sorted(rrf, key=lambda cid: -rrf[cid])[: max(1, int(limit))]
-        return [by_id[cid] for cid in fused_ids if cid in by_id]
+        fused: List[Hit] = []
+        for rank, cid in enumerate(fused_ids):
+            h = by_id.get(cid)
+            if h is None:
+                continue
+            md = dict(h.metadata or {})
+            md["_fusion_rank"] = rank
+            md["_fusion_score"] = float(rrf[cid])
+            fused.append(Hit(id=h.id, text=h.text, score=h.score, metadata=md))
+        return fused
 
     def _retrieve(
         self,
@@ -720,21 +808,54 @@ class RAGPipeline:
                 )
         # 低分兜底：最高分仍低于阈值 → 视为未命中，走拒答文案而不是硬答。
         # 过滤回退路径产生的命中同样受此约束，杜绝"为答而答"。
+        #
+        # ⚠️ 阈值必须作用在**语义分**上，不能直接取所有命中的最大分。
+        # 混合检索里两类命中的分数量纲不同：
+        #   - 向量命中：余弦相似度，0~1，代表"语义上有多相关"
+        #   - 关键词命中：BM25 原始分压缩成 s/(1+s)，长文档轻易上 0.9，
+        #     但它只说明"字面命中了查询词"，完全不代表语义相关
+        # 取 max(所有命中) 的话，一条字面命中但毫不相干的文档（0.90）
+        # 就能"顶开"一条弱语义命中（0.10），让 min_score 形同虚设 ——
+        # 结果是"硬答"了一个语义上根本没匹配上的问题。
+        #
+        # 所以：只要存在向量命中，就用向量命中里的最高语义分去比阈值；
+        # 一个向量命中都没有（纯关键词召回）时，才退到关键词口径的独立阈值。
         min_score = float(
             self.config.get("retrieval", {}).get("min_score", DEFAULT_MIN_SCORE) or 0.0
         )
-        if hits and min_score > 0 and max(h.score for h in hits) < min_score:
-            logger.info(
-                "检索最高分 %.3f 低于 min_score=%.3f，按未命中处理（查询：%s）",
-                max(h.score for h in hits),
-                min_score,
-                norm_query[:50],
-            )
-            return []
+        if hits and min_score > 0:
+            semantic_hits = [h for h in hits if h.score_kind != "keyword"]
+            keyword_hits = [h for h in hits if h.score_kind == "keyword"]
+            if semantic_hits:
+                best = max(h.score for h in semantic_hits)
+                passed = best >= min_score
+            else:
+                # 纯关键词召回：没有语义分可比，用关键词口径的独立门槛。
+                # 关键词分天然虚高（长文档命中词多），门槛因此定得更高。
+                kw_min = float(
+                    self.config.get("retrieval", {}).get("keyword_min_score", DEFAULT_KEYWORD_MIN_SCORE)
+                    or 0.0
+                )
+                best = max((h.score for h in keyword_hits), default=0.0)
+                passed = kw_min <= 0 or best >= kw_min
+            if not passed:
+                logger.info(
+                    "检索最高分 %.3f 低于阈值 %.3f，按未命中处理（查询：%s）",
+                    best,
+                    min_score if semantic_hits else kw_min,
+                    norm_query[:50],
+                )
+                return []
         # 截回调用方要的 K：全库打分只用来"发现"，不该整包塞进 prompt。
-        # 保持分数降序，下游（全文扩展 / 重排 / 引用）都按这个顺序取。
+        #
+        # ⚠️ 这里**必须按融合序截断，不能按 h.score 重排**。
+        # 混合检索的 score 是混合量纲：向量侧是余弦相似度(0~1)，关键词侧是
+        # s/(1+s)（BM25 压缩分，可轻易超过 0.9）。此前 `sorted(hits, key=score)`
+        # 会把 BM25 关键词命中的无关文档顶到真正语义相关的片段之前 ——
+        # 这正是 bm25_weight=0.5 想防的事，却在最后一步被自己推翻了。
+        # 融合层已把名次写进 _fusion_rank，这里直接按原序（融合序）截断。
         if requested_k > 0 and len(hits) > requested_k:
-            hits = sorted(hits, key=lambda h: h.score, reverse=True)[:requested_k]
+            hits = hits[:requested_k]
         # P0-4 small-to-big：命中块回填前后邻居，还原文脉（跨段因果题最吃这个）。
         hits = self._expand_with_neighbors(hits, where=where, allowed_groups=allowed_groups)
         return hits
@@ -904,7 +1025,13 @@ class RAGPipeline:
                     "知识图谱为空，GraphRAG 增强停用（运行 python scripts/build_kg.py 构建图谱后自动生效）"
                 )
                 return None
-            self._graph_retriever = GraphRetriever(store, embedding_model=self.embedding)
+            cfg = self.config.get("knowledge_graph", {}) or {}
+            retriever_cfg = cfg.get("retriever", {}) or {}
+            self._graph_retriever = GraphRetriever(
+                store,
+                embedding_model=self.embedding,
+                enable_fuzzy_match=bool(retriever_cfg.get("enable_fuzzy_match", True)),
+            )
             logger.info("GraphRAG 已启用：%s", counts)
         except Exception as exc:  # noqa: BLE001
             logger.warning("GraphRAG 初始化失败，跳过图谱增强: %s", exc)
@@ -1161,7 +1288,7 @@ class RAGPipeline:
         以及调试检索质量。
         """
         retrieval_cfg = self.config.get("retrieval", {})
-        k = top_k or retrieval_cfg.get("top_k", 5)
+        k = top_k or retrieval_cfg.get("top_k", DEFAULT_TOP_K)
         if getattr(self, "reranker", None) is not None:
             initial_k = max(k, retrieval_cfg.get("rerank_candidates", k * 3))
         else:
@@ -1212,15 +1339,29 @@ class RAGPipeline:
             try:
                 conc = float(cfg.get("concentration_threshold", 0.6) or 0.6)
                 if len(hits) >= 2:
-                    top_scores = sorted([h.score for h in hits], reverse=True)[:3]
-                    # top1 占前3总分比例高 → 高度聚焦同一文档，值得扩全文
-                    denom = sum(max(0.0, s) for s in top_scores)
-                    if denom > 0 and (max(0.0, top_scores[0]) / denom) >= conc:
-                        # 且 top1 与 top2 拉开差距，避免并列多文档时误扩
-                        if len(top_scores) < 2 or top_scores[0] >= top_scores[1] * 1.2:
+                    # ⚠️ 这里不能用 h.score 做比值：混合检索的 score 是混合量纲
+                    # （向量余弦 vs BM25 压缩分），"top1 / 前3总分"这种算法在
+                    # 关键词路出现时完全失真。
+                    # 改用**与分数无关**的量：top3 里有多少块与 top1 来自同一文档。
+                    top3 = list(hits[:3])
+                    src0 = str((top3[0].metadata or {}).get("source") or "")
+                    same = sum(
+                        1
+                        for h in top3
+                        if str((h.metadata or {}).get("source") or "") == src0
+                    )
+                    ratio = same / len(top3)
+                    if ratio >= conc:
+                        # top1 与 top2 拉开差距，避免并列多文档时误扩。
+                        # 只有两者 score 同类（都向量、都关键词）时才可比。
+                        top1, top2 = top3[0], top3[1]
+                        gap_ok = True
+                        if top1.score_kind == top2.score_kind:
+                            gap_ok = top1.score >= top2.score * 1.2
+                        if gap_ok:
                             triggered = True
-                            logger.info("全文扩展语义触发：top1集中度 %.2f≥%.2f（问题：%s）",
-                                        (top_scores[0] / denom), conc, (question or "")[:40])
+                            logger.info("全文扩展语义触发：top3同源占比 %.2f≥%.2f（问题：%s）",
+                                        ratio, conc, (question or "")[:40])
             except Exception:
                 pass
         if not triggered:
@@ -1351,7 +1492,7 @@ class RAGPipeline:
         cfg = self._mapreduce_cfg()
         if not cfg.get("enabled", True) or not context_chunks:
             return False
-        limit = max(1200, int(cfg.get("soft_limit_chars", 6000)))
+        limit = max(1200, int(cfg.get("soft_limit_chars", 12000)))
         return sum(len(c["content"]) for c in context_chunks) > limit
 
     def _maybe_compress_context(
@@ -1373,14 +1514,14 @@ class RAGPipeline:
         if not cfg.get("enabled", True) or not context_chunks or self.llm is None:
             return context_chunks
 
-        soft_limit = max(1200, int(cfg.get("soft_limit_chars", 6000)))
+        soft_limit = max(1200, int(cfg.get("soft_limit_chars", 12000)))
         total_chars = sum(len(c["content"]) for c in context_chunks)
         if total_chars <= soft_limit:
             return context_chunks
 
-        group_chars = max(600, int(cfg.get("group_chars", 3200)))
-        max_groups = max(1, int(cfg.get("max_groups", 8)))
-        detail_limit = max(0, int(cfg.get("detail_chunks", 8)))
+        group_chars = max(600, int(cfg.get("group_chars", 4000)))
+        max_groups = max(1, int(cfg.get("max_groups", 6)))
+        detail_limit = max(0, int(cfg.get("detail_chunks", 0)))
 
         groups: List[List[Dict[str, Any]]] = []
         current: List[Dict[str, Any]] = []
@@ -1403,9 +1544,18 @@ class RAGPipeline:
         fallback_groups = 0
         retry_delay = float(cfg.get("retry_delay_sec", 1.0))
         per_group_chars = max(120, int(cfg.get("summary_chars", 150)))
-        # P0-6 并行 map：ThreadPool 代替串行 sleep；限流靠 max_workers 控制并发
+        # P0-6 并行 map：ThreadPool 代替串行 sleep。
+        #
+        # 并发度由 max_workers 控制（默认 2）。这里刻意**不**开满 4：
+        # 中转服务对"短时间内连续多次调用"敏感 —— 一次问答里 map 阶段
+        # 最多打 max_groups(6) 次，再加 reduce 与最终生成，很容易撞上
+        # "连续 6~8 次被限流、返回空串"的阈值。并行度越高越容易触发，
+        # 表现为该段退回原文摘录（答案质量下降但不报错，最难察觉）。
+        #
+        # 旧的 inter_call_delay_sec（串行 sleep 防限流）随并行改造一并移除 ——
+        # 它已无人读取，留着只会让人以为"调它能防限流"。
         import concurrent.futures as _fut
-        max_workers = max(1, min(4, int(cfg.get("max_workers", 4) or 4)))
+        max_workers = max(1, min(8, int(cfg.get("max_workers", 2) or 2)))
 
         def _summarize_one(args):
             idx, group = args
@@ -1753,7 +1903,7 @@ class RAGPipeline:
             return RAGResult(answer=reply, sources=[], raw_hits=[], timings={"llm_total_ms": 0.0})
 
         retrieval_cfg = self.config.get("retrieval", {})
-        k = top_k or retrieval_cfg.get("top_k", 5)
+        k = top_k or retrieval_cfg.get("top_k", DEFAULT_TOP_K)
         # P1 答案级语义缓存：无 history、非流式同问同库直接复用整答（TTFT≈0）。
         _ans_key = None
         if not stream and not history:
@@ -1768,7 +1918,7 @@ class RAGPipeline:
                 _ans_key = None
         # 重排候选数 = max(k, top_n*3)
         if getattr(self, "reranker", None) is not None:
-            initial_k = max(k, retrieval_cfg.get("rerank_candidates", retrieval_cfg.get("top_k", 5) * 3))
+            initial_k = max(k, retrieval_cfg.get("rerank_candidates", retrieval_cfg.get("top_k", DEFAULT_TOP_K) * 3))
         else:
             initial_k = k
 
@@ -1975,7 +2125,7 @@ class RAGPipeline:
                 timings={"llm_total_ms": 0.0, "ttft_ms": 0.0, "tokens_generated": 0, "tokens_per_sec": None},
             )
 
-        k = top_k or retrieval_cfg.get("top_k", 5)
+        k = top_k or retrieval_cfg.get("top_k", DEFAULT_TOP_K)
         if getattr(self, "reranker", None) is not None:
             initial_k = max(k, retrieval_cfg.get("rerank_candidates", k * 3))
         else:
@@ -2137,7 +2287,7 @@ class RAGPipeline:
         - ``error``: 异常
         """
         retrieval_cfg = self.config.get("retrieval", {})
-        k = top_k or retrieval_cfg.get("top_k", 5)
+        k = top_k or retrieval_cfg.get("top_k", DEFAULT_TOP_K)
         history = history or []
 
         # 直连通用问答：跳过路由与检索，直接流式输出 LLM 答案
@@ -2171,6 +2321,29 @@ class RAGPipeline:
             if self.context_assembler.enabled and history
             else question
         )
+
+        # P1 答案级语义缓存（流式路径同样适用）。
+        # 此前只有非流式 answer() 走缓存，而 Web UI 走的是 WS 流式 ——
+        # 意味着"同问同答免二次生成"这个优化在主界面上完全没生效。
+        # 缓存命中时把整段答案切片吐出去，语义与协议保持一致。
+        _ans_key = None
+        if not history:
+            try:
+                _ans_key = self._answer_cache_key(question, k, None, allowed_groups)
+                _cached = self._answer_cache_get(_ans_key)
+                if _cached is not None:
+                    yield {"event": "hits", "data": _cached.sources or []}
+                    for piece in iter_answer_chunks(_cached.answer or ""):
+                        yield {"event": "token", "data": piece}
+                    yield {
+                        "event": "done",
+                        "data": _cached.sources or [],
+                        "verification": _cached.verification,
+                    }
+                    return
+            except Exception:
+                _ans_key = None
+
         hits = self._retrieve(search_query, top_k=k, where=None, allowed_groups=allowed_groups)
         if getattr(self, "reranker", None) is not None:
             hits = self._rerank(question, hits, top_n=k)
@@ -2259,6 +2432,20 @@ class RAGPipeline:
             # Web UI 在 done 时才展示来源；先发送更新后的事件，避免把邻居
             # 回填块全部误显示为答案真正引用的资料。
             yield {"event": "hits", "data": visible_cites}
+        # 写回答案缓存（与非流式路径一致）
+        try:
+            if _ans_key is not None:
+                self._answer_cache_put(
+                    _ans_key,
+                    RAGResult(
+                        answer=answer_text,
+                        sources=visible_cites,
+                        raw_hits=list(hits),
+                        verification=verification,
+                    ),
+                )
+        except Exception:
+            pass
         yield {"event": "done", "data": visible_cites, "verification": verification}
 
     async def astream_answer(

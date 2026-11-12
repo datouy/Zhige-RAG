@@ -484,6 +484,29 @@ class Hit:
     score: float
     metadata: Dict[str, Any]
 
+    @property
+    def fusion_rank(self) -> Optional[int]:
+        """融合名次（RRF 序）。
+
+        混合检索里 ``score`` 的量纲是**混合的**：向量侧是余弦相似度
+        （0~1），关键词侧是 ``s / (1 + s)``（BM25 原始分的压缩），两者
+        不可直接比较。RRF 融合用的是"名次"而不是"分数"，所以排序的真值
+        应该是融合名次，而不是 ``score``。
+
+        融合层会把 ``_fusion_rank`` 写进 metadata；这里做一次防御性读取，
+        没有则返回 None（表示"未参与融合，保持原序"）。
+        """
+        v = self.metadata.get("_fusion_rank")
+        try:
+            return int(v) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    @property
+    def score_kind(self) -> str:
+        """``score`` 的语义类型：``vector`` / ``keyword`` / ``fusion``。"""
+        return str(self.metadata.get("_score_kind") or "vector")
+
     def to_dict(self) -> Dict[str, Any]:
         return {"id": self.id, "text": self.text, "score": self.score, "metadata": self.metadata}
 
@@ -756,9 +779,19 @@ class ChromaStore(BaseVectorStore):
         fused_ids = sorted(rrf, key=lambda cid: -rrf[cid])[: max(1, int(top_k))]
 
         hits: List[Hit] = []
-        for cid in fused_ids:
+        for rank, cid in enumerate(fused_ids):
             if cid in vec_by_id:
-                hits.append(vec_by_id[cid])
+                h = vec_by_id[cid]
+                # 把融合名次与 RRF 分数写进 metadata。
+                # 下游**必须**按 _fusion_rank 排序：score 是混合量纲
+                # （向量余弦 vs BM25 压缩分），按 score 重排会直接推翻
+                # bm25_weight 的保护作用，让关键词命中的无关文档压过
+                # 语义真正相关的片段。
+                md = dict(h.metadata or {})
+                md["_fusion_rank"] = rank
+                md["_fusion_score"] = float(rrf[cid])
+                md.setdefault("_score_kind", "vector")
+                hits.append(Hit(id=h.id, text=h.text, score=h.score, metadata=md))
                 continue
             idx = bm_idx.get(cid)
             if idx is None:
@@ -767,6 +800,8 @@ class ChromaStore(BaseVectorStore):
             md = dict(bm.metadatas[idx] or {})
             # 标注分数类型：这不是余弦相似度，别让界面/调用方当成"相似度"读。
             md["_score_kind"] = "keyword"
+            md["_fusion_rank"] = rank
+            md["_fusion_score"] = float(rrf[cid])
             hits.append(
                 Hit(
                     id=cid,

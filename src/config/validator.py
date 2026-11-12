@@ -101,11 +101,11 @@ class VectorStoreConfig(_StrictModel):
     collection_name: str = Field("chinese_rag_kb", description="集合名称")
     persist_directory: str = Field("data/chroma_db", description="持久化目录")
     distance_fn: str = Field("cosine", description="距离函数")
-    top_k: int = Field(4, ge=1, le=100, description="默认 top-k")
-    fetch_k: int = Field(20, ge=1, le=500, description="获取数量")
+    # 注意：top_k / fetch_k 已从 config.yaml 删除 —— 检索条数的真值只有
+    # retrieval.top_k 一处，这两项从未被任何代码读取（留着会让人误以为能改）。
     filter_metadata: Dict[str, Any] = Field(default_factory=dict)
     hybrid: Dict[str, Any] = Field(default_factory=dict)
-    
+
     @field_validator("distance_fn")
     @classmethod
     def validate_distance_fn(cls, v: str) -> str:
@@ -119,11 +119,11 @@ class VectorStoreConfig(_StrictModel):
 
 class RAGConfig(_StrictModel):
     """RAG 配置模型。"""
-    top_k: int = Field(4, ge=1, le=50, description="检索 top-k")
-    use_reranker: bool = Field(False, description="是否使用重排序")
-    max_context_tokens: int = Field(2000, ge=100, le=64000, description="最大上下文 token 数")
-    max_history_turns: int = Field(0, ge=0, le=10, description="对话历史轮数")
-    score_threshold: float = Field(0.0, ge=0.0, le=1.0, description="相似度阈值")
+    # 注意：top_k / use_reranker / score_threshold 已从 config.yaml 删除 ——
+    # 它们的真值分别在 retrieval.top_k、reranker.enabled、retrieval.score_threshold，
+    # 这三个字段从未被任何代码读取。schema 里也不保留，避免又出现两套默认值。
+    max_context_tokens: int = Field(12000, ge=100, le=64000, description="最大上下文 token 数")
+    max_history_turns: int = Field(3, ge=0, le=10, description="对话历史轮数")
     answer_citations: bool = Field(True, description="是否包含引用")
     return_sources: bool = Field(True, description="是否返回来源")
     fallback_answer: str = Field("抱歉，知识库中未找到相关信息，无法回答该问题。", description="默认回复")
@@ -232,12 +232,20 @@ class TextSplitterConfig(_StrictModel):
 
 
 class RetrievalConfig(_StrictModel):
-    """检索配置。"""
-    top_k: int = Field(4, ge=1, le=50, description="检索 top-k")
+    """检索配置。
+
+    这些默认值与 ``config/config.yaml`` 的 ``retrieval:`` 段**保持一致** ——
+    两套默认值迟早漂移，而漂移的后果是"改了 yaml 没生效"或"没改却被覆盖"。
+    ``tests/test_config_validation.py`` 里有断言守住这份一致性。
+    """
+    top_k: int = Field(8, ge=1, le=50, description="检索 top-k")
     fetch_k: int = Field(24, ge=1, le=100, description="两阶段召回候选数")
-    rerank_candidates: int = Field(12, ge=1, le=100, description="重排候选数")
+    rerank_candidates: int = Field(24, ge=1, le=100, description="重排候选数")
     score_threshold: float = Field(0.0, ge=0.0, le=1.0, description="相似度阈值")
-    min_score: float = Field(0.0, ge=0.0, le=1.0)
+    min_score: float = Field(0.15, ge=0.0, le=1.0, description="语义相似度下限（向量口径）")
+    keyword_min_score: float = Field(
+        0.60, ge=0.0, le=1.0, description="纯关键词召回时的最低分门槛"
+    )
     status_filter: bool = True
     status_filter_fallback: bool = True
     acl_filter: bool = True
@@ -257,7 +265,7 @@ class RetrievalConfig(_StrictModel):
 class RerankerConfig(_StrictModel):
     """重排序配置。"""
     enabled: bool = Field(False, description="是否启用")
-    backend: str = Field("bge", description="bge | d1 | api | auto")
+    backend: str = Field("auto", description="bge | d1 | api | auto")
     model_name: str = Field("BAAI/bge-reranker-base", description="模型名称")
     device: str = Field("cuda", description="设备类型")
     top_n: int = Field(3, ge=1, le=20, description="重排返回数")
@@ -273,10 +281,11 @@ class RerankerConfig(_StrictModel):
 
 class UIConfig(_StrictModel):
     """UI 配置。"""
-    title: str = Field("中文个人知识库 RAG", description="标题")
+    title: str = Field("知阁 · 本地知识库", description="标题")
     page_icon: str = Field("📚", description="页面图标")
     theme: str = Field("light", description="主题")
-    default_top_k: int = Field(4, ge=1, description="默认 top-k")
+    # 仅作为 retrieval.top_k 缺失时的兜底；真正的默认值来源是 retrieval.top_k。
+    default_top_k: int = Field(8, ge=1, description="默认 top-k")
     default_temperature: float = Field(0.2, ge=0.0, le=2.0, description="默认温度")
     show_thinking: bool = Field(False, description="显示思考过程")
     max_upload_mb: int = Field(50, ge=1, description="最大上传大小（MB）")

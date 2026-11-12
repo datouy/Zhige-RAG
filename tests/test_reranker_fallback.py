@@ -11,7 +11,6 @@ from __future__ import annotations
 import sys
 import types
 
-import pytest
 
 from src.reranker import BgeReranker
 
@@ -77,11 +76,17 @@ def test_threshold_is_calibrated_for_cross_encoder():
 
     实测相关提问 ≥0.087、无关提问 ≤0.001；旧值 0.3 是给 FlagEmbedding 的
     归一化分数用的，换到 CrossEncoder 后会把含糊但相关的候选全部误杀。
-    """
-    from src.settings_service import effective_config
 
-    rcfg = effective_config().get("reranker") or {}
-    # The current machine uses the LLM-free ONNX profile: a 3.2 GB cross
+    注意这里读的是**仓库里的 config/config.yaml**，而不是
+    ``effective_config()``：后者会叠加 ``config/local_overrides.yaml``
+    （该文件被 .git 忽略，属于每台机器自己的本地设置）。用 effective_config
+    断言"必须关闭重排"就等于把测试绑死在某一台开发机的本地配置上 ——
+    别人 clone 下来改了本地覆盖，这个测试就挂了，与代码对错无关。
+    """
+    from src.utils import load_config
+
+    rcfg = load_config("config/config.yaml").get("reranker") or {}
+    # The shipped default is the LLM-free ONNX profile: a 3.2 GB cross
     # encoder is disabled so all RAM/VRAM stays available for retrieval/OCR.
     assert rcfg.get("enabled") is False
     assert float(rcfg.get("min_relevance")) <= 0.1

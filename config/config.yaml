@@ -186,10 +186,11 @@ vector_store:
   collection_name: "chinese_rag_kb"
   persist_directory: "data/chroma_db"
   distance_fn: "cosine"
-  top_k: 4
-  fetch_k: 20
   filter_metadata: {}
-  
+  # ⚠️ 这里曾经有 top_k / fetch_k 两个字段，但**从未被任何代码读取** ——
+  # 检索条数的真值只有 retrieval.top_k 一处。留着只会让人以为改这里能生效，
+  # 所以已删除。改召回条数请改 retrieval.top_k / retrieval.fetch_k。
+
   # 混合检索（优化版）
   hybrid:
     enabled: true                 # 必须开启：向量 + BM25 混合
@@ -242,7 +243,11 @@ retrieval:
   fetch_k: 24                    # 两阶段召回候选数（向量+BM25先取fetch_k做RRF融合，再截回top_k）
   rerank_candidates: 24            # 重排候选数（top_k * 3）
   score_threshold: 0.0
-  min_score: 0.15                 # 混合检索分数量纲不一致，降低硬阈值误拒答
+  min_score: 0.15                 # 语义相似度下限（向量口径）：低于此值按未命中处理
+  # 纯关键词召回时的独立门槛（仅当"一个向量命中都没有"时生效）。
+  # 关键词分 s/(1+s) 天然虚高（长文档命中词多就分高），门槛必须更高，
+  # 否则字面沾边但毫不相关的文档会轻松越过 min_score 让系统硬答。
+  keyword_min_score: 0.60
   neighbor_expand: true           # P0-4 small-to-big：命中块前后各补1块，还原文脉
   neighbor_window: 1              # 前后各补几块（1=三连块，2=五连块，上限2防爆炸）
   cache_ttl_seconds: 900          # P1 语义缓存：同问 15min 内直接复用（原15s太短）
@@ -286,7 +291,7 @@ reranker:
   # sentence-transformers，也没有 ~1.1GB 的重排权重。安装 requirements-local.txt
   # 并下载 model_name 后再改为 true，避免“配置显示开启、运行实际停用”的假象。
   enabled: false
-  backend: "bge"                   # bge | d1 | api | auto（auto: 有RERANK_BASE_URL走api→d1→bge）
+  backend: "auto"                   # bge | d1 | api | auto（auto: 有RERANK_BASE_URL走api→d1→bge）
   model_name: "./models/bge-reranker-base"  # backend=api时为在线模型名，如BAAI/bge-reranker-v2-m3
   # P0-5 在线重排：Cohere/硅基流动/DashScope兼容/rerank，密钥优先走环境变量RERANK_API_KEY
   base_url: ""                     # 如 https://api.siliconflow.cn/v1；留空则api/auto回落本地
@@ -362,8 +367,8 @@ decision:
   verify:                         # 用 d1 noul + score 增强答案校验
     enabled: false
 
-  retrieval_sufficiency:          # 用 d1 noul 判定"检索是否足以回答"
-    enabled: false                # 明显不足 → 跳过生成直接拒答（省一次 LLM 调用）
+  retrieval_sufficiency:          # 用 d1 noul 判定"检索是否足以回答"（默认开，受 decision.enabled 总开关门控，extractive 部署不触发）
+    enabled: true                # 明显不足 → 跳过生成直接拒答（省一次 LLM 调用）
     min_probability: 0.25         # P(充分) 低于此值才判为不足（保守，避免误伤）
     max_chunks: 5                 # 判定时最多喂多少片段
 
@@ -441,8 +446,11 @@ llm:
 
 # ------------------ RAG 推理参数 ------------------
 rag:
-  top_k: 8
-  use_reranker: false
+  # ⚠️ 这里曾经有 top_k / use_reranker / score_threshold 三个字段，但
+  # **从未被任何代码读取** —— 检索条数与重排开关的真值分别是
+  # retrieval.top_k 与 reranker.enabled。留着只会让人误以为改这里能生效，
+  # 所以已删除。需要调整请改对应的 retrieval / reranker 段。
+  #
   # 送进 prompt 的上下文预算（token）。原值 1800 ≈ 3600 个中文字符，
   # 一本普通章节（3000~4000 字）都装不满，而且 _build_context 是"先到先得"
   # 扣预算，后面的分块直接丢弃 —— 模型只能看到开头两段，于是只能给出
@@ -450,7 +458,6 @@ rag:
   # 4000 字中文 ≈ 2700 token，12000 给论证、引用和长文档留足余量。
   max_context_tokens: 12000
   max_history_turns: 3
-  score_threshold: 0.0
   answer_citations: true
   return_sources: true
   fallback_answer: "抱歉，知识库中未找到相关信息，无法回答该问题。"
@@ -481,9 +488,9 @@ rag:
     #
     # 实测（当前中转服务 deepseek-v4.1-flash）：
     #   · system + 资料合计 3636 字 → 正常回答；
-    #   · 单次问答里连续 6~8 次摘要调用会被限流（表现为返回空字符串），
-    #     所以真正触发压缩时请保持 inter_call_delay_sec 的间隔。
-    # 换成直连大模型（deepseek 官方 / 本地 7B 以上）后可调到 30000 以上。
+    #   · 单次问答里连续 6~8 次摘要调用会被限流（表现为返回空字符串）。
+    # 所以并发度要压住 —— 用 max_workers 控制（默认 2，最保守）。
+    # 换成直连大模型（deepseek 官方 / 本地 7B 以上）后可调到 4。
     soft_limit_chars: 12000
     # 每个摘要段最多吃多少字符
     group_chars: 4000
@@ -493,8 +500,11 @@ rag:
     summary_chars: 150
     # 摘要之外再附多少块原始分块作为细节（0 = 只给摘要）
     detail_chunks: 0
-    # 分批调用之间的间隔（秒），防限流
-    inter_call_delay_sec: 1.5
+    # map 阶段并发度：同时发起多少个摘要请求。
+    # 中转服务对"短时间内连续多次调用"敏感（超过 6~8 次会限流返回空串），
+    # 调大能压缩耗时，但更容易撞限流 —— 表现为该段退回原文摘录。
+    # 保守起见默认 2；直连大模型可调到 4。
+    max_workers: 2
     # 单段失败后的重试间隔（秒）
     retry_delay_sec: 2.0
 
@@ -548,7 +558,9 @@ ui:
   title: "知阁 · 本地知识库"
   page_icon: "📚"
   theme: "light"
-  default_top_k: 4
+  # 仅作兜底；检索条数的真值是 retrieval.top_k（前端启动时从
+  # GET /api/v1/config/defaults 读取，与后端同源）
+  default_top_k: 8
   default_temperature: 0.2
   show_thinking: false
   max_upload_mb: 50
@@ -579,9 +591,12 @@ knowledge_graph:
     max_relations_per_chunk: 30
     batch_size: 5
   retriever:
+    # 种子实体数（图谱检索的第一跳匹配多少个实体）
     top_k_entities: 5
-    default_hops: 2
+    # 模糊匹配（子串匹配）：中文实体常以简称出现（"阿里巴巴" vs "阿里"），
+    # 关掉会明显掉召回。设为 false 则只做全名精确匹配。
     enable_fuzzy_match: true
   graph_rag:
     enabled: false
+    # 图谱扩展跳数（多跳）
     graph_hops: 2

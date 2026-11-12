@@ -139,7 +139,7 @@ python scripts/backfill_chunk_index.py --write
 | `rag.max_context_tokens` | `12000` | 送进 prompt 的 token 上限；服务窗口小就调低，`mapreduce` 会接管超长部分 |
 | `rag.fulltext_expand.max_documents` | `1` | 总结类问题扩几篇全文。问"对比两章"时调到 2 |
 | `rag.fulltext_expand.max_chars` | `40000` | 扩展的字符护栏，防止误触发时把整库倒进 prompt |
-| `rag.mapreduce.soft_limit_chars` | `6000` | 超过就分段压缩；服务能吃更长就调大 |
-| `rag.mapreduce.detail_chunks` | `8` | 摘要之外附多少块原始细节；`0` = 只给摘要 |
+| `rag.mapreduce.soft_limit_chars` | `12000` | 超过就分段压缩；服务能吃更长就调大 |
+| `rag.mapreduce.detail_chunks` | `0` | 摘要之外附多少块原始细节；`0` = 只给摘要 |
 | `rag.verification.synthesis_aware` | `true` | `false` 恢复旧行为（提炼句也会被判编造） |
 | `retrieval.top_k` | `8` | 候选分块数；检索不准时调大，但会被 `max_context_tokens` 截 |

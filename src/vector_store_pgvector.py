@@ -29,6 +29,74 @@ from .vector_store import BaseVectorStore, Hit, VectorStoreHealthError
 logger = get_logger("vector_store_pgvector")
 
 
+def _where_to_sql(where: Optional[Dict[str, Any]]) -> tuple[str, List[Any]]:
+    """把 Chroma 风格 where 转为 Postgres JSONB SQL。
+
+    支持 build_security_where 产生的全部算子：= / $eq / $ne / $in / $nin /
+    $and / $or。未知算子抛 ValueError（fail-closed，上层转为健康检查错误，
+    绝不静默放行）。
+    """
+    if not where:
+        return "", []
+    if not isinstance(where, dict):
+        raise ValueError(f"非法 where 条件: {where!r}")
+
+    # $and / $or 组合
+    if "$and" in where and len(where) == 1:
+        parts: List[str] = []
+        params: List[Any] = []
+        for c in (where.get("$and") or []):
+            s, p = _where_to_sql(c)
+            if not s:
+                continue
+            parts.append(f"({s})")
+            params.extend(p)
+        return (" AND ".join(parts), params) if parts else ("", [])
+    if "$or" in where and len(where) == 1:
+        parts = []
+        params = []
+        for c in (where.get("$or") or []):
+            s, p = _where_to_sql(c)
+            if not s:
+                continue
+            parts.append(f"({s})")
+            params.extend(p)
+        return (" OR ".join(parts), params) if parts else ("", [])
+
+    parts = []
+    params = []
+    for key, cond in where.items():
+        if key.startswith("$"):
+            raise ValueError(f"pgvector 不支持的顶层算子: {key}")
+        col = f"metadata->>'{key}'"
+        if isinstance(cond, dict):
+            if len(cond) != 1:
+                raise ValueError(f"pgvector 不支持的复合条件: {key}={cond!r}")
+            op, operand = next(iter(cond.items()))
+            if op == "$eq":
+                parts.append(f"{col} = %s")
+                params.append(str(operand))
+            elif op == "$ne":
+                parts.append(f"{col} != %s")
+                params.append(str(operand))
+            elif op == "$in":
+                if not isinstance(operand, (list, tuple, set)):
+                    raise ValueError(f"$in 需要列表: {key}={cond!r}")
+                parts.append(f"{col} = ANY(%s)")
+                params.append(list(map(str, operand)))
+            elif op == "$nin":
+                if not isinstance(operand, (list, tuple, set)):
+                    raise ValueError(f"$nin 需要列表: {key}={cond!r}")
+                parts.append(f"NOT ({col} = ANY(%s))")
+                params.append(list(map(str, operand)))
+            else:
+                raise ValueError(f"pgvector 不支持的算子 {op}: {key}")
+        else:
+            parts.append(f"{col} = %s")
+            params.append(str(cond))
+    return (" AND ".join(parts), params)
+
+
 class PgVectorStore(BaseVectorStore):
     """Postgres + pgvector 实现的向量库。"""
 
@@ -115,21 +183,13 @@ class PgVectorStore(BaseVectorStore):
         if self.embedding_model is None:
             raise RuntimeError("当前未配置 embedding 模型，无法进行语义检索")
         qv = self.embedding_model.encode([query_text], batch_size=1).tolist()[0]
-        conds: List[str] = []
+        where_sql, where_params = _where_to_sql(where)
         params: List[Any] = [list(map(float, qv))]
-        if where:
-            src = (where.get("source") if isinstance(where, dict) else None)
-            if isinstance(src, dict):
-                if "$eq" in src:
-                    conds.append("metadata->>'source' = %s")
-                    params.append(str(src["$eq"]))
-                elif "$in" in src and isinstance(src["$in"], (list, tuple)):
-                    conds.append("metadata->>'source' = ANY(%s)")
-                    params.append(list(map(str, src["$in"])))
         sql = f"SELECT id, text, metadata, embedding <=> %s::vector AS dist FROM {self.table}"
         params.append(list(map(float, qv)))
-        if conds:
-            sql += " WHERE " + " AND ".join(conds)
+        if where_sql:
+            sql += f" WHERE {where_sql}"
+            params.extend(where_params)
         sql += f" ORDER BY dist ASC LIMIT {max(1, int(top_k))}"
         hits: List[Hit] = []
         with self._connect() as conn, conn.cursor() as cur:
@@ -156,16 +216,11 @@ class PgVectorStore(BaseVectorStore):
     def delete_by_metadata(self, where: Dict[str, Any]) -> int:
         if not where:
             raise ValueError("where 条件不能为空，避免误删")
-        src = (where.get("source") if isinstance(where, dict) else None)
+        where_sql, where_params = _where_to_sql(where)
+        if not where_sql:
+            raise ValueError("where 条件不能为空，避免误删")
         with self._connect() as conn, conn.cursor() as cur:
-            if isinstance(src, dict) and "$in" in src:
-                cur.execute(f"DELETE FROM {self.table} WHERE metadata->>'source' = ANY(%s)", (list(map(str, src["$in"])),))
-            elif isinstance(src, dict) and "$eq" in src:
-                cur.execute(f"DELETE FROM {self.table} WHERE metadata->>'source' = %s", (str(src["$eq"]),))
-            elif isinstance(src, str):
-                cur.execute(f"DELETE FROM {self.table} WHERE metadata->>'source' = %s", (src,))
-            else:
-                raise ValueError("pgvector 仅支持 source 等值/in 删除")
+            cur.execute(f"DELETE FROM {self.table} WHERE {where_sql}", tuple(where_params))
             return int(cur.rowcount or 0)
 
     def count(self) -> int:
