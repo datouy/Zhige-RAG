@@ -3,13 +3,9 @@
 from __future__ import annotations
 
 import json
-import os
-import sqlite3
 import sys
-import tempfile
-import types
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Dict, List
 from unittest.mock import MagicMock
 
 import pytest
@@ -23,14 +19,11 @@ from src.kg import (  # noqa: E402
     GraphRAG,
     GraphRetriever,
     KGExtractor,
-    KGStore,
-    Neo4jStore,
     Relation,
     SQLiteGraphStore,
     Triple,
     create_kg_store,
 )
-from src.kg.schema import Triple as SchemaTriple  # noqa: E402
 
 
 # ------------------------- helpers -------------------------

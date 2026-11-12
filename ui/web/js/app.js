@@ -214,9 +214,29 @@ class ChatApp {
     /** 进入主界面：拉知识库、会话，并建立 WS */
     async bootstrap() {
         this.el['app-layout'].hidden = false;
+        await this.loadDefaults();
         await this.loadKnowledgeBases();
         await this.loadSessions();
         this.connectWebSocket();
+    }
+
+    /**
+     * 从后端读取生效的默认值（检索条数等）。
+     *
+     * 为什么必须读而不是前端写死：top_k 的真值只有 `retrieval.top_k` 一处，
+     * 前端硬编码 8、后端请求体默认 4，三者互相矛盾 —— 用户改 config.yaml
+     * 对界面毫无影响。改成同源后，界面与 API 用同一套值。
+     */
+    async loadDefaults() {
+        try {
+            const d = await this.api('/config/defaults');
+            if (d && Number.isFinite(d.top_k) && d.top_k > 0) {
+                this.topK = d.top_k;
+            }
+        } catch (e) {
+            // 后端不可用时保留构造函数的默认值，不阻断启动
+            console.warn('读取后端默认值失败，沿用默认 top_k:', e);
+        }
     }
 
     // ================= 知识库 =================

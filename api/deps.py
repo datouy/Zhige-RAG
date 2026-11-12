@@ -376,7 +376,12 @@ def get_kg_retriever():
     if _kg_retriever is None:
         with _kg_lock:
             if _kg_retriever is None:
-                _kg_retriever = GraphRetriever(get_kg_store())
+                kg_cfg = _load_kg_config()
+                retriever_cfg = kg_cfg.get("retriever", {}) or {}
+                _kg_retriever = GraphRetriever(
+                    get_kg_store(),
+                    enable_fuzzy_match=bool(retriever_cfg.get("enable_fuzzy_match", True)),
+                )
     return _kg_retriever
 
 

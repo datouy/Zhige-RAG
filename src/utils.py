@@ -300,33 +300,6 @@ def file_md5(path: str | Path, chunk_size: int = 65536) -> str:
 
 
 # ----------------------------------------------------------------------
-#  环境变量加载（简易 .env）
-# ----------------------------------------------------------------------
-def load_env_file(env_path: str | Path = ".env", override: bool = False) -> None:
-    """加载 .env 文件到环境变量（不依赖 python-dotenv）。
-
-    Args:
-        env_path: .env 文件路径。
-        override: 是否覆盖已有环境变量。
-    """
-    path = resolve_path(env_path)
-    if not path.exists():
-        return
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if "=" not in line:
-            continue
-        key, _, value = line.partition("=")
-        key = key.strip()
-        value = value.strip().strip('"').strip("'")
-        if not override and key in os.environ:
-            continue
-        os.environ[key] = value
-
-
-# ----------------------------------------------------------------------
 #  配置加载
 # ----------------------------------------------------------------------
 # config.yaml 中形如 ${VAR} 或 ${VAR:-default} 的占位符，在加载时用

@@ -34,12 +34,12 @@ class _FakePipeline:
     # chat 路由会探测长期记忆存储；None = 不可用，路由须容忍
     long_term_store = None
 
-    def answer(self, question, top_k=None, where=None, stream=False, history=None, user_id=None, allowed_groups=None):
+    def answer(self, question, top_k=None, where=None, stream=False, history=None, user_id=None, allowed_groups=None, direct=False):
         from src.rag_pipeline import RAGResult
 
         return RAGResult(answer="测试回答", sources=[], raw_hits=[], timings={})
 
-    async def astream_answer(self, question, top_k=None, history=None, user_id=None, allowed_groups=None):
+    async def astream_answer(self, question, top_k=None, history=None, user_id=None, allowed_groups=None, direct=False):
         yield {"event": "hits", "data": []}
         yield {"event": "token", "data": "测试"}
         yield {"event": "token", "data": "回答"}

@@ -124,7 +124,7 @@ def test_pdf_without_outline_still_enriches(tmp_path):
     """无书签 PDF 应优雅退化（无章节路径），不报错、不改变旧行为。"""
     import pytest
 
-    pypdf = pytest.importorskip("pypdf")
+    pytest.importorskip("pypdf")
     from pypdf import PdfWriter
 
     pdf_path = tmp_path / "plain.pdf"
@@ -146,7 +146,7 @@ def test_pdf_outline_paths_hierarchical(tmp_path):
     """带书签 PDF 应还原章节层级，且页码区间向后继承。"""
     import pytest
 
-    pypdf = pytest.importorskip("pypdf")
+    pytest.importorskip("pypdf")
     from pypdf import PdfWriter
 
     w = PdfWriter()

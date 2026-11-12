@@ -12,7 +12,6 @@
 
 from __future__ import annotations
 
-import json
 import shutil
 import tempfile
 import unittest
@@ -27,7 +26,6 @@ if str(ROOT) not in sys.path:
 from scripts.version_manager import (
     compute_diff,
     get_version_detail,
-    list_all_documents,
     list_versions,
     prune_versions,
     save_version,

@@ -6,9 +6,19 @@ on:
   pull_request:
     branches: [main]
 
+# 整条流水线最长 20 分钟。GitHub 默认 6 小时 —— 一个卡死的测试就能把
+# 流水线挂 6 小时，占住并发额度且没人看得住。
+# （本仓库此前就出现过 WS 测试挂死的情况，CI 会一直转圈直到超时。）
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     runs-on: ubuntu-latest
+    # 单个 job 的硬超时。测试正常跑完约 40 秒，给 15 分钟足够宽松；
+    # 真挂死时 15 分钟后 job 被杀掉，CI 会明确失败而不是无限等待。
+    timeout-minutes: 15
 
     steps:
       - name: Checkout code
@@ -34,14 +44,18 @@ jobs:
           # 项目对重依赖是惰性导入，装了只会显著拖慢流水线。
           pip install -r requirements-core.txt
           pip install -r requirements-dev.txt
+          # 文档解析的可选依赖：测试里用 importorskip 探测，不装就跳过，
+          # 装了才能真正跑到 docx/pdf 的解析分支（此前 CI 上这些测试恒被跳过，
+          # 相当于文档解析路径在 CI 里完全没有覆盖）。
+          pip install -r requirements-parse-test.txt
 
       - name: Run linter
         run: |
-          ruff check src/ api/ --output-format=concise
+          ruff check src/ api/ scripts/ tests/ ui/ --output-format=concise
 
       - name: Check syntax
         run: |
-          python -m compileall -q src api scripts tests
+          python -m compileall -q src api scripts tests ui
 
       - name: Verify database migrations
         run: |
@@ -53,13 +67,23 @@ jobs:
 
       - name: Eval regression gate (retrieval-only, 0.8/0.7/1500ms)
         # P1 评估门禁：差评导出评估集后，CI 用阈值卡死回归。
-        # 空库冷启时检索命中为 0 属预期，故 continue-on-error 只告警不卡死；
-        # 有数据（自带 runner 挂载 data/chroma_db）的环境把 continue-on-error
-        # 去掉即变硬门禁：--min-hit-rate 0.8 --min-ndcg 0.7 --max-p95 1500。
-        continue-on-error: true
+        #
+        # 硬化的部分：此前这条命令后面跟着一个"失败也只告警"的兜底，
+        # 无论门禁是否通过，**这一步永远是绿的** —— 门禁形同虚设，
+        # 评估指标退化几个月都不会有人知道。
+        # 现在改为：evaluate.py 自己以退出码表达成败，CI 直接让它决定成败；
+        # 只有"评估集为空"（空库冷启，属预期）才降级为警告。
+        #
+        # 有数据（自带 runner 挂载 data/chroma_db）的环境可以把
+        # --allow-empty-eval 去掉，变成完全硬门禁。
         run: |
-          pytest tests/test_evaluate_thresholds.py -v --tb=short
-          python scripts/evaluate.py --retrieval-only --min-hit-rate 0.8 --min-ndcg 0.7 --max-p95-latency-ms 1500 --no-archive || echo "::warning::eval gate未通过，请查看 data/eval/report.json（差评转 eval 见 POST /api/v1/eval/export-feedback）"
+          python scripts/evaluate.py \
+            --retrieval-only \
+            --min-hit-rate 0.8 \
+            --min-ndcg 0.7 \
+            --max-p95-latency-ms 1500 \
+            --allow-empty-eval \
+            --no-archive
 
       - name: Test imports
         run: |

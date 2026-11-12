@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import streamlit as st
 
 from src.kg import KGExtractor, GraphRAG, GraphRetriever, create_kg_store
-from src.utils import get_logger, load_config, resolve_path
+from src.utils import get_logger, load_config
 
 logger = get_logger("ui.kg")
 
@@ -29,12 +28,16 @@ def _get_kg_store_cached(_cfg_hash: int = 0):
 
 @st.cache_resource(show_spinner=False)
 def _get_kg_retriever():
-    return GraphRetriever(_get_kg_store())
+    cfg = load_config("config/config.yaml")
+    retriever_cfg = (cfg.get("knowledge_graph", {}) or {}).get("retriever", {}) or {}
+    return GraphRetriever(
+        _get_kg_store(),
+        enable_fuzzy_match=bool(retriever_cfg.get("enable_fuzzy_match", True)),
+    )
 
 
 @st.cache_resource(show_spinner=False)
 def _get_kg_extractor():
-    from src.llm import LocalLLM
     from src.rag_pipeline import RAGPipeline
 
     try:
@@ -75,7 +78,7 @@ def _get_graph_rag():
             **hybrid_kwargs(cfg.get("vector_store", {})),
         )
         kg_store = _get_kg_store()
-        retriever = GraphRetriever(kg_store)
+        retriever = _get_kg_retriever()
         extractor = _get_kg_extractor()
         try:
             pipeline = RAGPipeline.from_config("config/config.yaml", lazy_llm=False)

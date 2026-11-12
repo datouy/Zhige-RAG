@@ -1,0 +1,33 @@
+# ============================================================
+# CI 用的文档解析测试依赖
+# ============================================================
+#     pip install -r requirements-parse-test.txt
+#
+# 为什么要单独一份：完整的 requirements-optional.txt 里含 streamlit / plotly /
+# kaleido / FlagEmbedding，对 CI 来说体积过大且毫无用处（尤其 FlagEmbedding 会
+# 拖进 torch，几百 MB 到 2GB）。
+#
+# 而**不装**它们的代价是：tests/test_document_loader.py 与
+# tests/test_document_meta.py 里的 docx / pdf / pptx 解析用例全部被
+# `pytest.importorskip` 跳过 —— 文档解析这条最脏最易碎的路径，在 CI 里
+# 实际上**一行都没跑过**。出问题只能等用户上传文件时才发现。
+#
+# 这里只装纯解析所需的轻量库（无 torch / 无 streamlit），
+# 让 CI 真正覆盖 docx / pdf / xlsx / pptx 的解析分支。
+# ============================================================
+
+# ---------- Word ----------
+python-docx>=1.1.0
+
+# ---------- PDF ----------
+pdfplumber>=0.10.0,<0.11.8   # 0.11.8+ requires Pillow 12; keep Streamlit-compatible
+pypdf>=4.0.0
+
+# ---------- Excel / PowerPoint ----------
+openpyxl>=3.1.0
+python-pptx>=0.6.21
+
+# ---------- Markdown / HTML ----------
+markdown>=3.6
+beautifulsoup4>=4.12.0
+lxml>=4.9.0

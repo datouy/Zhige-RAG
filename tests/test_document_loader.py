@@ -53,7 +53,7 @@ def test_load_unknown_ext_returns_empty(tmp_path):
 
 def test_load_docx_if_available(tmp_path):
     """若安装了 python-docx，写一个最小 docx 验证解析。"""
-    docx = pytest.importorskip("docx")
+    pytest.importorskip("docx")
     from docx import Document  # type: ignore
 
     d = Document()
@@ -86,10 +86,7 @@ def test_load_pdf_if_available(tmp_path):
     writer = PdfWriter()
     writer.add_blank_page(width=200, height=200)
     
-    # 添加文本（使用 pypdf 的简单方式）
-    from pypdf.generic import TextStringObject
-    page = writer.pages[0]
-    # 注意：pypdf 不直接支持添加文本，但我们可以测试空白 PDF 解析
+    # 注意：pypdf 不直接支持添加文本，这里只构造空白页验证 pdfplumber 能打开它
     # 对于完整测试，我们只验证 pdfplumber 能打开它
     
     with open(pdf_path, "wb") as f:

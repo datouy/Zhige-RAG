@@ -384,7 +384,7 @@ class ReActAgent:
                 for piece in self._yield_tokens(end.strip()):
                     yield {"event": "token", "data": piece}
             yield {"event": "done", "data": {"steps": steps, "tools_used": tools_used, "answer": end.strip(), "truncated": True}}
-        except Exception as exc:
+        except Exception:
             logger.exception("FC链路失败回退文本ReAct")
             yield from self._run_text_react(query, stream=stream)
             return

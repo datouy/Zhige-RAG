@@ -510,7 +510,7 @@ async def get_metrics(current_user: User = Depends(get_current_user)):
                 "system": system_metrics,
                 "prometheus_endpoint": "/api/metrics",
             }
-        from scripts.monitoring.metrics import MetricsCollector
+        from src.monitoring.custom_metrics import MetricsCollector
 
         custom_metrics = MetricsCollector.get_instance().get_summary()
         return {
@@ -538,3 +538,33 @@ async def get_user_config(current_user: User = Depends(get_current_user)) -> Dic
     except Exception as exc:
         logger.error("获取配置失败: %s", exc)
         raise HTTPException(status_code=500, detail="获取配置失败")
+
+
+@router.get("/api/v1/config/defaults", tags=["系统"])
+async def get_config_defaults(current_user: User = Depends(get_current_user)) -> Dict[str, Any]:
+    """前端启动时读取的**有效默认值**（脱敏）。
+
+    为什么需要这个端点：检索条数 ``top_k`` 的真值只存在于
+    ``retrieval.top_k`` 一处，但前端此前把它硬编码成 8、后端请求体默认 4，
+    三者互相矛盾 —— 用户改 ``config.yaml`` 对前端界面毫无影响。
+    这里把"当前生效的默认值"作为唯一出口暴露给前端，界面与 API 用同一套值。
+
+    返回的 ``top_k`` 已经过 API 侧允许范围（1~50）的裁剪。
+    """
+    try:
+        cfg = get_runtime_config()
+        retrieval = cfg.get("retrieval") or {}
+        ui = cfg.get("ui") or {}
+        top_k = int(retrieval.get("top_k", ui.get("default_top_k", 8)) or 8)
+        return {
+            "top_k": max(1, min(50, top_k)),
+            "default_top_k": max(1, min(50, int(ui.get("default_top_k", top_k) or top_k))),
+            "max_upload_mb": int(ui.get("max_upload_mb", 50) or 50),
+            "llm_backend": (cfg.get("llm") or {}).get("backend", "extractive"),
+            "embedding_backend": (cfg.get("embedding") or {}).get("backend", "onnx"),
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        logger.error("获取默认配置失败: %s", exc)
+        raise HTTPException(status_code=500, detail="获取默认配置失败")

@@ -11,9 +11,18 @@ from src.kg.store import KGStore
 class GraphRetriever:
     """Retrieve subgraph via entity matching and multi-hop expansion."""
 
-    def __init__(self, store: KGStore, embedding_model=None) -> None:
+    def __init__(
+        self,
+        store: KGStore,
+        embedding_model=None,
+        enable_fuzzy_match: bool = True,
+    ) -> None:
         self.store = store
         self.embedding = embedding_model
+        # 模糊匹配（子串 LIKE / CONTAINS）：中文实体名常以简称或部分词出现
+        # （"阿里巴巴" vs "阿里"），关掉会明显掉召回。
+        # 由 knowledge_graph.retriever.enable_fuzzy_match 配置控制。
+        self.enable_fuzzy_match = enable_fuzzy_match
 
     def search(
         self,
@@ -103,7 +112,9 @@ class GraphRetriever:
         return self.store.query_cypher(cypher, params)
 
     def _resolve_query(self, query: str, top_k_entities: int = 5) -> Tuple[List[Entity], List[Relation]]:
-        candidates = self.store.find_entities_by_name(query, fuzzy=True, limit=top_k_entities)
+        candidates = self.store.find_entities_by_name(
+            query, fuzzy=self.enable_fuzzy_match, limit=top_k_entities
+        )
         entities: List[Entity] = []
         relations: List[Relation] = []
         for e in candidates:

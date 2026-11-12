@@ -33,14 +33,14 @@ def test_custom_dict():
     words = load_custom_dict_from_file(dict_path)
     
     print(f"成功加载 {len(words)} 个自定义词汇")
-    print(f"\n前 20 个词汇示例:")
+    print("\n前 20 个词汇示例:")
     for i, word in enumerate(words[:20], 1):
         print(f"  {i:2d}. {word}")
     
     if len(words) > 20:
         print(f"  ... 还有 {len(words) - 20} 个词")
     
-    print(f"\n词典加载测试通过")
+    print("\n词典加载测试通过")
     return words
 
 
@@ -82,12 +82,12 @@ def test_splitter_with_dict():
     print(f"不带词典分块数: {len(chunks_no_dict)}")
     print(f"带词典分块数: {len(chunks_with_dict)}")
     
-    print(f"\n带词典的第一个分块:")
-    print(f"-" * 80)
+    print("\n带词典的第一个分块:")
+    print("-" * 80)
     print(chunks_with_dict[0].text[:300] if chunks_with_dict else "无分块")
-    print(f"-" * 80)
+    print("-" * 80)
     
-    print(f"\n分块测试通过")
+    print("\n分块测试通过")
     return chunks_with_dict
 
 
@@ -113,13 +113,13 @@ def test_config_loading():
         status = "[OK]" if value == expected else "[WARN]"
         print(f"  {status} {name}: {value} (期望: {expected})")
     
-    print(f"\n自定义分隔符:")
+    print("\n自定义分隔符:")
     separators = config["text_splitter"].get("chinese_separators", [])
     for i, sep in enumerate(separators[:8], 1):
         display_sep = repr(sep) if sep in ["\n\n", "\n", " "] else sep
         print(f"  {i}. {display_sep}")
     
-    print(f"\n配置加载测试通过")
+    print("\n配置加载测试通过")
     return config
 
 
@@ -159,25 +159,25 @@ def test_chunk_quality_metrics():
     proper_endings = sum(1 for c in chunks if c.text.rstrip()[-1] in end_punctuation if c.text)
     proper_ending_ratio = proper_endings / len(chunks) if chunks else 0
     
-    print(f"分块统计:")
+    print("分块统计:")
     print(f"  总分块数: {len(chunks)}")
     print(f"  平均长度: {avg_length:.1f} 字符")
     print(f"  最小长度: {min_length} 字符")
     print(f"  最大长度: {max_length} 字符")
     print(f"  语义完整性: {proper_ending_ratio*100:.1f}% (以标点结尾)")
     
-    print(f"\n质量评估:")
+    print("\n质量评估:")
     if 300 <= avg_length <= 500:
-        print(f"  [OK] 平均长度合理 (推荐 300-500)")
+        print("  [OK] 平均长度合理 (推荐 300-500)")
     else:
-        print(f"  [WARN] 平均长度可能需要调整")
+        print("  [WARN] 平均长度可能需要调整")
     
     if proper_ending_ratio >= 0.7:
-        print(f"  [OK] 语义完整性良好")
+        print("  [OK] 语义完整性良好")
     else:
-        print(f"  [WARN] 部分分块可能在句中截断")
+        print("  [WARN] 部分分块可能在句中截断")
     
-    print(f"\n质量指标测试完成")
+    print("\n质量指标测试完成")
 
 
 def main():

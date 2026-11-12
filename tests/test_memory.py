@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import time
 
 import pytest
 from sqlalchemy import create_engine

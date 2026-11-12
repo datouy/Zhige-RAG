@@ -14,7 +14,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, Optional
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -23,7 +23,7 @@ from src.document_loader import load_directory  # noqa: E402
 from src.kg import KGExtractor, create_kg_store  # noqa: E402
 from src.llm import LocalLLM  # noqa: E402
 from src.text_splitter import ChineseTextSplitter, RecursiveTextSplitter  # noqa: E402
-from src.utils import ensure_dir, get_logger, load_config, resolve_path  # noqa: E402
+from src.utils import get_logger, load_config, resolve_path  # noqa: E402
 
 logger = get_logger("build_kg")
 

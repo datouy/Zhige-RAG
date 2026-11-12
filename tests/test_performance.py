@@ -10,15 +10,11 @@
 """
 from __future__ import annotations
 
-import io
 import os
 import sys
 import time
-import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Callable, Generator
-from unittest.mock import MagicMock
 
 import pytest
 from sqlalchemy import text
@@ -130,7 +126,7 @@ class TestConcurrentRequests:
                 load_tester.record("/api/health", duration_ms, status_code, error)
 
         summary = load_tester.summary()
-        print(f"\n健康检查并发测试结果:")
+        print("\n健康检查并发测试结果:")
         print(f"  总请求数: {summary['total_requests']}")
         print(f"  成功: {summary['successful']}, 失败: {summary['failed']}")
         print(f"  平均延迟: {summary['avg_duration_ms']:.2f}ms")
@@ -167,7 +163,7 @@ class TestConcurrentRequests:
                 load_tester.record("/api/v1/search", duration_ms, status_code, error)
 
         summary = load_tester.summary()
-        print(f"\n搜索并发测试结果:")
+        print("\n搜索并发测试结果:")
         print(f"  总请求数: {summary['total_requests']}")
         print(f"  成功: {summary['successful']}, 失败: {summary['failed']}")
         print(f"  平均延迟: {summary['avg_duration_ms']:.2f}ms")
@@ -184,7 +180,6 @@ class TestConcurrentRequests:
         duration_seconds = 10
 
         start_time = time.time()
-        request_times: list[tuple[float, float, int, str]] = []
 
         def make_request():
             req_start = time.time()
@@ -212,7 +207,7 @@ class TestConcurrentRequests:
         summary = load_tester.summary()
         summary["elapsed_seconds"] = elapsed
 
-        print(f"\n持续负载测试结果:")
+        print("\n持续负载测试结果:")
         print(f"  总请求数: {summary['total_requests']}")
         print(f"  实际耗时: {elapsed:.2f}秒")
         print(f"  吞吐量: {summary['requests_per_second']:.2f} req/s")
@@ -312,7 +307,7 @@ class TestLargeDocumentIngestion:
                 "chunks_per_sec": chunks_per_sec,
             })
 
-        print(f"\n入库吞吐量测试:")
+        print("\n入库吞吐量测试:")
         for r in results:
             print(f"  {r['size_mb']}MB: {r['total_time_sec']:.2f}秒, "
                   f"{r['throughput_mb_per_sec']:.2f} MB/s, "
@@ -341,7 +336,7 @@ class TestResponseTimeBenchmarks:
                 latencies.append(latency_ms)
                 assert response.status_code == 200
 
-        print(f"\n健康检查延迟基准:")
+        print("\n健康检查延迟基准:")
         print(f"  P50: {sorted(latencies)[len(latencies)//2]:.2f}ms")
         print(f"  P95: {sorted(latencies)[int(len(latencies)*0.95)]:.2f}ms")
         print(f"  P99: {sorted(latencies)[int(len(latencies)*0.99)]:.2f}ms")
@@ -358,14 +353,14 @@ class TestResponseTimeBenchmarks:
         with TestClient(app) as client:
             for query in queries * 5:
                 start = time.time()
-                response = client.post(
+                client.post(
                     "/api/v1/search",
                     json={"query": query, "top_k": 4}
                 )
                 latency_ms = (time.time() - start) * 1000
                 latencies.append(latency_ms)
 
-        print(f"\n搜索端点延迟基准:")
+        print("\n搜索端点延迟基准:")
         print(f"  P50: {sorted(latencies)[len(latencies)//2]:.2f}ms")
         print(f"  P95: {sorted(latencies)[int(len(latencies)*0.95)]:.2f}ms")
         print(f"  P99: {sorted(latencies)[int(len(latencies)*0.99)]:.2f}ms")
@@ -392,7 +387,7 @@ class TestMemoryUsage:
             chunks = splitter.split_text(text, metadata={"source": f"doc_{i}"})
             all_chunks.extend(chunks)
 
-        print(f"\n分块累积测试:")
+        print("\n分块累积测试:")
         print(f"  文档数: {num_docs}")
         print(f"  每个文档大小: {doc_size_kb}KB")
         print(f"  总分块数: {len(all_chunks)}")
@@ -422,7 +417,7 @@ class TestDatabasePerformance:
                 db.close()
             latencies.append((time.time() - start) * 1000)
 
-        print(f"\n数据库连接池性能:")
+        print("\n数据库连接池性能:")
         print(f"  查询数: {num_queries}")
         print(f"  平均延迟: {sum(latencies)/len(latencies):.2f}ms")
         print(f"  P95 延迟: {sorted(latencies)[int(len(latencies)*0.95)]:.2f}ms")
@@ -448,7 +443,7 @@ class TestDatabasePerformance:
             futures = [executor.submit(query_db) for _ in range(num_queries)]
             latencies = [f.result() for f in as_completed(futures)]
 
-        print(f"\n并发数据库查询:")
+        print("\n并发数据库查询:")
         print(f"  查询数: {num_queries}")
         print(f"  平均延迟: {sum(latencies)/len(latencies):.2f}ms")
         print(f"  最大延迟: {max(latencies):.2f}ms")

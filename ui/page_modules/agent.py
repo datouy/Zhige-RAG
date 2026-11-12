@@ -14,7 +14,7 @@ UI 行为：
 from __future__ import annotations
 
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from src.utils import get_logger
 
@@ -29,7 +29,6 @@ def _get_agent_for_ui(cfg: dict):
         return globals()["_REACT_AGENT_SINGLETON"]
 
     from src.agent import BuiltinTools, ReActAgent
-    from src.embeddings import EmbeddingModel
     from src.utils import apply_env_overrides, load_config
     from src.vector_store import ChromaStore, hybrid_kwargs
 
@@ -60,7 +59,6 @@ def _get_agent_for_ui(cfg: dict):
     # LLM：与 RAG 流水线共享，避免内存翻倍
     # 关键修复：从 ui._pipeline 导入（独立模块），绝不 import ui.app
     # 否则 streamlit rerun 时会重新执行 ui.app.py，触发 set_page_config 重复调用报错。
-    import streamlit as st
     try:
         from ui._pipeline import load_pipeline
         pipeline = load_pipeline("config/config.yaml")

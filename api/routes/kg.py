@@ -87,7 +87,12 @@ def _get_user_kg_store(user_id: str):
 
 
 def _get_user_kg_retriever(user_id: str):
-    return GraphRetriever(_get_user_kg_store(user_id))
+    cfg = get_runtime_config()
+    retriever_cfg = (cfg.get("knowledge_graph", {}) or {}).get("retriever", {}) or {}
+    return GraphRetriever(
+        _get_user_kg_store(user_id),
+        enable_fuzzy_match=bool(retriever_cfg.get("enable_fuzzy_match", True)),
+    )
 
 
 @router.get("/api/v1/kg/stats", tags=["知识图谱"])
@@ -380,7 +385,7 @@ async def kg_graph_rag(
         cfg_full = get_runtime_config()
         vs = TenantAwareFactory.get_chroma_store(user.id, cfg_full)
         kg_store = _get_user_kg_store(user.id)
-        kg_retriever = GraphRetriever(kg_store)
+        kg_retriever = _get_user_kg_retriever(user.id)
         try:
             # P5 审计修复：复用全局单例 pipeline，不再每请求 from_config 重建
             pipeline = get_runtime_pipeline(user_id=user.id)

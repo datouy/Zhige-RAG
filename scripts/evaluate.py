@@ -588,6 +588,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--synthesize-from", default="data/raw/rag-intro.md", help="合成使用的 markdown")
     p.add_argument("--no-archive", action="store_true", help="不写历史存档")
+    p.add_argument(
+        "--allow-empty-eval",
+        action="store_true",
+        help=(
+            "评估集为空时返回 0（仅告警）而不是 1。"
+            "空库冷启属预期，此时指标无从谈起，不应把 CI 卡死；"
+            "但**指标不达标**仍然返回 1 —— 门禁只对'没有数据'宽容。"
+        ),
+    )
     p.add_argument("--min-samples", type=int, default=0, help="CI：最少样本数")
     p.add_argument("--min-hit-rate", type=float, default=None, help="CI：最低检索命中率")
     p.add_argument("--min-ndcg", type=float, default=None, help="CI：最低 NDCG@5")
@@ -602,8 +611,10 @@ def main():
     cfg = load_config(args.config)
     cfg = apply_env_overrides(cfg)
     if args.top_k:
+        # 只写 retrieval.top_k —— top_k 的唯一真值来源。
+        # 此前还会写 rag.top_k，而该字段既从未被读取、也已从 config.yaml 删除
+        # （schema 是 extra="forbid"，多写这个键会让配置校验直接失败）。
         cfg.setdefault("retrieval", {})["top_k"] = args.top_k
-        cfg.setdefault("rag", {})["top_k"] = args.top_k
 
     dataset_path = Path(args.dataset or cfg.get("evaluation", {}).get("dataset_path", "data/eval/eval_set.jsonl"))
     dataset_path = resolve_path(dataset_path)
@@ -616,6 +627,17 @@ def main():
 
     items = load_eval_dataset(dataset_path)
     if not items:
+        if args.allow_empty_eval:
+            # 空评估集：空库冷启属预期，指标无从谈起。
+            # 明确告警并以 0 退出 —— 但注意这只针对"没有数据"，
+            # 指标不达标仍然是硬失败。
+            logger.warning(
+                "评估集为空或不存在（%s），已跳过评估（--allow-empty-eval）。"
+                "本次不产生任何质量结论。",
+                dataset_path,
+            )
+            print("::warning::评估集为空，本次评估已跳过（无质量结论）")
+            return 0
         logger.error("评估集为空或不存在：%s", dataset_path)
         return 1
 

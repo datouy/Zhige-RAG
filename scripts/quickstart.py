@@ -145,7 +145,7 @@ def check_deps(interpreter: Path, auto_install: bool, assume_yes: bool) -> bool:
 
     if not auto_install:
         say("  ", "处理方式：")
-        say("  ", f"  ① 自动安装：python scripts\\quickstart.py --install")
+        say("  ", "  ① 自动安装：python scripts\\quickstart.py --install")
         say("  ", "  ② 手动安装：pip install -r requirements-core.txt")
         return False
 

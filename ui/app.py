@@ -6,7 +6,6 @@
 
 from __future__ import annotations
 
-import os
 import sys
 import json
 import time
@@ -30,14 +29,12 @@ from src.data_quality import run_data_pipeline
 from src.document_loader import load_document
 from src.document_meta import enrich_directory, enrich_file
 from src.embeddings import EmbeddingModel
-from src.llm import LocalLLM
 from src.rag_pipeline import RAGPipeline
 from src.text_splitter import ChineseTextSplitter, RecursiveTextSplitter
 from src.utils import (
     apply_env_overrides,
     get_logger,
     load_config,
-    merge_dict,
     resolve_path,
 )
 from src.vector_store import ChromaStore, hybrid_kwargs
@@ -161,10 +158,11 @@ def _raw_docs_dir(cfg: dict) -> Path:
 
 
 def _top_k(cfg: dict) -> int:
+    """检索条数：与 API / Web UI 同源，都以 ``retrieval.top_k`` 为真值。"""
     return (
         (cfg.get("retrieval", {}) or {}).get("top_k")
         or (cfg.get("ui", {}) or {}).get("default_top_k")
-        or 4
+        or 8
     )
 
 

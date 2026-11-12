@@ -428,7 +428,9 @@ Zhige-RAG/
 
 **Q：上传 PDF 没反应**
 需要 Streamlit、重排器等可选能力：`pip install -r requirements-optional.txt`。
-扫描件（图片型 PDF）目前不支持 OCR，见下方「已知限制」。
+若 PDF 是扫描件（图片型，提取不出文本），还需额外装 OCR 依赖：
+`pip install -r requirements-ocr.txt`，然后重新入库（OCR 只在入库时补文本，
+不会回头处理已入库的旧文件）。详见下方「已知限制」。
 
 **Q：切换了 Embedding 模型后检索结果不对**
 向量维度变了。非 `local` 后端会自动使用带指纹的 collection 名（如

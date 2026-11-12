@@ -1,4 +1,14 @@
-"""可观测性指标收集（无外部依赖）。"""
+"""零依赖的自定义指标收集器（Prometheus 不可用时的降级路径）。
+
+与 :mod:`src.monitoring.metrics` 的 Prometheus 实现并存：
+后者依赖 ``prometheus_client``，缺失时整个模块不可用；本模块只用标准库，
+保证"没装 prometheus_client"时 ``/api/v1/metrics`` 仍能返回一份可读的摘要。
+
+历史背景：本文件原先放在 ``scripts/monitoring/`` 下 —— 但 ``scripts/`` 是
+**离线工具目录**，运行时（api/routes/system.py）却从那里 import，
+既违反项目自己的分层约定，也让打包/裁剪时容易漏掉。
+现已迁到 ``src/monitoring/custom_metrics.py``。
+"""
 from __future__ import annotations
 import time
 from typing import Dict

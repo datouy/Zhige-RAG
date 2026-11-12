@@ -384,6 +384,44 @@ def check_embedding(cfg: Dict[str, Any]) -> None:
     )
 
 
+def check_reranker(cfg):
+    """重排序自检：判断 backend 是否真的可用，并给出开启引导。
+
+    只做轻量探测（依赖/模型文件/HTTP 可达性），不加载重排模型，避免拖慢自检。
+    """
+    rcfg = cfg.get("reranker") or {}
+    enabled = bool(rcfg.get("enabled"))
+    backend = str(rcfg.get("backend") or "bge").strip().lower()
+    base_url = str(rcfg.get("base_url") or os.getenv("RERANK_BASE_URL", "")).strip()
+
+    if not enabled:
+        add(INFO, "重排序（reranker）当前关闭（backend=" + backend + "）",
+            "开启可改善答案块排不进 top-k 的问题：把 reranker.enabled 改为 true；无 GPU 建议 backend: api 并配 base_url 走在线 /rerank，或保持 auto 让它在有 RERANK_BASE_URL 时自动走 API。")
+        return
+
+    add(OK, "重排序已开启：backend=" + backend)
+    if backend in ("api", "auto") and base_url:
+        status, body = _probe(base_url.rstrip("/") + "/", timeout=5.0)
+        if status is not None:
+            add(OK, "在线重排服务可达：" + base_url + "（HTTP " + str(status) + "）")
+        else:
+            add(WARN, "在线重排 base_url 不可达：" + base_url + "（" + body[:100] + "）", "检查网络/代理与 base_url 拼写（通常写到 /v1）。")
+        return
+
+    if backend in ("bge", "auto"):
+        if not (has_module("FlagEmbedding") or has_module("sentence_transformers")):
+            add(WARN, "bge 重排缺少依赖（FlagEmbedding / sentence-transformers）", "安装：pip install -r requirements-local.txt")
+        model_name = str(rcfg.get("model_name") or "./models/bge-reranker-base")
+        if _resolve(model_name).exists():
+            add(OK, "本地重排模型已就位：" + model_name)
+        else:
+            add(WARN, "本地重排模型缺失：" + str(_resolve(model_name)), "下载权重到该目录，或改用 backend: api + base_url 走在线重排。")
+        return
+
+    if backend == "d1":
+        add(WARN, "backend=d1 依赖决策层（decision.enabled=true 且有可用 LLM/d1 权重）", "无 d1 权重时用 decision.backend: llm 复用现有 LLM，或改用 backend: bge/auto。")
+
+
 def check_bm25_tokenizer() -> None:
     """BM25 分词器依赖：jieba 是 requirements-core 里的必装项。
 
@@ -513,6 +551,7 @@ def main() -> int:
     if cfg is not None:
         check_llm_backend(cfg)
         check_embedding(cfg)
+        check_reranker(cfg)
         check_doc_group(cfg)
         check_bm25_tokenizer()
         check_writable_dirs(cfg)

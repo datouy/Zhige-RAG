@@ -264,16 +264,29 @@ async def websocket_agent(websocket: WebSocket):
                     await websocket.send_json(ev)
 
             try:
-                sem = getattr(gate, "semaphore", None)
-                if sem is not None:
-                    async with sem:
+                # 用 gate 本身做上下文管理器（而不是 gate.semaphore）：
+                # gate 内部按事件循环挑选信号量，并保证 acquire/release
+                # 落在同一把上 —— 直接拿属性会在跨循环时抛
+                # "bound to a different event loop"。
+                if gate is not None:
+                    async with gate:
                         await _run()
                 else:
                     await _run()
             except Exception as exc:
                 logger.error("Agent WebSocket 处理失败: %s", exc)
                 await websocket.send_json({"event": "error", "data": str(exc)})
+                # 错误后补一条 done，避免客户端一直等"本轮结束"。
+                try:
+                    await websocket.send_json({"event": "done", "data": []})
+                except Exception:  # noqa: BLE001 - 连接可能已断开
+                    pass
     except WebSocketDisconnect:
         logger.info("Agent WebSocket 客户端断开")
     except Exception as exc:
-        logger.error("Agent WebSocket 异常: %s", exc)
+        # 同 /ws/chat：顶层异常必须回一条 error 事件，否则客户端永久等待。
+        logger.error("Agent WebSocket 异常: %s", exc, exc_info=True)
+        try:
+            await websocket.send_json({"event": "error", "data": f"会话初始化失败：{exc}"})
+        except Exception:  # noqa: BLE001 - 连接可能已断开
+            pass

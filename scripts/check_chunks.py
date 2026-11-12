@@ -35,7 +35,7 @@ def check_chunks(doc_path: str, num_chunks: int = 5):
         print("❌ 无法加载文档")
         return
     
-    print(f"✅ 文档加载成功")
+    print("✅ 文档加载成功")
     print(f"   - 原始长度: {len(doc.content)} 字符")
     print(f"   - 元数据: {doc.metadata}\n")
     
@@ -56,7 +56,7 @@ def check_chunks(doc_path: str, num_chunks: int = 5):
     # 分块
     chunks = splitter.split_text(doc.content, metadata=doc.metadata)
     
-    print(f"📊 分块统计:")
+    print("📊 分块统计:")
     print(f"   - 总块数: {len(chunks)}")
     print(f"   - 平均长度: {sum(len(c.text) for c in chunks) / len(chunks):.1f} 字符")
     print(f"   - 最小长度: {min(len(c.text) for c in chunks)}")
@@ -71,7 +71,7 @@ def check_chunks(doc_path: str, num_chunks: int = 5):
         print(f"{'─'*80}")
         print(f"块 {i+1}:")
         print(f"  长度: {len(chunk.text)} 字符")
-        print(f"  内容:\n")
+        print("  内容:\n")
         # 显示前 200 字符，避免输出过长
         preview = chunk.text[:200]
         if len(chunk.text) > 200:
@@ -80,7 +80,7 @@ def check_chunks(doc_path: str, num_chunks: int = 5):
         print()
     
     print(f"{'='*80}")
-    print(f"✅ 分块质量检查完成！")
+    print("✅ 分块质量检查完成！")
     print(f"{'='*80}\n")
     
     # 质量建议

@@ -18,9 +18,20 @@ ROOT = Path(__file__).resolve().parent.parent
 
 @pytest.fixture
 def client():
+    """FastAPI 测试客户端。
+
+    必须用 ``with TestClient(app) as c``：``lifespan`` 里的 ``init_db()``
+    负责建表，而 lifespan **只在上下文管理器内**触发。直接 ``TestClient(app)``
+    不会建表 → ``users`` 表不存在 → WS 处理器里 ``get_local_user(db)`` 抛
+    ``no such table: users`` → 异常被路由顶层 ``except Exception`` 吞掉且
+    不发 error 事件 → 客户端 ``receive_json()`` 永久阻塞 → 测试挂死。
+
+    （``conftest.py`` 把 DB_PATH 指向临时目录，所以不能指望"碰巧已有表"。）
+    """
     from api.main import app
 
-    return TestClient(app)
+    with TestClient(app) as c:
+        yield c
 
 
 # ----------------------------------------------------------------------

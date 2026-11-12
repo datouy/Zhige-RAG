@@ -12,7 +12,6 @@ import pytest
 
 from scripts.evaluate import (
     INDEX_LIMIT,
-    _now_ts,
     archive_report,
     dcg_at_k,
     keyword_coverage,

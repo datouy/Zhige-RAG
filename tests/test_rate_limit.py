@@ -5,8 +5,6 @@
 2. X-Forwarded-For 伪造防护
 3. 按账号限流功能
 """
-import pytest
-from fastapi import Request
 from src.rate_limit import (
     is_trusted_proxy,
     get_real_client_ip,

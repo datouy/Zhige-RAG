@@ -26,8 +26,6 @@ from __future__ import annotations
 
 import argparse
 import sys
-from collections import Counter
-from datetime import datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent

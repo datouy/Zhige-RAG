@@ -56,7 +56,7 @@ def main() -> int:
         with acquire_llm_load_lock():
             from src.rag_pipeline import RAGPipeline
 
-            rag = RAGPipeline.from_config(
+            RAGPipeline.from_config(
                 str(ROOT / "config" / "config.yaml"),
                 overrides=config,
                 lazy_llm=False,

@@ -1,0 +1,15 @@
+# 本地 pre-commit 门禁：提交前跑 lint + 语法检查，与 CI 保持一致。
+# 安装：pip install pre-commit && pre-commit install
+repos:
+  - repo: local
+    hooks:
+      - id: ruff
+        name: ruff check
+        entry: ruff check src/ api/ scripts/ tests/ ui/
+        language: system
+        pass_filenames: false
+      - id: compileall
+        name: python syntax check
+        entry: python -m compileall -q src api scripts tests ui
+        language: system
+        pass_filenames: false

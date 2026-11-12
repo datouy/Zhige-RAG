@@ -89,7 +89,7 @@ def _format_timestamp(ts: str) -> str:
     if not ts:
         return "N/A"
     try:
-        from datetime import datetime, timezone
+        from datetime import datetime
         dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
         return dt.strftime("%Y-%m-%d %H:%M:%S")
     except Exception:
@@ -273,7 +273,7 @@ def _render_diff_result(result: dict):
                 st.caption(f"相似度: {similarity:.1%}")
 
         elif change_type == "added":
-            with st.expander(f"🟢 新增", expanded=True):
+            with st.expander("🟢 新增", expanded=True):
                 st.code(_truncate_text(change.get("to_text", ""), 400))
                 st.caption("这是新增的 chunk")
 

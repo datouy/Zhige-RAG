@@ -384,7 +384,10 @@ class SearchBody(BaseModel):
     """POST /api/v1/search 请求体。"""
 
     query: str
-    top_k: int = 4
+    # 同 ChatRequest：缺省走 None，由服务端回落到 retrieval.top_k
+    top_k: Optional[int] = Field(
+        None, ge=1, le=100, description="检索 Top-K；缺省用配置里的 retrieval.top_k"
+    )
     kb_id: Optional[str] = Field(None, description="在指定知识库内检索，缺省为默认知识库")
 
 
@@ -403,6 +406,8 @@ async def search_documents(
         kb = _resolve_kb(user, cfg, body.kb_id)
         store = TenantAwareFactory.get_chroma_store_by_name(kb["collection_name"], cfg)
         retrieval_cfg = cfg.get("retrieval", {})
+        # 缺省回落：retrieval.top_k 是 top_k 的唯一真值来源
+        top_k = body.top_k or int(retrieval_cfg.get("top_k", 8) or 8)
 
         def _query() -> List[Any]:
             from src.vector_store import build_security_where
@@ -411,10 +416,10 @@ async def search_documents(
                 status_filter=bool(retrieval_cfg.get("status_filter", True)),
                 acl_groups=_allowed_groups(user) if retrieval_cfg.get("acl_filter", True) else None,
             )
-            hits = store.query(query_text=body.query, top_k=body.top_k, where=where)
+            hits = store.query(query_text=body.query, top_k=top_k, where=where)
             # 旧索引兼容回退（仅状态过滤；ACL 绝不回退）
             if not hits and where is not None and retrieval_cfg.get("status_filter_fallback", True):
-                hits = store.query(query_text=body.query, top_k=body.top_k)
+                hits = store.query(query_text=body.query, top_k=top_k)
             return hits
 
         hits = await run_in_threadpool(_query)
@@ -445,7 +450,12 @@ class ChatRequest(BaseModel):
     """POST /api/v1/chat 请求体（非流式）。"""
 
     query: str = Field(..., min_length=1, description="查询文本，不能为空")
-    top_k: int = Field(4, ge=1, le=50, description="检索 Top-K")
+    # 缺省用 None（而非写死 4）：让服务端回落到 ``retrieval.top_k``。
+    # 写死默认值会让 ``config.yaml`` 里的 top_k 对接口调用完全失效 ——
+    # 用户改了配置却毫无察觉，属于"配置显示生效、运行实际没变"的假象。
+    top_k: Optional[int] = Field(
+        None, ge=1, le=50, description="检索 Top-K；缺省用配置里的 retrieval.top_k"
+    )
     session_id: str = Field("", description="会话 ID；同一会话的多轮问答共享即时记忆")
     kb_id: Optional[str] = Field(None, description="在指定知识库内检索，缺省为默认知识库")
     direct: bool = Field(False, description="true=直连 LLM 通用问答，跳过知识库检索")
@@ -1216,7 +1226,12 @@ async def websocket_chat(websocket: WebSocket):
         while True:
             data = await websocket.receive_json()
             query = data.get("query", "")
-            top_k = data.get("top_k", 4)
+            # 缺省回落：前端不传 top_k 时用配置里的 retrieval.top_k。
+            # 此前写死 4，配置的 top_k 对 WebSocket 完全失效。
+            _cfg_ws = get_runtime_config()
+            top_k = data.get("top_k") or int(
+                (_cfg_ws.get("retrieval", {}) or {}).get("top_k", 8) or 8
+            )
             session_id = str(data.get("session_id") or "default")
             kb_id = data.get("kb_id")
             direct = data.get("direct", False)
@@ -1233,7 +1248,7 @@ async def websocket_chat(websocket: WebSocket):
             kb = None
             if kb_id:
                 try:
-                    kb = _resolve_kb(ws_user, get_runtime_config(), kb_id)
+                    kb = _resolve_kb(ws_user, _cfg_ws, kb_id)
                 except HTTPException as kb_exc:
                     await websocket.send_json(
                         {"event": "error", "data": str(kb_exc.detail)}
@@ -1309,10 +1324,12 @@ async def websocket_chat(websocket: WebSocket):
                 })
 
             try:
-                # P0-1 修复：使用 LLMConcurrencyGate 的 semaphore
-                sem = getattr(gate, "semaphore", None)
-                if sem is not None:
-                    async with sem:
+                # 用 gate 本身做上下文管理器（而不是 gate.semaphore）：
+                # gate 内部按事件循环挑选信号量，并保证 acquire/release
+                # 落在同一把上 —— 直接拿属性会在跨循环时抛
+                # "bound to a different event loop"。
+                if gate is not None:
+                    async with gate:
                         await _run()
                 else:
                     await _run()
@@ -1336,9 +1353,26 @@ async def websocket_chat(websocket: WebSocket):
             except Exception as exc:
                 logger.error("WebSocket 流式生成失败: %s", exc)
                 await websocket.send_json({"event": "error", "data": str(exc)})
+                # 错误后必须补一条 done：客户端普遍以 "done" 作为"本轮结束"的
+                # 信号，只发 error 就结束会让前端一直转圈 / 测试 receive_json 永久阻塞。
+                try:
+                    await websocket.send_json({
+                        "event": "done",
+                        "data": metadata_buf["sources"],
+                        "verification": metadata_buf["verification"],
+                    })
+                except Exception:  # noqa: BLE001 - 连接可能已断开
+                    pass
     except WebSocketDisconnect:
         logger.info("WebSocket 客户端断开")
     except Exception as exc:
-        logger.error("WebSocket 异常: %s", exc)
+        # 顶层异常（如 get_local_user 失败、DB 不可用）必须回一条 error 事件。
+        # 此前只写日志就静默结束，客户端那边 receive_json() 会一直等下去 ——
+        # 前端表现为"消息一直转圈"，服务端日志里也只有一行 ERROR，极难定位。
+        logger.error("WebSocket 异常: %s", exc, exc_info=True)
+        try:
+            await websocket.send_json({"event": "error", "data": f"会话初始化失败：{exc}"})
+        except Exception:  # noqa: BLE001 - 连接可能已断开，无需再处理
+            pass
     finally:
         db.close()

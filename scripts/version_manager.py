@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import argparse
 import difflib
-import hashlib
 import json
 import shutil
 import sys
@@ -344,7 +343,7 @@ def _cli_show(doc_name: str, version: str):
     print(f"字符数: {meta['total_chars']}")
     print(f"来源: {meta.get('created_by', 'N/A')}")
     print(f"{'='*60}")
-    print(f"\n分块预览 (前 5 个):")
+    print("\n分块预览 (前 5 个):")
     for i, ck in enumerate(chunks[:5]):
         text = ck.get("text", "")[:100]
         print(f"  [{i}] {text}...")
@@ -381,7 +380,7 @@ def _cli_diff(doc_name: str, from_ver: str, to_ver: str):
                 print(f"旧内容: {change['from_text'][:150]}...")
 
     # 输出 JSON 格式
-    print(f"\n--- JSON Output ---")
+    print("\n--- JSON Output ---")
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 

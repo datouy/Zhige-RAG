@@ -81,7 +81,6 @@ def test_chinese_splitter_mixed_cjk_and_english():
     sp = ChineseTextSplitter(chunk_size=40, chunk_overlap=5)
     chunks = sp.split_text(text)
     assert len(chunks) >= 2
-    full = "".join(c.text for c in chunks).replace("\n", " ")
     # 关键短语应保留（顺序可能因切分略有变化；重叠部分允许被截断，
     # 因此只断言完整出现在至少一个 chunk 中，而非拼接后存在）
     needles_per_chunk = ["".join(c.text for c in chunks).count(n) for n in
