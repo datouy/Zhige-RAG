@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from .utils import clean_text, get_logger, resolve_path
+from .utils import IMAGE_EXTENSIONS, clean_text, get_logger, resolve_path
 
 logger = get_logger("document_loader")
 
@@ -213,6 +213,67 @@ def _augment_pdf_with_ocr(path: Path, docs: List[Document], ocr_cfg: Dict) -> Li
         docs.sort(key=lambda d: d.page)
         logger.info("OCR 补齐 %d/%d 页（%s）", added, len(missing), path.name)
     return docs
+
+
+def _ocr_image_file(path, engine, max_side=3000):
+    """对单张图片文件做 OCR，返回识别出的文本。
+
+    RapidOCR 直接吃 numpy 数组。这里用 PIL 读文件而不是 cv2.imread，
+    因为 Windows 下 cv2.imread 对非 ASCII 路径会返回 None，中文文件名会失败。
+    超长边先等比缩放，避免超大图占满内存。
+    """
+    try:
+        import numpy as np  # type: ignore
+        from PIL import Image  # type: ignore
+
+        image = Image.open(str(path)).convert("RGB")
+        width, height = image.size
+        longest = max(width, height)
+        if longest > max_side:
+            scale = max_side / longest
+            image = image.resize(
+                (max(1, int(width * scale)), max(1, int(height * scale)))
+            )
+        result, _ = engine(np.array(image))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("图片 OCR 失败（%s）：%s", path.name, exc)
+        return ""
+    if not result:
+        return ""
+    # RapidOCR 返回形如 [[box, text, score], ...]
+    return "\n".join(str(item[1]) for item in result if len(item) > 1)
+
+
+def _load_image(path, ocr_cfg):
+    """解析单张图片文件：用 RapidOCR 提取文字，作为单页 Document 返回。
+
+    图片没有文本层，OCR 是唯一提取手段：引擎不可用或 OCR 被显式关闭时
+    返回空列表（图片无法入库），由调用方决定提示。
+    """
+    ocr_cfg = ocr_cfg or {}
+    if not ocr_cfg.get("enabled", True):
+        logger.info("扫描件 OCR 已关闭，跳过图片解析：%s", path.name)
+        return []
+    engine = _get_ocr_engine()
+    if engine is None:
+        return []
+    text = clean_text(_ocr_image_file(path, engine))
+    if not text:
+        return []
+    return [
+        Document(
+            page=1,
+            content=text,
+            metadata={
+                "source": path.name,
+                "filepath": str(path),
+                "ext": path.suffix.lower(),
+                "page_count": 1,
+                "ocr": True,
+                "ocr_engine": "rapidocr",
+            },
+        )
+    ]
 
 
 # ----------------------------------------------------------------------
@@ -848,6 +909,8 @@ def load_document(
         docs = _load_csv(path, encoding=encoding)
     elif ext in (".html", ".htm", ".xhtml"):
         docs = _load_html(path, encoding=encoding)
+    elif ext in IMAGE_EXTENSIONS:
+        docs = _load_image(path, ocr_cfg)
     else:
         logger.warning("不支持的扩展名 %s，已跳过: %s", ext, path)
         return []

@@ -40,6 +40,13 @@ document_loader:
     - .xlsx
     - .csv
     - .html
+    - .jpg
+    - .jpeg
+    - .png
+    - .bmp
+    - .tif
+    - .tiff
+    - .webp
   pdf_engine: "pdfplumber"
   encoding: "auto"
   clean_text: true

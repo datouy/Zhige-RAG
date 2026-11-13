@@ -267,9 +267,11 @@ def chunk_text_by_length(text: str, max_chars: int) -> List[str]:
 # ----------------------------------------------------------------------
 #  文件与目录
 # ----------------------------------------------------------------------
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
+
 SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".md", ".markdown", ".txt",
                           ".pptx", ".ppt", ".xlsx", ".xls", ".csv",
-                          ".html", ".htm", ".xhtml"}
+                          ".html", ".htm", ".xhtml"} | IMAGE_EXTENSIONS
 
 
 def iter_doc_files(root: str | Path, recursive: bool = True) -> Iterable[Path]:
