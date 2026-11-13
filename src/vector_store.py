@@ -314,10 +314,12 @@ def _tokenize(text: str) -> List[str]:
 
 
 class BM25Index:
-    """
-    内存 BM25 索引（k1/b 为标准参数）。
-    
-    优化：使用多粒度分词，提升中文检索召回率。
+    """内存 BM25 索引（k1/b 为标准参数）。
+
+    优化：
+    - 使用多粒度分词，提升中文检索召回率。
+    - 线程安全：search / upsert / remove 用 RLock 互斥，避免查询与入库并发读写同一份 ids/metadatas/texts 时出现撕裂。
+    - 维护 _id_to_pos 映射，避免每次检索重建 O(N) 的 id->位置 表。
     """
 
     def __init__(
@@ -328,11 +330,13 @@ class BM25Index:
         k1: float = 1.5, 
         b: float = 0.75
     ) -> None:
+        self._lock = threading.RLock()
         self.ids = list(ids)
         self.metadatas = list(metadatas)
         self.texts = list(texts)
         self.k1, self.b = k1, b
         self.docs_tokens: List[List[str]] = [_tokenize(t) for t in self.texts]
+        self._id_to_pos: Dict[str, int] = {cid: i for i, cid in enumerate(self.ids)}
         self.N = len(self.ids)
         self.avgdl = (sum(len(d) for d in self.docs_tokens) / self.N) if self.N else 0.0
         self.df: Counter = Counter()
@@ -359,14 +363,15 @@ class BM25Index:
             self.df.update(tf.keys())
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
-            "ids": self.ids,
-            "texts": self.texts,
-            "metadatas": self.metadatas,
-            "k1": self.k1,
-            "b": self.b,
-            "version": 1,
-        }
+        with self._lock:
+            return {
+                "ids": list(self.ids),
+                "texts": list(self.texts),
+                "metadatas": list(self.metadatas),
+                "k1": self.k1,
+                "b": self.b,
+                "version": 1,
+            }
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "BM25Index":
@@ -379,23 +384,35 @@ class BM25Index:
         )
 
     def save(self, path: Any) -> None:
+        """原子写：先写临时文件再 os.replace，避免进程被 kill 时留下半截 pkl。"""
         try:
+            import os
             import pickle
+            import tempfile
 
             p = str(path)
-            import os
-
-            os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
-            with open(p, "wb") as f:
-                pickle.dump(self.to_dict(), f)
+            directory = os.path.dirname(p) or "."
+            os.makedirs(directory, exist_ok=True)
+            data = self.to_dict()
+            fd, tmp = tempfile.mkstemp(dir=directory, suffix=".tmp")
+            try:
+                with os.fdopen(fd, "wb") as f:
+                    pickle.dump(data, f)
+                os.replace(tmp, p)
+            except Exception:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
         except Exception:
             pass
 
     @classmethod
     def load(cls, path: Any) -> Optional["BM25Index"]:
         try:
-            import pickle
             import os
+            import pickle
 
             p = str(path)
             if not os.path.exists(p):
@@ -415,64 +432,87 @@ class BM25Index:
         metadatas: Sequence[Dict[str, Any]],
     ) -> None:
         """增量覆盖指定 chunk，不重新读取或分词整个 collection。"""
-        positions = {chunk_id: index for index, chunk_id in enumerate(self.ids)}
-        for chunk_id, text, metadata in zip(ids, texts, metadatas):
-            tokens = _tokenize(text)
-            position = positions.get(chunk_id)
-            if position is None:
-                positions[chunk_id] = len(self.ids)
-                self.ids.append(chunk_id)
-                self.texts.append(text)
-                self.metadatas.append(metadata)
-                self.docs_tokens.append(tokens)
-            else:
-                self.texts[position] = text
-                self.metadatas[position] = metadata
-                self.docs_tokens[position] = tokens
-        self._rebuild_stats()
+        with self._lock:
+            for chunk_id, text, metadata in zip(ids, texts, metadatas):
+                tokens = _tokenize(text)
+                position = self._id_to_pos.get(chunk_id)
+                if position is None:
+                    position = len(self.ids)
+                    self._id_to_pos[chunk_id] = position
+                    self.ids.append(chunk_id)
+                    self.texts.append(text)
+                    self.metadatas.append(metadata)
+                    self.docs_tokens.append(tokens)
+                else:
+                    self.texts[position] = text
+                    self.metadatas[position] = metadata
+                    self.docs_tokens[position] = tokens
+            self._rebuild_stats()
 
     def remove_ids(self, ids: Sequence[str]) -> None:
         """删除指定 chunk 并重建词频统计（不重新分词）。"""
         remove = set(ids)
         if not remove:
             return
-        kept = [
-            index
-            for index, chunk_id in enumerate(self.ids)
-            if chunk_id not in remove
-        ]
-        self.ids = [self.ids[index] for index in kept]
-        self.texts = [self.texts[index] for index in kept]
-        self.metadatas = [self.metadatas[index] for index in kept]
-        self.docs_tokens = [self.docs_tokens[index] for index in kept]
-        self._rebuild_stats()
+        with self._lock:
+            kept = [
+                index
+                for index, chunk_id in enumerate(self.ids)
+                if chunk_id not in remove
+            ]
+            self.ids = [self.ids[index] for index in kept]
+            self.texts = [self.texts[index] for index in kept]
+            self.metadatas = [self.metadatas[index] for index in kept]
+            self.docs_tokens = [self.docs_tokens[index] for index in kept]
+            self._id_to_pos = {cid: i for i, cid in enumerate(self.ids)}
+            self._rebuild_stats()
 
     def search(self, query_text: str, top_k: int) -> List[Tuple[str, float]]:
         """返回 [(chunk_id, bm25_score)]，按分数降序。"""
-        if not self.N:
-            return []
-        
-        q_terms = set(_tokenize(query_text))
-        if not q_terms:
-            return []
-        
-        scores: Dict[int, float] = {}
-        for term in q_terms:
-            df = self.df.get(term)
-            if not df:
-                continue
-            idf = math.log(1.0 + (self.N - df + 0.5) / (df + 0.5))
+        with self._lock:
+            if not self.N:
+                return []
             
-            for i, tf in enumerate(self.tfs):
-                f = tf.get(term)
-                if not f:
+            q_terms = set(_tokenize(query_text))
+            if not q_terms:
+                return []
+            
+            scores: Dict[int, float] = {}
+            for term in q_terms:
+                df = self.df.get(term)
+                if not df:
                     continue
-                dl = len(self.docs_tokens[i])
-                norm = self.k1 * (1.0 - self.b + self.b * (dl / self.avgdl if self.avgdl else 0.0))
-                scores[i] = scores.get(i, 0.0) + idf * (f * (self.k1 + 1.0)) / (f + norm)
-        
-        ranked = sorted(scores.items(), key=lambda x: -x[1])[:max(1, int(top_k))]
-        return [(self.ids[i], s) for i, s in ranked]
+                idf = math.log(1.0 + (self.N - df + 0.5) / (df + 0.5))
+                
+                for i, tf in enumerate(self.tfs):
+                    f = tf.get(term)
+                    if not f:
+                        continue
+                    dl = len(self.docs_tokens[i])
+                    norm = self.k1 * (1.0 - self.b + self.b * (dl / self.avgdl if self.avgdl else 0.0))
+                    scores[i] = scores.get(i, 0.0) + idf * (f * (self.k1 + 1.0)) / (f + norm)
+            
+            ranked = sorted(scores.items(), key=lambda x: -x[1])[:max(1, int(top_k))]
+            return [(self.ids[i], s) for i, s in ranked]
+
+    def get_by_id(self, chunk_id: str) -> Optional[Tuple[str, Dict[str, Any]]]:
+        """按 id 取 (text, metadata)；不存在返回 None。线程安全。"""
+        with self._lock:
+            position = self._id_to_pos.get(chunk_id)
+            if position is None:
+                return None
+            return (self.texts[position], self.metadatas[position])
+
+    def matching_ids(self, where: Optional[Dict[str, Any]]) -> List[str]:
+        """返回满足 where 条件的 chunk id（线程安全）。"""
+        with self._lock:
+            if not where:
+                return list(self.ids)
+            return [
+                self.ids[i]
+                for i, metadata in enumerate(self.metadatas)
+                if _metadata_matches(metadata, where)
+            ]
 
 
 @dataclass
@@ -636,6 +676,8 @@ class ChromaStore(BaseVectorStore):
         # count 缓存
         self._count_cache: Optional[int] = None
         self._count_cache_valid = False
+        # 内容变更版本号：每次写/删递增，用于答案缓存键（替换等量文档也能失效）
+        self._mutation_version = 0
 
         # 混合检索（BM25 + 向量 RRF 融合）
         self.hybrid_enabled = bool(hybrid_enabled)
@@ -754,18 +796,15 @@ class ChromaStore(BaseVectorStore):
         rrf: Dict[str, float] = {}
         RRF_K = 60
 
-        # 向量检索排名
         for rank, h in enumerate(vector_hits):
             rrf[h.id] = rrf.get(h.id, 0.0) + 1.0 / (RRF_K + rank + 1)
 
         bm = self._ensure_bm25()
-        bm_idx = {cid: i for i, cid in enumerate(bm.ids)}
         bm_score: Dict[str, float] = {}
         kept = 0
-        # 多取一些再过滤：过滤本身会丢掉一部分候选
         for cid, s in bm.search(query_text, top_k=max(self.hybrid_fetch_k * 4, 20)):
-            idx = bm_idx.get(cid)
-            if idx is None or not _metadata_matches(bm.metadatas[idx], where):
+            rec = bm.get_by_id(cid)
+            if rec is None or not _metadata_matches(rec[1], where):
                 continue
             bm_score[cid] = s
             rrf[cid] = rrf.get(cid, 0.0) + self.hybrid_bm25_weight / (RRF_K + kept + 1)
@@ -782,30 +821,25 @@ class ChromaStore(BaseVectorStore):
         for rank, cid in enumerate(fused_ids):
             if cid in vec_by_id:
                 h = vec_by_id[cid]
-                # 把融合名次与 RRF 分数写进 metadata。
-                # 下游**必须**按 _fusion_rank 排序：score 是混合量纲
-                # （向量余弦 vs BM25 压缩分），按 score 重排会直接推翻
-                # bm25_weight 的保护作用，让关键词命中的无关文档压过
-                # 语义真正相关的片段。
                 md = dict(h.metadata or {})
                 md["_fusion_rank"] = rank
                 md["_fusion_score"] = float(rrf[cid])
                 md.setdefault("_score_kind", "vector")
                 hits.append(Hit(id=h.id, text=h.text, score=h.score, metadata=md))
                 continue
-            idx = bm_idx.get(cid)
-            if idx is None:
+            rec = bm.get_by_id(cid)
+            if rec is None:
                 continue
+            text, md_src = rec
             s = bm_score.get(cid, 0.0)
-            md = dict(bm.metadatas[idx] or {})
-            # 标注分数类型：这不是余弦相似度，别让界面/调用方当成"相似度"读。
+            md = dict(md_src or {})
             md["_score_kind"] = "keyword"
             md["_fusion_rank"] = rank
             md["_fusion_score"] = float(rrf[cid])
             hits.append(
                 Hit(
                     id=cid,
-                    text=bm.texts[idx],
+                    text=text,
                     score=(s / (1.0 + s)) if s > 0 else 0.0,
                     metadata=md,
                 )
@@ -874,6 +908,7 @@ class ChromaStore(BaseVectorStore):
             total += len(ids)
 
         self._invalidate_count_cache(invalidate_bm25=False)
+        self._bump_mutation()
         logger.info("写入完成：%d 条", total)
         return total
 
@@ -929,6 +964,7 @@ class ChromaStore(BaseVectorStore):
                     ],
                 )
             self._invalidate_count_cache()
+            self._bump_mutation()
 
         try:
             inserted = self.add_chunks(chunks)
@@ -1058,6 +1094,9 @@ class ChromaStore(BaseVectorStore):
         
         return results
 
+    def _bump_mutation(self) -> None:
+        self._mutation_version += 1
+
     def _invalidate_count_cache(self, invalidate_bm25: bool = True) -> None:
         """写入/删除后调用，使 count 缓存失效。"""
         self._count_cache_valid = False
@@ -1068,15 +1107,7 @@ class ChromaStore(BaseVectorStore):
         """按 metadata 条件删除文档，返回删除条数。"""
         if not where:
             raise ValueError("where 条件不能为空，避免误删")
-        matching_ids = (
-            [
-                chunk_id
-                for chunk_id, metadata in zip(self._bm25.ids, self._bm25.metadatas)
-                if _metadata_matches(metadata, where)
-            ]
-            if self._bm25 is not None
-            else []
-        )
+        matching_ids = self._bm25.matching_ids(where) if self._bm25 is not None else []
         before = self.collection.count()
         self.collection.delete(where=where)
         after = self.collection.count()
@@ -1084,6 +1115,7 @@ class ChromaStore(BaseVectorStore):
         if self._bm25 is not None:
             self._bm25.remove_ids(matching_ids)
         self._invalidate_count_cache(invalidate_bm25=False)
+        self._bump_mutation()
         logger.info("按 %s 删除 %d 条", where, deleted)
         return deleted
 
@@ -1096,6 +1128,7 @@ class ChromaStore(BaseVectorStore):
         if self._bm25 is not None:
             self._bm25.remove_ids(ids)
         self._invalidate_count_cache(invalidate_bm25=False)
+        self._bump_mutation()
         return before - after
 
     def list_sources(self) -> List[Dict[str, Any]]:
@@ -1127,4 +1160,5 @@ class ChromaStore(BaseVectorStore):
             metadata={"hnsw:space": "cosine"},
         )
         self._invalidate_count_cache()
+        self._bump_mutation()
         logger.warning("集合 %s 已重置", self.collection_name)
