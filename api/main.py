@@ -215,6 +215,14 @@ async def lifespan(app: FastAPI):
         close_db()
         logger.info("数据库连接池已关闭")
 
+        try:
+            from src.ingest_jobs import shutdown as _ingest_shutdown
+
+            _ingest_shutdown()
+            logger.info("入库任务线程池已关闭")
+        except Exception as _ingest_shutdown_err:
+            logger.warning("入库任务线程池关闭失败: %s", _ingest_shutdown_err)
+
         # P0-1 修复：原 AsyncLLMExecutor 是死代码（已删除），
         # 现在的 LLMConcurrencyGate 是无状态的 semaphore 包装，无需清理
 

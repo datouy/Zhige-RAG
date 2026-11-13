@@ -117,3 +117,8 @@ dist/
 
 # 界面写入的本地模型设置（个性化，不进仓库）
 config/local_overrides.yaml
+
+# Ingest task runtime persistence (generated, never commit)
+data/ingest_jobs.json
+data/ingest_jobs.json.tmp
+
