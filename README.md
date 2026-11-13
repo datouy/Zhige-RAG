@@ -330,6 +330,32 @@ EMBEDDING_BACKEND=onnx             # 本地 CPU 向量
 > 切换 Embedding 模型会改变向量维度。非 `local` 后端会自动为 collection 追加
 > "后端+模型"指纹，避免与旧向量混库。
 
+### 稳定性 / 性能相关环境变量
+
+除上面的功能开关外，以下开关用于在高并发或资源受限时稳住服务。它们都有保守默认值，
+本地单机一般无需修改；容器化或多副本部署建议按需调整。
+
+| 变量 | 默认 | 作用 |
+|------|------|------|
+| LLM_MAX_CONCURRENT | 5 | 同时进行生成式 LLM 调用的上限（背压，防并发击穿） |
+| LLM_MAX_QUEUE | 64 | LLM 调用排队上限；超出即拒绝 |
+| LLM_QUEUE_TIMEOUT | 120 | LLM 调用排队等待超时（秒） |
+| RATE_LIMIT_STORAGE_URL | 空=内存 | 限流计数存储；多副本部署指向 redis://... |
+| REDIS_URL | 空 | Redis 地址（RATE_LIMIT_STORAGE_URL 未设时作为回退） |
+| HEALTH_CACHE_TTL | 5 | 健康检查结果缓存秒数，避免探针穿透下游 |
+| READY_TIMEOUT_SECONDS | 10 | 就绪探针（/api/ready）硬超时，防止依赖卡死 |
+| INGEST_MAX_PENDING | 100 | 异步入库排队上限；超出拒绝新任务（背压） |
+| RAG_CHROMA_CACHE_MAX | 32 | 进程内缓存的 Chroma 实例上限（LRU，防多知识库涨内存） |
+
+健康探针分工：
+
+- GET /api/health/live：轻量存活探针，只证明进程/事件循环存活，不碰 DB/Redis/Chroma/磁盘，适合 livenessProbe 或外部高频监控。
+- GET /api/health：全量体检（DB / Chroma / LLM 配置 / 磁盘 / 内存 / Redis / 存储），带 TTL 缓存。
+- GET /api/ready：就绪探针，只查 DB + Chroma，带 READY_TIMEOUT_SECONDS 硬超时。
+
+性能基线：启动服务后运行 python scripts/load_test.py --base-url http://localhost:8000，
+可得到 /api/health/live、/api/health、/api/v1/search 的 P50/P95/P99、错误率与吞吐。
+
 ---
 
 ## Docker 部署
