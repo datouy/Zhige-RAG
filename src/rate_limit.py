@@ -117,4 +117,14 @@ def get_rate_limit_key(request: Request, username: Optional[str] = None) -> str:
 
 #: 全局限流器实例。所有路由与 ``api/main.py`` 共用同一个，
 #: 这样 ``app.state.limiter`` 与各端点的 ``@limiter.limit`` 才作用在同一份计数上。
-limiter = Limiter(key_func=get_rate_limit_key)
+_RATE_LIMIT_STORAGE_URL = (
+    os.getenv("RATE_LIMIT_STORAGE_URL", "").strip()
+    or os.getenv("REDIS_URL", "").strip()
+    or "memory://"
+)
+
+#: 全局限流器实例。所有路由与 api/main.py 共用同一个，这样 app.state.limiter
+#: 与各端点的 @limiter.limit 才作用在同一份计数上。
+#: 显式传入 storage_uri：此前没传，RATE_LIMIT_STORAGE_URL 形同虚设，
+#: 多副本下各自用独立内存桶，限流会失效。
+limiter = Limiter(key_func=get_rate_limit_key, storage_uri=_RATE_LIMIT_STORAGE_URL)
