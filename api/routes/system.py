@@ -79,7 +79,7 @@ def _redact(value: Any) -> Any:
 
 @router.get("/api/health")
 async def health_check():
-    """增强健康检查（带 TTL 缓存，避免高频探针穿透）。
+    """健康检查（带 TTL 缓存，避免高频探针穿透）。
 
     检查项：
     - PostgreSQL/SQLite 数据库连接
@@ -87,216 +87,225 @@ async def health_check():
     - LLM 模型可用性（仅校验配置，不真正加载大模型）
     - 磁盘 / 内存 / Redis（若配置）
 
-    缓存 TTL 由 ``HEALTH_CACHE_TTL`` 环境变量控制（默认 5 秒）。
+    缓存 TTL 由 HEALTH_CACHE_TTL 环境变量控制（默认 5 秒）。
+
+    稳定性：所有同步阻塞调用（DB / Redis / Chroma 盘点）都放进
+    run_in_threadpool，避免阻塞事件循环拖垮其它请求。
     """
-    # 命中缓存：直接返回，节省 psutil / sqlite 查询
     cached = _get_health_cache()
     if cached is not None:
         return cached
 
     try:
         cfg = get_runtime_config()
-        checks: Dict[str, Any] = {}
-        overall_healthy = True
-        chunks_total = 0
-        sources_total = 0
 
-        # ---- Database ----
-        db_status = "unknown"
-        db_details: Dict[str, Any] = {}
-        try:
-            from src.db.database import engine
+        def _collect() -> Dict[str, Any]:
+            checks: Dict[str, Any] = {}
+            overall_healthy = True
+            chunks_total = 0
+            sources_total = 0
 
-            with engine.connect() as conn:
-                conn.execute(_sa_text("SELECT 1"))
-                try:
-                    sources_total = int(
-                        conn.execute(
-                            _sa_text("SELECT COUNT(DISTINCT source) FROM document_records")
-                        ).scalar()
-                        or 0
-                    )
-                except Exception:
-                    sources_total = 0
-            db_status = "healthy"
-            db_details["type"] = (
-                "postgresql" if str(engine.url).startswith("postgresql") else "sqlite"
-            )
-        except Exception as e:
-            db_status = "unhealthy"
-            db_details["error"] = str(e)[:100]
-            overall_healthy = False
-        checks["database"] = {"status": db_status, "details": db_details}
+            # ---- Database ----
+            db_status = "unknown"
+            db_details: Dict[str, Any] = {}
+            try:
+                from src.db.database import engine
 
-        # ---- Chroma ----
-        chunks_total = 0
-        chroma_status = "unknown"
-        chroma_details: Dict[str, Any] = {}
-        try:
-            from src.vector_store import probe_collections
-
-            def _probe_vector_store():
-                return probe_collections(get_vector_store().client)
-
-            report = await run_in_threadpool(_probe_vector_store)
-            chunks_total = int(report.get("chunks", 0))
-            if report.get("status") == "healthy":
-                chroma_status = "healthy"
-                chroma_details = {
-                    "collections": report.get("collections", 0),
-                    "chunks": chunks_total,
-                }
-            else:
-                chroma_status = "unhealthy"
-                chroma_details = {
-                    "collections": report.get("collections", 0),
-                    "errors": len(report.get("errors", [])),
-                }
-                overall_healthy = False
-        except Exception as e:
-            chroma_status = "unhealthy"
-            chroma_details["error"] = "vector store probe failed"
-            logger.error("健康检查中的向量库探测失败: %s", e)
-            overall_healthy = False
-        checks["chroma"] = {"status": chroma_status, "details": chroma_details}
-
-        # ---- LLM 配置校验 ----
-        llm_status = "unknown"
-        llm_details: Dict[str, Any] = {}
-        try:
-            cfg_llm = cfg.get("llm", {})
-            backend = str(cfg_llm.get("backend") or "extractive").strip().lower()
-            llm_details["backend"] = backend
-            if backend == "extractive":
-                llm_status = "not_required"
-                llm_details["model"] = "none"
-            else:
-                model_name = cfg_llm.get("model_name", "unknown")
-                cache_dir = cfg_llm.get("cache_dir")
-                if cache_dir:
-                    cache_path = resolve_path(cache_dir)
-                    llm_details["cache_dir"] = str(cache_path)
-                    llm_details["cache_exists"] = cache_path.exists()
-                llm_status = "available"
-                llm_details["model"] = model_name
-        except Exception as e:
-            llm_status = "not_available"
-            llm_details = {"error": str(e)[:100]}
-        checks["llm"] = {"status": llm_status, "details": llm_details}
-
-        # ---- Disk ----
-        disk_status = "unknown"
-        disk_details: Dict[str, Any] = {}
-        try:
-            if psutil is None:
-                disk_status = "unavailable"
-                disk_details = {"message": "psutil 未安装，磁盘检查不可用"}
-            elif os.name == "nt":
-                disk = psutil.disk_usage("C:")
-                disk_details = {
-                    "total_gb": round(disk.total / (1024**3), 2),
-                    "used_gb": round(disk.used / (1024**3), 2),
-                    "free_gb": round(disk.free / (1024**3), 2),
-                    "percent": disk.percent,
-                }
-                disk_status = "healthy" if disk.percent < 90 else "warning"
-            else:
-                disk = psutil.disk_usage("/")
-                disk_details = {
-                    "total_gb": round(disk.total / (1024**3), 2),
-                    "used_gb": round(disk.used / (1024**3), 2),
-                    "free_gb": round(disk.free / (1024**3), 2),
-                    "percent": disk.percent,
-                }
-                disk_status = "healthy" if disk.percent < 90 else "warning"
-        except Exception as e:
-            disk_status = "error"
-            disk_details = {"error": str(e)[:100]}
-        checks["disk"] = {"status": disk_status, "details": disk_details}
-
-        # ---- Memory ----
-        memory_status = "unknown"
-        memory_details: Dict[str, Any] = {}
-        try:
-            if psutil is None:
-                memory_status = "unavailable"
-                memory_details = {"message": "psutil 未安装，内存检查不可用"}
-            else:
-                mem = psutil.virtual_memory()
-                memory_details = {
-                    "total_gb": round(mem.total / (1024**3), 2),
-                    "available_gb": round(mem.available / (1024**3), 2),
-                    "percent": mem.percent,
-                }
-                memory_status = "healthy" if mem.percent < 90 else "warning"
-        except Exception as e:
-            memory_status = "error"
-            memory_details = {"error": str(e)[:100]}
-        checks["memory"] = {"status": memory_status, "details": memory_details}
-
-        # ---- Redis ----
-        redis_status = "not_configured"
-        redis_details: Dict[str, Any] = {}
-        try:
-            redis_url = os.getenv("REDIS_URL")
-            if redis_url:
-                import redis
-
-                r = redis.from_url(redis_url, socket_connect_timeout=2)
-                r.ping()
-                redis_status = "healthy"
-                redis_details = {"connected": True}
-            else:
-                redis_details = {"message": "Redis not configured"}
-        except Exception as e:
-            redis_status = "unavailable"
-            redis_details = {"error": str(e)[:100]}
-        checks["redis"] = {"status": redis_status, "details": redis_details}
-
-        # ---- Storage 一致性（孤儿 collection / 遗留图谱文件）----
-        storage_details: Dict[str, Any] = {}
-        try:
-            from src.db.database import engine as _engine
-            from sqlalchemy import text as _sa
-
-            with _engine.connect() as conn:
-                active_names = {
-                    str(row[0])
-                    for row in conn.execute(
-                        _sa("SELECT collection_name FROM knowledge_bases")
-                    ).fetchall()
-                }
-            client = get_vector_store().client
-            all_names = [str(getattr(c, "name", c)) for c in client.list_collections()]
-            orphaned = sorted(n for n in all_names if n and n not in active_names)
-            storage_details["chroma_collections"] = len(all_names)
-            storage_details["chroma_collections_active"] = len(active_names)
-            storage_details["chroma_collections_orphaned"] = len(orphaned)
-            if orphaned:
-                storage_details["orphaned_sample"] = orphaned[:10]
-            data_dir = resolve_path("data")
-            storage_details["kg_files"] = (
-                len(list(data_dir.glob("kg_*.db"))) if data_dir.exists() else 0
-            )
-            if orphaned or storage_details["kg_files"] > 0:
-                storage_details["suggestion"] = (
-                    "存在孤儿资源，可调用 POST /api/v1/system/maintenance/cleanup"
-                    "（dry_run=true 预览，dry_run=false 清理）"
+                with engine.connect() as conn:
+                    conn.execute(_sa_text("SELECT 1"))
+                    try:
+                        sources_total = int(
+                            conn.execute(
+                                _sa_text("SELECT COUNT(DISTINCT source) FROM document_records")
+                            ).scalar()
+                            or 0
+                        )
+                    except Exception:
+                        sources_total = 0
+                db_status = "healthy"
+                db_details["type"] = (
+                    "postgresql" if str(engine.url).startswith("postgresql") else "sqlite"
                 )
-        except Exception as e:
-            storage_details["error"] = str(e)[:120]
-        checks["storage"] = {
-            "status": "ok" if "error" not in storage_details else "degraded",
-            "details": storage_details,
-        }
+            except Exception as e:
+                db_status = "unhealthy"
+                db_details["error"] = str(e)[:100]
+                overall_healthy = False
+            checks["database"] = {"status": db_status, "details": db_details}
+
+            # ---- Chroma ----
+            chroma_status = "unknown"
+            chroma_details: Dict[str, Any] = {}
+            try:
+                from src.vector_store import probe_collections
+
+                report = probe_collections(get_vector_store().client)
+                chunks_total = int(report.get("chunks", 0))
+                if report.get("status") == "healthy":
+                    chroma_status = "healthy"
+                    chroma_details = {
+                        "collections": report.get("collections", 0),
+                        "chunks": chunks_total,
+                    }
+                else:
+                    chroma_status = "unhealthy"
+                    chroma_details = {
+                        "collections": report.get("collections", 0),
+                        "errors": len(report.get("errors", [])),
+                    }
+                    overall_healthy = False
+            except Exception as e:
+                chroma_status = "unhealthy"
+                chroma_details["error"] = "vector store probe failed"
+                logger.error("健康检查中的向量库探测失败: %s", e)
+                overall_healthy = False
+            checks["chroma"] = {"status": chroma_status, "details": chroma_details}
+
+            # ---- LLM 配置校验 ----
+            llm_status = "unknown"
+            llm_details: Dict[str, Any] = {}
+            try:
+                cfg_llm = cfg.get("llm", {})
+                backend = str(cfg_llm.get("backend") or "extractive").strip().lower()
+                llm_details["backend"] = backend
+                if backend == "extractive":
+                    llm_status = "not_required"
+                    llm_details["model"] = "none"
+                else:
+                    model_name = cfg_llm.get("model_name", "unknown")
+                    cache_dir = cfg_llm.get("cache_dir")
+                    if cache_dir:
+                        cache_path = resolve_path(cache_dir)
+                        llm_details["cache_dir"] = str(cache_path)
+                        llm_details["cache_exists"] = cache_path.exists()
+                    llm_status = "available"
+                    llm_details["model"] = model_name
+            except Exception as e:
+                llm_status = "not_available"
+                llm_details = {"error": str(e)[:100]}
+            checks["llm"] = {"status": llm_status, "details": llm_details}
+
+            # ---- Disk ----
+            disk_status = "unknown"
+            disk_details: Dict[str, Any] = {}
+            try:
+                if psutil is None:
+                    disk_status = "unavailable"
+                    disk_details = {"message": "psutil 未安装，磁盘检查不可用"}
+                elif os.name == "nt":
+                    disk = psutil.disk_usage("C:")
+                    disk_details = {
+                        "total_gb": round(disk.total / (1024**3), 2),
+                        "used_gb": round(disk.used / (1024**3), 2),
+                        "free_gb": round(disk.free / (1024**3), 2),
+                        "percent": disk.percent,
+                    }
+                    disk_status = "healthy" if disk.percent < 90 else "warning"
+                else:
+                    disk = psutil.disk_usage("/")
+                    disk_details = {
+                        "total_gb": round(disk.total / (1024**3), 2),
+                        "used_gb": round(disk.used / (1024**3), 2),
+                        "free_gb": round(disk.free / (1024**3), 2),
+                        "percent": disk.percent,
+                    }
+                    disk_status = "healthy" if disk.percent < 90 else "warning"
+            except Exception as e:
+                disk_status = "error"
+                disk_details = {"error": str(e)[:100]}
+            checks["disk"] = {"status": disk_status, "details": disk_details}
+
+            # ---- Memory ----
+            memory_status = "unknown"
+            memory_details: Dict[str, Any] = {}
+            try:
+                if psutil is None:
+                    memory_status = "unavailable"
+                    memory_details = {"message": "psutil 未安装，内存检查不可用"}
+                else:
+                    mem = psutil.virtual_memory()
+                    memory_details = {
+                        "total_gb": round(mem.total / (1024**3), 2),
+                        "available_gb": round(mem.available / (1024**3), 2),
+                        "percent": mem.percent,
+                    }
+                    memory_status = "healthy" if mem.percent < 90 else "warning"
+            except Exception as e:
+                memory_status = "error"
+                memory_details = {"error": str(e)[:100]}
+            checks["memory"] = {"status": memory_status, "details": memory_details}
+
+            # ---- Redis ----
+            redis_status = "not_configured"
+            redis_details: Dict[str, Any] = {}
+            try:
+                redis_url = os.getenv("REDIS_URL") or os.getenv("RATE_LIMIT_STORAGE_URL")
+                if redis_url:
+                    import redis
+
+                    r = redis.from_url(redis_url, socket_connect_timeout=2, socket_timeout=2)
+                    r.ping()
+                    redis_status = "healthy"
+                    redis_details = {"connected": True}
+                else:
+                    redis_details = {"message": "Redis not configured"}
+            except Exception as e:
+                redis_status = "unavailable"
+                redis_details = {"error": str(e)[:100]}
+            checks["redis"] = {"status": redis_status, "details": redis_details}
+
+            # ---- Storage 一致性（孤儿 collection / 遗留图谱文件）----
+            storage_details: Dict[str, Any] = {}
+            try:
+                from src.db.database import engine as _engine
+                from sqlalchemy import text as _sa
+
+                with _engine.connect() as conn:
+                    active_names = {
+                        str(row[0])
+                        for row in conn.execute(
+                            _sa("SELECT collection_name FROM knowledge_bases")
+                        ).fetchall()
+                    }
+                client = get_vector_store().client
+                all_names = [str(getattr(c, "name", c)) for c in client.list_collections()]
+                orphaned = sorted(n for n in all_names if n and n not in active_names)
+                storage_details["chroma_collections"] = len(all_names)
+                storage_details["chroma_collections_active"] = len(active_names)
+                storage_details["chroma_collections_orphaned"] = len(orphaned)
+                if orphaned:
+                    storage_details["orphaned_sample"] = orphaned[:10]
+                data_dir = resolve_path("data")
+                storage_details["kg_files"] = (
+                    len(list(data_dir.glob("kg_*.db"))) if data_dir.exists() else 0
+                )
+                if orphaned or storage_details["kg_files"] > 0:
+                    storage_details["suggestion"] = (
+                        "存在孤儿资源，可调用 POST /api/v1/system/maintenance/cleanup"
+                        "（dry_run=true 预览，dry_run=false 清理）"
+                    )
+            except Exception as e:
+                storage_details["error"] = str(e)[:120]
+            checks["storage"] = {
+                "status": "ok" if "error" not in storage_details else "degraded",
+                "details": storage_details,
+            }
+
+            return {
+                "status": "ok" if overall_healthy else "degraded",
+                "chunks": chunks_total,
+                "sources": sources_total,
+                "checks": checks,
+            }
+
+        collected = await run_in_threadpool(_collect)
 
         payload: Dict[str, Any] = {
-            "status": "ok" if overall_healthy else "degraded",
+            "status": collected["status"],
             "timestamp": _cn_timestamp(),
             "version": "0.3.0",
-            "chunks": chunks_total,
-            "sources": sources_total,
-            "checks": checks,
+            "chunks": collected["chunks"],
+            "sources": collected["sources"],
+            "checks": collected["checks"],
             "cached_for_seconds": get_health_cache_ttl(),
         }
 
@@ -314,6 +323,18 @@ async def health_check():
             },
         )
 
+
+@router.get("/api/health/live")
+async def health_live():
+    """轻量存活探针：只证明进程与事件循环存活，不碰 DB/Redis/Chroma/磁盘。
+
+    供容器 livenessProbe / 外部监控高频调用，避免每次探针都穿透下游依赖。
+    """
+    return {
+        "status": "ok",
+        "timestamp": _cn_timestamp(),
+        "version": "0.3.0",
+    }
 
 @router.get("/api/health/invalidate")
 async def health_invalidate(current_user: User = Depends(get_current_user)):
@@ -405,24 +426,38 @@ async def maintenance_cleanup(
 
 @router.get("/api/ready")
 async def readiness_check():
-    """Kubernetes 就绪探针 - 检查所有依赖服务状态。"""
+    """Kubernetes 就绪探针 - 只检查 DB + Chroma，并加超时防止探针挂起。
+
+    与 /api/health 的分工：health 负责全量体检（带 TTL 缓存），
+    ready 只回答「现在能不能接流量」，把 DB 与 Chroma 的同步调用
+    放进线程池，并套一个 READY_TIMEOUT_SECONDS 硬超时，避免某个
+    依赖卡死让探针永远不返回。
+    """
     global _ready_cache_at, _ready_cache_payload
     ttl = get_health_cache_ttl()
     if _ready_cache_payload is not None and time.monotonic() - _ready_cache_at < ttl:
         return JSONResponse(status_code=200, content=_ready_cache_payload)
-    try:
-        # 检查数据库连接
-        try:
+
+    timeout = float(os.getenv("READY_TIMEOUT_SECONDS", "10") or 10)
+
+    async def _probe() -> Dict[str, Any]:
+        db_status = "unknown"
+        chroma_status = "unknown"
+        chroma_detail: Dict[str, Any] = {}
+
+        def _check_db() -> bool:
             from src.db.database import engine
 
             with engine.connect() as conn:
                 conn.execute(_sa_text("SELECT 1"))
-            db_status = "connected"
-        except Exception as e:
-            db_status = f"error: {str(e)}"
+            return True
 
-        # 检查 Chroma 向量库：文件存在不等于 collection 可读。
-        chroma_detail: Dict[str, Any] = {}
+        try:
+            await run_in_threadpool(_check_db)
+            db_status = "connected"
+        except Exception:
+            db_status = "error"
+
         try:
             def _probe_vector_store():
                 return get_vector_store().health_check()
@@ -439,13 +474,12 @@ async def readiness_check():
             chroma_status = "error"
             chroma_detail = {"error": "vector store probe failed"}
 
-        # 检查 LLM 可用性（仅校验配置）
+        llm_status = "available"
         try:
             cfg = get_runtime_config()
             cache_dir = cfg.get("llm", {}).get("cache_dir")
             if cache_dir:
-                resolve_path(cache_dir)  # 校验路径合法
-            llm_status = "available"
+                resolve_path(cache_dir)
         except Exception:
             llm_status = "not_available"
 
@@ -453,9 +487,8 @@ async def readiness_check():
             "connected",
             "not_initialized",
         )
-
-        payload = {
-            "status": "ready" if is_ready else "not_ready",
+        return {
+            "is_ready": is_ready,
             "checks": {
                 "database": db_status,
                 "chroma": chroma_status,
@@ -463,19 +496,35 @@ async def readiness_check():
                 "llm": llm_status,
             },
         }
-        if is_ready:
-            _ready_cache_payload = payload
-            _ready_cache_at = time.monotonic()
-        return JSONResponse(status_code=200 if is_ready else 503, content=payload)
+
+    try:
+        import asyncio
+
+        result = await asyncio.wait_for(_probe(), timeout=timeout)
+    except asyncio.TimeoutError:
+        _clear_readiness_cache()
+        logger.warning("就绪检查超时（>%ss）", timeout)
+        return JSONResponse(
+            status_code=503,
+            content={"status": "not_ready", "error": "readiness check timed out"},
+        )
     except Exception as exc:
         _clear_readiness_cache()
         logger.error("就绪检查失败: %s", exc)
         return JSONResponse(
             status_code=503,
-            # 不回传 str(exc)：内部路径/驱动报错会泄露给探针调用方
             content={"status": "not_ready", "error": "readiness check failed"},
         )
 
+    is_ready = result["is_ready"]
+    payload = {
+        "status": "ready" if is_ready else "not_ready",
+        "checks": result["checks"],
+    }
+    if is_ready:
+        _ready_cache_payload = payload
+        _ready_cache_at = time.monotonic()
+    return JSONResponse(status_code=200 if is_ready else 503, content=payload)
 
 @router.get("/api/metrics")
 async def prometheus_metrics():
