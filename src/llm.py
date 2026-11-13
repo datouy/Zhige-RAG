@@ -16,11 +16,13 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass
 from typing import Any, Dict, Generator, List, Optional
 
+from .llm_concurrency import get_llm_call_gate
 from .utils import Timer, get_logger, resolve_path, select_torch_device
 
 logger = get_logger("llm")
@@ -126,6 +128,10 @@ class LocalLLM:
         self.local_files_only = local_files_only
         self.trust_remote_code = trust_remote_code
         self.max_retries = max_retries
+        self._active_generate = 0
+        self._active_lock = threading.Lock()
+        self._stop_states = {}
+        self._next_generation_counter = 0
 
         # 解析缓存目录
         self.cache_dir = resolve_path(cache_dir) if cache_dir else None
@@ -303,19 +309,22 @@ class LocalLLM:
         超时后放弃等待并抛出 :class:`TimeoutError`；推理线程本身无法被强制
         中断，作为 daemon 线程随进程退出。
         """
+        gate = get_llm_call_gate()
         pool = _get_timeout_pool()
         
         # P1-5 修复：使用队列传递开始时间，排除排队延迟
         import queue
         start_queue: queue.Queue = queue.Queue(maxsize=1)
 
-        def _run() -> str:
+        def _run(generation_id: int) -> str:
             # 任务真正开始时记录时刻
             start_queue.put(time.time())
             return self._generate_with_retry(prompt, gen_cfg)
 
         submit_time = time.time()
-        future = pool.submit(_run)
+        generation_id = self._register_generation()
+        future = pool.submit(_run, generation_id)
+        stop_flag = _TimeoutStopFlag(self, generation_id)
         
         try:
             # 等待任务开始（最多等 timeout）
@@ -330,8 +339,15 @@ class LocalLLM:
                 logger.warning("LLM 任务排队超时（%.1f 秒）", timeout)
                 raise TimeoutError(f"LLM 任务排队超时（{timeout}s）") from None
             
-            # 等待实际生成完成（只计生成时间）
-            return future.result(timeout=remaining_timeout)
+            # 等待实际生成完成（只计生成时间），同时持有全局 LLM 并发闸。
+            with gate.blocking(timeout=remaining_timeout):
+                self._increment_active_generate()
+                try:
+                    return future.result(timeout=remaining_timeout)
+                finally:
+                    stop_flag.request_stop()
+                    self._unregister_generation(generation_id)
+                    self._decrement_active_generate()
         except FuturesTimeoutError:
             future.cancel()
             logger.warning("LLM 生成超时（%.1f 秒）", timeout)
@@ -341,6 +357,7 @@ class LocalLLM:
         import torch  # type: ignore
 
         inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
+        generation_id = self._register_generation()
         with Timer("llm generate"):
             with torch.no_grad():
                 output_ids = self.model.generate(
@@ -351,9 +368,11 @@ class LocalLLM:
                     repetition_penalty=gen_cfg.repetition_penalty,
                     do_sample=gen_cfg.do_sample,
                     pad_token_id=self.tokenizer.pad_token_id,
+                    stopping_criteria=_ActiveStopCriteria(self, generation_id),
                 )
         new_ids = output_ids[0][inputs["input_ids"].shape[1] :]
         text = self.tokenizer.decode(new_ids, skip_special_tokens=True)
+        self._unregister_generation(generation_id)
         return text.strip()
 
     def _stream_generate(self, prompt: str, gen_cfg: GenerationConfig) -> Generator[str, None, None]:
@@ -369,6 +388,7 @@ class LocalLLM:
             skip_prompt=True,
             skip_special_tokens=True,
         )
+        generation_id = self._register_generation()
         gen_kwargs = dict(
             **inputs,
             max_new_tokens=gen_cfg.max_new_tokens,
@@ -378,6 +398,7 @@ class LocalLLM:
             do_sample=gen_cfg.do_sample,
             pad_token_id=self.tokenizer.pad_token_id,
             streamer=streamer,
+            stopping_criteria=_ActiveStopCriteria(self, generation_id),
         )
 
         def _worker():
@@ -397,9 +418,13 @@ class LocalLLM:
 
         th = Thread(target=_worker, daemon=True)
         th.start()
-        for piece in streamer:
-            yield piece
-        th.join()
+        try:
+            for piece in streamer:
+                yield piece
+        finally:
+            self.request_stop_generation(generation_id)
+            self._unregister_generation(generation_id)
+            th.join(timeout=5)
 
     # ------------------------------------------------------------------
     @staticmethod
@@ -417,3 +442,73 @@ class LocalLLM:
             if tag in n:
                 return round(gb * 0.4 if quant else gb, 2)
         return 4.0 if quant else 8.0
+
+    def _increment_active_generate(self) -> None:
+        with self._active_lock:
+            self._active_generate += 1
+
+    def _decrement_active_generate(self) -> None:
+        with self._active_lock:
+            self._active_generate = max(0, self._active_generate - 1)
+
+    def _next_generation_id(self) -> int:
+        with self._active_lock:
+            self._next_generation_counter += 1
+            return self._next_generation_counter
+
+    def _register_generation(self) -> int:
+        generation_id = self._next_generation_id()
+        return generation_id
+
+    def _unregister_generation(self, generation_id: int) -> None:
+        with self._active_lock:
+            self._stop_states.pop(generation_id, None)
+
+    def request_stop_generation(self, generation_id: int) -> None:
+        state = self._stop_states.get(generation_id)
+        if state is not None:
+            state.request_stop()
+
+    def active_generate_count(self) -> int:
+        with self._active_lock:
+            return self._active_generate
+
+
+class _ActiveStopState:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._stopped = False
+
+    def request_stop(self) -> None:
+        with self._lock:
+            self._stopped = True
+
+    @property
+    def stopped(self) -> bool:
+        with self._lock:
+            return self._stopped
+
+
+class _ActiveStopCriteria:
+    """Transformers StoppingCriteria，超时后请求当前 generate 停止。"""
+
+    def __init__(self, owner: LocalLLM, generation_id: int) -> None:
+        self.owner = owner
+        self._state = _ActiveStopState()
+        self._generation_id = generation_id
+        with owner._active_lock:
+            owner._stop_states[generation_id] = self._state
+
+    def __call__(self, input_ids, scores, **kwargs) -> bool:
+        return self._state.stopped
+
+
+class _TimeoutStopFlag:
+    """把超时事件转发给最近一次 generate 的停止条件。"""
+
+    def __init__(self, owner: LocalLLM, generation_id: int) -> None:
+        self.owner = owner
+        self.generation_id = generation_id
+
+    def request_stop(self) -> None:
+        self.owner.request_stop_generation(self.generation_id)

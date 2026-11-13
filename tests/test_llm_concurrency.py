@@ -115,13 +115,8 @@ class TestGateApi:
             else:
                 os.environ["LLM_MAX_CONCURRENT"] = old
 
-    def test_closed_loop_semaphores_are_pruned(self):
-        """已关闭的事件循环不该在 gate 里长期堆积。
-
-        语义：每次取用信号量时会清掉**已关闭**的 loop。当前正在用的那个
-        loop 要等它自己关闭后、下一次取用时才会被清掉，所以断言是
-        "残留的已关闭 loop 不超过 1 个"，而不是"一个都没有"。
-        """
+    def test_gate_state_is_balanced_after_closed_loop(self):
+        """旧实现的 per-loop 字典可能残留；新实现没有 loop 级状态可堆积。"""
         gate = LLMConcurrencyGate(max_concurrent=1)
 
         async def scenario():
@@ -136,16 +131,11 @@ class TestGateApi:
         # 再跑一次：此时上一个 loop 已关闭，应被 prune 掉
         asyncio.run(scenario())
 
-        closed = [
-            lp for lp in gate._semaphores
-            if getattr(lp, "is_closed", lambda: False)()
-        ]
-        assert len(closed) <= 1, (
-            f"已关闭的事件循环残留了 {len(closed)} 个，应在下次取用时清理"
-        )
+        assert gate.stats()["active"] == 0
+        assert gate.stats()["waiting"] == 0
 
-    def test_prune_removes_closed_loops_on_next_access(self):
-        """连续使用多个 loop，旧的（已关闭）必须被清掉，不留堆积。"""
+    def test_repeated_loop_usage_releases_all_leases(self):
+        """连续使用多个 loop 后，容量必须全部归还。"""
         gate = LLMConcurrencyGate(max_concurrent=1)
 
         async def scenario():
@@ -157,13 +147,8 @@ class TestGateApi:
         # 最后一个 loop 也已关闭；再取一次即应把前几个清空
         asyncio.run(scenario())
 
-        closed = [
-            lp for lp in gate._semaphores
-            if getattr(lp, "is_closed", lambda: False)()
-        ]
-        assert len(closed) <= 1, (
-            f"连续多 loop 使用后仍残留 {len(closed)} 个已关闭 loop"
-        )
+        assert gate.stats()["active"] == 0
+        assert gate.stats()["waiting"] == 0
 
 
 @pytest.mark.parametrize("max_conc", [1, 3, 10])

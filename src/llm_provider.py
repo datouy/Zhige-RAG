@@ -50,6 +50,7 @@ from src.http_client import (
     post_sse,
 )
 from src.llm import DEFAULT_MAX_RETRIES, DEFAULT_TIMEOUT, GenerationConfig, LocalLLM
+from src.llm_concurrency import get_llm_call_gate
 from src.monitoring.metrics import metrics_collector
 from src.utils import get_logger
 
@@ -167,24 +168,25 @@ class OpenAICompatLLM:
             timeout=float(os.getenv("CB_LLM_TIMEOUT", "60") or 60),
         )
         start = time.perf_counter()
-        try:
-            data = breaker.call(
-                post_json,
-                self._endpoint,
-                self._build_payload(messages, gen, stream=False),
-                headers=build_headers(self.api_key),
-                timeout=timeout or self.timeout,
-                label=self.provider_label,
-                model=self.model_name,
-            )
-            metrics_collector.record_llm_request(
-                "success", self.model_name, time.perf_counter() - start
-            )
-        except Exception:  # noqa: BLE001 - 记录失败并原样抛出，由上层兜底
-            metrics_collector.record_llm_request(
-                "error", self.model_name, time.perf_counter() - start
-            )
-            raise
+        with get_llm_call_gate().blocking(timeout=timeout or self.timeout):
+            try:
+                data = breaker.call(
+                    post_json,
+                    self._endpoint,
+                    self._build_payload(messages, gen, stream=False),
+                    headers=build_headers(self.api_key),
+                    timeout=timeout or self.timeout,
+                    label=self.provider_label,
+                    model=self.model_name,
+                )
+                metrics_collector.record_llm_request(
+                    "success", self.model_name, time.perf_counter() - start
+                )
+            except Exception:  # noqa: BLE001 - 记录失败并原样抛出，由上层兜底
+                metrics_collector.record_llm_request(
+                    "error", self.model_name, time.perf_counter() - start
+                )
+                raise
         return self._parse_content(data)
 
     @staticmethod
@@ -230,14 +232,15 @@ class OpenAICompatLLM:
         payload = self._build_payload(messages, gen, stream=False)
         payload["tools"] = tools
         payload["tool_choice"] = tool_choice
-        data = post_json(
-            self._endpoint,
-            payload,
-            headers=build_headers(self.api_key),
-            timeout=timeout or self.timeout,
-            label=self.provider_label,
-            model=self.model_name,
-        )
+        with get_llm_call_gate().blocking(timeout=timeout or self.timeout):
+            data = post_json(
+                self._endpoint,
+                payload,
+                headers=build_headers(self.api_key),
+                timeout=timeout or self.timeout,
+                label=self.provider_label,
+                model=self.model_name,
+            )
         choices = data.get("choices") or []
         if not choices:
             raise LLMProviderError(
@@ -284,17 +287,18 @@ class OpenAICompatLLM:
         gen: GenerationConfig,
         timeout: Optional[float],
     ) -> Generator[str, None, None]:
-        for chunk in post_sse(
-            self._endpoint,
-            self._build_payload(messages, gen, stream=True),
-            headers=build_headers(self.api_key),
-            timeout=timeout or self.timeout,
-            label=self.provider_label,
-            model=self.model_name,
-        ):
-            delta = self._extract_delta(chunk)
-            if delta:
-                yield delta
+        with get_llm_call_gate().blocking(timeout=timeout or self.timeout):
+            for chunk in post_sse(
+                self._endpoint,
+                self._build_payload(messages, gen, stream=True),
+                headers=build_headers(self.api_key),
+                timeout=timeout or self.timeout,
+                label=self.provider_label,
+                model=self.model_name,
+            ):
+                delta = self._extract_delta(chunk)
+                if delta:
+                    yield delta
 
     # ------------------------------------------------------------------
     def _build_payload(
