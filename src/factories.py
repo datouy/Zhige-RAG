@@ -14,6 +14,7 @@ import hashlib
 import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
+from collections import OrderedDict
 from threading import Lock
 
 from src.utils import get_logger
@@ -48,12 +49,13 @@ def _sanitize_user_id(user_id: str) -> str:
 class TenantAwareFactory:
     """多租户组件工厂，按 user_id 隔离资源。"""
     _lock = Lock()
-    _chroma_stores: Dict[str, ChromaStore] = {}
+    _chroma_stores: OrderedDict[str, ChromaStore] = OrderedDict()
     # user_id -> 其名下的 collection 全名集合（用于 cleanup 反查，
     # 因为 chroma_stores 的 key 是脱敏后的名字，无法从 user_id 直接匹配）
     _user_collections: Dict[str, Set[str]] = {}
     _kg_stores: Dict[str, SQLiteGraphStore] = {}
     _embedding: Optional[EmbeddingModel] = None
+    _CHROMA_CACHE_MAX = int(os.getenv("RAG_CHROMA_CACHE_MAX", "32") or 32)
 
     @classmethod
     def get_embedding(cls, config: dict) -> Any:
@@ -83,47 +85,59 @@ class TenantAwareFactory:
         """
         safe_uid = _sanitize_user_id(user_id)
         base_name = f"{safe_uid}_{config['vector_store']['collection_name']}"
-        # 非 local 的 Embedding 后端会追加"后端+模型"指纹：换模型即换向量维数，
-        # 与旧向量混在同一个 collection 里会直接报错，检索结果也不可信。
         from src.embeddings_provider import embedding_collection_name
 
         collection_name = embedding_collection_name(
             base_name, config.get("embedding", {})
         )
 
+        with cls._lock:
+            if collection_name in cls._chroma_stores:
+                cls._chroma_stores.move_to_end(collection_name)
+                return cls._chroma_stores[collection_name]
+
         # 注意：get_embedding 内部会再次获取 _lock，而 threading.Lock 不可重入，
         # 必须在锁外调用，否则同线程二次加锁直接死锁。
-        if collection_name not in cls._chroma_stores:
-            embed = cls.get_embedding(config)
-            with cls._lock:
-                if collection_name not in cls._chroma_stores:
-                    persist_dir = config["vector_store"]["persist_directory"]
-                    cls._chroma_stores[collection_name] = ChromaStore(
-                        persist_directory=persist_dir,
-                        collection_name=collection_name,
-                        embedding_model=embed,
-                        distance_fn=config["vector_store"].get("distance_fn", "cosine"),
-            **hybrid_kwargs(config.get("vector_store", {})),
-                    )
-                    cls._user_collections.setdefault(user_id, set()).add(collection_name)
-        return cls._chroma_stores[collection_name]
+        embed = cls.get_embedding(config)
+        with cls._lock:
+            if collection_name not in cls._chroma_stores:
+                persist_dir = config["vector_store"]["persist_directory"]
+                cls._chroma_stores[collection_name] = ChromaStore(
+                    persist_directory=persist_dir,
+                    collection_name=collection_name,
+                    embedding_model=embed,
+                    distance_fn=config["vector_store"].get("distance_fn", "cosine"),
+                    **hybrid_kwargs(config.get("vector_store", {})),
+                )
+                cls._user_collections.setdefault(user_id, set()).add(collection_name)
+            cls._chroma_stores.move_to_end(collection_name)
+            while len(cls._chroma_stores) > cls._CHROMA_CACHE_MAX:
+                cls._chroma_stores.popitem(last=False)
+            return cls._chroma_stores[collection_name]
 
     @classmethod
     def get_chroma_store_by_name(cls, collection_name: str, config: dict) -> ChromaStore:
         """通过完整 collection_name 获取 ChromaStore（不隔离用户）。"""
-        if collection_name not in cls._chroma_stores:
-            embed = cls.get_embedding(config)
-            with cls._lock:
-                if collection_name not in cls._chroma_stores:
-                    persist_dir = config["vector_store"]["persist_directory"]
-                    cls._chroma_stores[collection_name] = ChromaStore(
-                        persist_directory=persist_dir,
-                        collection_name=collection_name,
-                        embedding_model=embed,
-                        distance_fn=config["vector_store"].get("distance_fn", "cosine"),
-            **hybrid_kwargs(config.get("vector_store", {})),
-                    )
-        return cls._chroma_stores[collection_name]
+        with cls._lock:
+            if collection_name in cls._chroma_stores:
+                cls._chroma_stores.move_to_end(collection_name)
+                return cls._chroma_stores[collection_name]
+
+        embed = cls.get_embedding(config)
+        with cls._lock:
+            if collection_name not in cls._chroma_stores:
+                persist_dir = config["vector_store"]["persist_directory"]
+                cls._chroma_stores[collection_name] = ChromaStore(
+                    persist_directory=persist_dir,
+                    collection_name=collection_name,
+                    embedding_model=embed,
+                    distance_fn=config["vector_store"].get("distance_fn", "cosine"),
+                    **hybrid_kwargs(config.get("vector_store", {})),
+                )
+            cls._chroma_stores.move_to_end(collection_name)
+            while len(cls._chroma_stores) > cls._CHROMA_CACHE_MAX:
+                cls._chroma_stores.popitem(last=False)
+            return cls._chroma_stores[collection_name]
 
     @classmethod
     def get_kg_store(cls, user_id: str, config: dict) -> SQLiteGraphStore:

@@ -17,6 +17,7 @@ import re
 import threading
 import time
 import unicodedata
+from collections import OrderedDict
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Generator, List, Optional
@@ -242,7 +243,7 @@ class RAGPipeline:
         # 懒加载只允许一个线程真正动手，其余等待复用，避免并发首问各自加载。
         self._llm_load_lock = threading.Lock()
         # 检索短 TTL 缓存：键含 collection 名，防止跨库/跨租户复用
-        self._retrieval_cache: Dict[Any, tuple[float, List[Hit]]] = {}
+        self._retrieval_cache: OrderedDict[Any, tuple[float, List[Hit]]] = OrderedDict()
         self._retrieval_cache_lock = threading.Lock()
         # P1 答案级语义缓存：同问(归一化后)+同库+同top_k 24h内直接复用整答，
         # 命中时跳过检索+LLM，TTFT≈0。键含collection/kb防串库；有history/流式不缓存。
@@ -523,12 +524,15 @@ class RAGPipeline:
         cache = getattr(self, "_retrieval_cache", None)
         if lock is None or cache is None:
             lock = threading.Lock()
-            cache = {}
+            cache = OrderedDict()
             self._retrieval_cache_lock = lock
             self._retrieval_cache = cache
+        _move_to_end = getattr(cache, "move_to_end", None)
         with lock:
             entry = cache.get(key)
             if entry is not None and now - entry[0] < ttl:
+                if _move_to_end is not None:
+                    _move_to_end(key)
                 return entry[1]
 
         try:
@@ -545,6 +549,8 @@ class RAGPipeline:
 
         with lock:
             cache[key] = (now, hits)
+            if _move_to_end is not None:
+                _move_to_end(key)
             if len(cache) > RETRIEVAL_CACHE_MAX_ENTRIES:
                 expired = [
                     k for k, v in cache.items()
@@ -552,6 +558,11 @@ class RAGPipeline:
                 ]
                 for k in expired:
                     cache.pop(k, None)
+            while len(cache) > RETRIEVAL_CACHE_MAX_ENTRIES:
+                if _move_to_end is not None:
+                    cache.popitem(last=False)
+                else:
+                    cache.pop(next(iter(cache)), None)
         return hits
 
     # ---------------- P1 答案级语义缓存 ----------------
@@ -570,7 +581,8 @@ class RAGPipeline:
         try:
             store = self.vector_store
             n = store.count()
-            return int(n) if n is not None else None
+            mutation = getattr(store, "_mutation_version", 0)
+            return (int(n) if n is not None else None, int(mutation or 0))
         except Exception:
             return None
 
