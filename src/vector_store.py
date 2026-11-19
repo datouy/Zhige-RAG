@@ -320,6 +320,8 @@ class BM25Index:
     - 使用多粒度分词，提升中文检索召回率。
     - 线程安全：search / upsert / remove 用 RLock 互斥，避免查询与入库并发读写同一份 ids/metadatas/texts 时出现撕裂。
     - 维护 _id_to_pos 映射，避免每次检索重建 O(N) 的 id->位置 表。
+    - 倒排索引 postings（term -> {doc_pos: tf}）替代 df+tfs 全表结构，
+      使 search() 从 O(N) 全表扫描降为 O(查询词 x 命中文档数)。
     """
 
     def __init__(
@@ -339,28 +341,52 @@ class BM25Index:
         self._id_to_pos: Dict[str, int] = {cid: i for i, cid in enumerate(self.ids)}
         self.N = len(self.ids)
         self.avgdl = (sum(len(d) for d in self.docs_tokens) / self.N) if self.N else 0.0
-        self.df: Counter = Counter()
-        self.tfs: List[Counter] = []
-        
-        for toks in self.docs_tokens:
-            tf = Counter(toks)
-            self.tfs.append(tf)
-            for term in tf:
-                self.df[term] += 1
+        self.postings: Dict[str, Dict[int, int]] = {}
+        self.doc_lengths: List[int] = [len(d) for d in self.docs_tokens]
+        self._rebuild_postings()
 
-    def _rebuild_stats(self) -> None:
+    def _rebuild_postings(self) -> None:
+        """从 docs_tokens 全量重建倒排索引与统计（冷启动 / 批量删除后调用）。"""
+        self.postings = {}
+        self.doc_lengths = [len(tokens) for tokens in self.docs_tokens]
+        for pos, tokens in enumerate(self.docs_tokens):
+            for term, freq in Counter(tokens).items():
+                self.postings.setdefault(term, {})[pos] = freq
         self.N = len(self.ids)
         self.avgdl = (
-            sum(len(tokens) for tokens in self.docs_tokens) / self.N
+            sum(self.doc_lengths) / self.N
             if self.N
             else 0.0
         )
-        self.df = Counter()
-        self.tfs = []
-        for tokens in self.docs_tokens:
-            tf = Counter(tokens)
-            self.tfs.append(tf)
-            self.df.update(tf.keys())
+
+    def _remove_doc_from_postings(self, pos: int, tokens: Sequence[str]) -> None:
+        for term in set(tokens):
+            posting = self.postings.get(term)
+            if posting is None:
+                continue
+            posting.pop(pos, None)
+            if not posting:
+                del self.postings[term]
+
+    def _add_doc_to_postings(self, pos: int, tokens: Sequence[str]) -> None:
+        for term, freq in Counter(tokens).items():
+            self.postings.setdefault(term, {})[pos] = freq
+
+    def _score(self, pos: int, q_terms: Set[str]) -> float:
+        dl = self.doc_lengths[pos]
+        norm = self.k1 * (1.0 - self.b + self.b * (dl / self.avgdl if self.avgdl else 0.0))
+        total = 0.0
+        for term in q_terms:
+            posting = self.postings.get(term)
+            if posting is None:
+                continue
+            f = posting.get(pos)
+            if not f:
+                continue
+            df = len(posting)
+            idf = math.log(1.0 + (self.N - df + 0.5) / (df + 0.5))
+            total += idf * (f * (self.k1 + 1.0)) / (f + norm)
+        return total
 
     def to_dict(self) -> Dict[str, Any]:
         with self._lock:
@@ -431,7 +457,7 @@ class BM25Index:
         texts: Sequence[str],
         metadatas: Sequence[Dict[str, Any]],
     ) -> None:
-        """增量覆盖指定 chunk，不重新读取或分词整个 collection。"""
+        """增量覆盖指定 chunk，只更新受影响词的倒排索引，不再全量重建。"""
         with self._lock:
             for chunk_id, text, metadata in zip(ids, texts, metadatas):
                 tokens = _tokenize(text)
@@ -442,15 +468,26 @@ class BM25Index:
                     self.ids.append(chunk_id)
                     self.texts.append(text)
                     self.metadatas.append(metadata)
-                    self.docs_tokens.append(tokens)
+                    self.docs_tokens.append([])
+                    self.doc_lengths.append(0)
                 else:
                     self.texts[position] = text
                     self.metadatas[position] = metadata
-                    self.docs_tokens[position] = tokens
-            self._rebuild_stats()
+                    old_tokens = self.docs_tokens[position]
+                    if old_tokens:
+                        self._remove_doc_from_postings(position, old_tokens)
+                self._add_doc_to_postings(position, tokens)
+                self.docs_tokens[position] = tokens
+                self.doc_lengths[position] = len(tokens)
+            self.N = len(self.ids)
+            self.avgdl = (
+                sum(self.doc_lengths) / self.N
+                if self.N
+                else 0.0
+            )
 
     def remove_ids(self, ids: Sequence[str]) -> None:
-        """删除指定 chunk 并重建词频统计（不重新分词）。"""
+        """删除指定 chunk。删除是低频操作，紧凑化列表后全量重建倒排索引。"""
         remove = set(ids)
         if not remove:
             return
@@ -465,35 +502,48 @@ class BM25Index:
             self.metadatas = [self.metadatas[index] for index in kept]
             self.docs_tokens = [self.docs_tokens[index] for index in kept]
             self._id_to_pos = {cid: i for i, cid in enumerate(self.ids)}
-            self._rebuild_stats()
+            self._rebuild_postings()
 
-    def search(self, query_text: str, top_k: int) -> List[Tuple[str, float]]:
-        """返回 [(chunk_id, bm25_score)]，按分数降序。"""
+    def search(
+        self,
+        query_text: str,
+        top_k: int,
+        where: Optional[Dict[str, Any]] = None,
+    ) -> List[Tuple[str, float]]:
+        """返回 [(chunk_id, bm25_score)]，按分数降序，最多 top_k 条。
+
+        走倒排索引：只对「命中任一查询词」的文档打分，不再 O(N) 全表扫描。
+        ``where`` 在候选收集阶段即生效，避免被过滤文档占满 top_k 后漏召回。
+        """
         with self._lock:
             if not self.N:
                 return []
-            
+
             q_terms = set(_tokenize(query_text))
             if not q_terms:
                 return []
-            
-            scores: Dict[int, float] = {}
+
+            candidates: Set[int] = set()
             for term in q_terms:
-                df = self.df.get(term)
-                if not df:
+                posting = self.postings.get(term)
+                if posting:
+                    candidates.update(posting.keys())
+            if not candidates:
+                return []
+
+            scored: List[Tuple[int, float]] = []
+            for pos in candidates:
+                if where is not None and not _metadata_matches(self.metadatas[pos], where):
                     continue
-                idf = math.log(1.0 + (self.N - df + 0.5) / (df + 0.5))
-                
-                for i, tf in enumerate(self.tfs):
-                    f = tf.get(term)
-                    if not f:
-                        continue
-                    dl = len(self.docs_tokens[i])
-                    norm = self.k1 * (1.0 - self.b + self.b * (dl / self.avgdl if self.avgdl else 0.0))
-                    scores[i] = scores.get(i, 0.0) + idf * (f * (self.k1 + 1.0)) / (f + norm)
-            
-            ranked = sorted(scores.items(), key=lambda x: -x[1])[:max(1, int(top_k))]
-            return [(self.ids[i], s) for i, s in ranked]
+                s = self._score(pos, q_terms)
+                if s > 0:
+                    scored.append((pos, s))
+
+            scored.sort(key=lambda x: -x[1])
+            return [
+                (self.ids[pos], s)
+                for pos, s in scored[: max(1, int(top_k))]
+            ]
 
     def get_by_id(self, chunk_id: str) -> Optional[Tuple[str, Dict[str, Any]]]:
         """按 id 取 (text, metadata)；不存在返回 None。线程安全。"""
@@ -801,16 +851,11 @@ class ChromaStore(BaseVectorStore):
 
         bm = self._ensure_bm25()
         bm_score: Dict[str, float] = {}
-        kept = 0
-        for cid, s in bm.search(query_text, top_k=max(self.hybrid_fetch_k * 4, 20)):
-            rec = bm.get_by_id(cid)
-            if rec is None or not _metadata_matches(rec[1], where):
-                continue
+        for rank, (cid, s) in enumerate(
+            bm.search(query_text, top_k=self.hybrid_fetch_k, where=where)
+        ):
             bm_score[cid] = s
-            rrf[cid] = rrf.get(cid, 0.0) + self.hybrid_bm25_weight / (RRF_K + kept + 1)
-            kept += 1
-            if kept >= self.hybrid_fetch_k:
-                break
+            rrf[cid] = rrf.get(cid, 0.0) + self.hybrid_bm25_weight / (RRF_K + rank + 1)
 
         if not rrf:
             return vector_hits
