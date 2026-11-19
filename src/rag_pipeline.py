@@ -2398,7 +2398,7 @@ class RAGPipeline:
         return est, True
 
     # ------------------------------------------------------------------
-    def stream_answer(
+    def _stream_answer_before_llm(
         self,
         question: str,
         top_k: Optional[int] = None,
@@ -2407,13 +2407,11 @@ class RAGPipeline:
         allowed_groups: Optional[List[str]] = None,
         direct: bool = False,
     ) -> Dict[str, Any]:
-        """流式问答的高级封装：返回 ``{"event":..., "data":...}`` 事件流。
+        """流式问答的「检索 + 上下文组装」阶段，止步于 LLM 生成之前。
 
-        事件类型：
-        - ``hits``: 命中来源（最早发出）
-        - ``token``: 生成 token
-        - ``done``: 结束（data 含 cites 与 verification 可验证性报告）
-        - ``error``: 异常
+        产出 ``hits / token / done / error`` 事件；当走到需要 LLM 生成时，以内部
+        哨兵事件 ``__llm_ready__`` 收尾并把生成所需参数交给消费者 —— 同步调用方
+        走 :meth:`_emit_llm_tail`，异步调用方走 :meth:`_emit_llm_tail_async`。
         """
         retrieval_cfg = self.config.get("retrieval", {})
         k = top_k or retrieval_cfg.get("top_k", DEFAULT_TOP_K)
@@ -2546,6 +2544,64 @@ class RAGPipeline:
             long_term=self._recall_long_term(user_id),
             runtime=self._runtime_context(hits),
         )
+        # 到达 LLM 生成阶段：把后续交给消费者。检索与上下文这些同步阻塞部分仍
+        # 留在调用方线程里跑；LLM 的网络 I/O 则可换成事件循环内的非阻塞 httpx
+        # 请求（见 stream_answer / astream_answer 的分流）。
+        yield {
+            "event": "__llm_ready__",
+            "data": {
+                "messages": messages,
+                "hits": list(hits),
+                "cites": cites,
+                "context_chunks": context_chunks,
+                "ans_key": _ans_key,
+            },
+        }
+        return
+
+    def stream_answer(
+        self,
+        question: str,
+        top_k: Optional[int] = None,
+        history: Optional[List[Dict[str, str]]] = None,
+        user_id: Optional[str] = None,
+        allowed_groups: Optional[List[str]] = None,
+        direct: bool = False,
+    ) -> Dict[str, Any]:
+        """流式问答的高级封装：返回 ``{"event":..., "data":...}`` 事件流。
+
+        先同步完成检索与上下文组装（:meth:`_stream_answer_before_llm`），再在
+        LLM 生成处同步流式输出。事件类型：
+        - ``hits``: 命中来源（最早发出）
+        - ``token``: 生成 token
+        - ``done``: 结束（data 含 cites 与 verification）
+        - ``error``: 异常
+        """
+        for ev in self._stream_answer_before_llm(
+            question,
+            top_k=top_k,
+            history=history,
+            user_id=user_id,
+            allowed_groups=allowed_groups,
+            direct=direct,
+        ):
+            if isinstance(ev, dict) and ev.get("event") == "__llm_ready__":
+                d = ev["data"]
+                yield from self._emit_llm_tail(
+                    d["messages"], d["hits"], d["cites"], d["context_chunks"], d["ans_key"]
+                )
+            else:
+                yield ev
+
+    def _emit_llm_tail(
+        self,
+        messages: List[Dict[str, str]],
+        hits: List[Hit],
+        cites: List[Dict[str, Any]],
+        context_chunks: List[Dict[str, Any]],
+        ans_key: Any,
+    ):
+        """同步流式生成尾部：LLM 生成 → 校验 → 引用 → 缓存 → done。"""
         buf = ""
         try:
             for piece in self.llm.chat(messages, self.llm.gen_cfg, stream=True):
@@ -2563,9 +2619,46 @@ class RAGPipeline:
             yield {"event": "hits", "data": visible_cites}
         # 写回答案缓存（与非流式路径一致）
         try:
-            if _ans_key is not None:
+            if ans_key is not None:
                 self._answer_cache_put(
-                    _ans_key,
+                    ans_key,
+                    RAGResult(
+                        answer=answer_text,
+                        sources=visible_cites,
+                        raw_hits=list(hits),
+                        verification=verification,
+                    ),
+                )
+        except Exception:
+            pass
+        yield {"event": "done", "data": visible_cites, "verification": verification}
+
+    async def _emit_llm_tail_async(
+        self,
+        messages: List[Dict[str, str]],
+        hits: List[Hit],
+        cites: List[Dict[str, Any]],
+        context_chunks: List[Dict[str, Any]],
+        ans_key: Any,
+    ):
+        """异步流式生成尾部：``httpx`` 非阻塞 LLM 流，其余与同步尾部一致。"""
+        buf = ""
+        try:
+            async for piece in self.llm.achat(messages, self.llm.gen_cfg, stream=True):
+                buf += piece
+                yield {"event": "token", "data": piece}
+        except Exception as exc:
+            yield {"event": "error", "data": str(exc)}
+            return
+        answer_text = buf.strip()
+        verification = self._verify(answer_text, context_chunks)
+        visible_cites = self._visible_citations(answer_text, cites, verification)
+        if visible_cites != cites:
+            yield {"event": "hits", "data": visible_cites}
+        try:
+            if ans_key is not None:
+                self._answer_cache_put(
+                    ans_key,
                     RAGResult(
                         answer=answer_text,
                         sources=visible_cites,
@@ -2594,12 +2687,10 @@ class RAGPipeline:
         - ``done``: 结束（data 含 cites 与 verification）
         - ``error``: 异常
 
-        实现说明：检索 + LLM 推理是同步阻塞的，因此把 ``stream_answer``
-        放到独立线程中生产事件，再通过 ``asyncio.Queue`` 转交事件循环。
-        之前直接 ``run_in_executor(None, self.stream_answer, ...)`` 只会立即
-        返回生成器对象（生成器函数被调用时并不执行函数体），随后的同步
-        ``for`` 迭代——包括整个 LLM 推理——仍然跑在事件循环线程上，会把
-        整个 FastAPI 事件循环卡住。
+        实现说明：检索与上下文组装仍是同步阻塞的，放到独立线程里生产事件并经
+        ``asyncio.Queue`` 转交事件循环。到 LLM 生成阶段，若后端支持异步 HTTP
+        （``OpenAICompatLLM.supports_async``，即 ``llm.http_backend: httpx``），
+        则把生成切回事件循环用 ``httpx`` 非阻塞流式输出；否则仍在线程内同步生成。
         """
         import asyncio
         import concurrent.futures
@@ -2637,7 +2728,7 @@ class RAGPipeline:
 
         def _produce() -> None:
             try:
-                for event in self.stream_answer(
+                for ev in self._stream_answer_before_llm(
                     question,
                     top_k=top_k,
                     history=history,
@@ -2645,7 +2736,21 @@ class RAGPipeline:
                     allowed_groups=allowed_groups,
                     direct=direct,
                 ):
-                    if not _post(event):
+                    if isinstance(ev, dict) and ev.get("event") == "__llm_ready__":
+                        d = ev["data"]
+                        if getattr(self.llm, "supports_async", False):
+                            # 转交事件循环：异步 LLM 流（httpx 非阻塞）在消费端执行
+                            if not _post({"event": "__llm_ready__", "data": d}):
+                                return
+                            return
+                        # 同步后端：线程内直接流式生成（与旧行为一致）
+                        for e in self._emit_llm_tail(
+                            d["messages"], d["hits"], d["cites"], d["context_chunks"], d["ans_key"]
+                        ):
+                            if not _post(e):
+                                return
+                        return
+                    if not _post(ev):
                         return
             except Exception as exc:  # noqa: BLE001
                 _post({"event": "error", "data": str(exc)})
@@ -2660,6 +2765,13 @@ class RAGPipeline:
                 item = await queue.get()
                 if item is _SENTINEL:
                     break
+                if isinstance(item, dict) and item.get("event") == "__llm_ready__":
+                    d = item["data"]
+                    async for e in self._emit_llm_tail_async(
+                        d["messages"], d["hits"], d["cites"], d["context_chunks"], d["ans_key"]
+                    ):
+                        yield e
+                    continue
                 yield item
         finally:
             # 无论正常结束、客户端断连还是被取消，都要放行生产者：
