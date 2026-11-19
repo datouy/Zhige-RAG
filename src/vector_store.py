@@ -1032,6 +1032,50 @@ class ChromaStore(BaseVectorStore):
                 ) from exc
             raise
 
+    def get_by_sources(
+        self,
+        sources: List[str],
+        where: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, List[Hit]]:
+        """批量读取多个来源文档的全部分块，单次 ``$in`` 查询，按 source 分组返回。
+
+        与 :meth:`get_by_source` 语义一致：每组按 ``chunk_index`` 升序（即原文顺序）。
+        调用方对每个命中 source 各调一次 ``get_by_source`` 是 N+1 查询 —— 一批命中
+        来自多个文档时会放大为多次 Chroma 往返；这里合并为一次 ``$in``，多 worker /
+        高并发问答时能显著减少往返次数。
+        """
+        if not sources:
+            return {}
+        filters: List[Dict[str, Any]] = [{"source": {"$in": list(sources)}}]
+        if where:
+            filters.append(where)
+        combined = filters[0] if len(filters) == 1 else {"$and": filters}
+        data = self.collection.get(where=combined, include=["documents", "metadatas"])
+        ids = data.get("ids") or []
+        docs = data.get("documents") or []
+        metas = data.get("metadatas") or []
+        grouped: Dict[str, List[Hit]] = {}
+        for i in range(len(ids)):
+            meta = metas[i] if i < len(metas) else {}
+            src = str((meta or {}).get("source") or "")
+            hit = Hit(id=ids[i], text=docs[i] or "", score=1.0, metadata=meta)
+            grouped.setdefault(src, []).append(hit)
+        # 每组按 chunk_index 升序；老索引缺该字段时保持存储顺序。
+        for src, hits in grouped.items():
+            if len(hits) <= 1:
+                continue
+            indices: List[Optional[int]] = []
+            for hit in hits:
+                try:
+                    indices.append(int((hit.metadata or {}).get("chunk_index")))
+                except (TypeError, ValueError):
+                    indices.append(None)
+            if all(index is not None for index in indices):
+                grouped[src] = [
+                    h for _, h in sorted(zip(indices, hits), key=lambda pair: pair[0])
+                ]
+        return grouped
+
     def get_by_source(self, source: str, where: Optional[Dict[str, Any]] = None) -> List[Hit]:
         """读取指定来源文档的全部分块，可叠加安全过滤条件。
 

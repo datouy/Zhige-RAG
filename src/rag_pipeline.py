@@ -892,17 +892,33 @@ class RAGPipeline:
             if window == 0:
                 return hits
             expand = getattr(self.vector_store, "get_by_source", None)
-            if not callable(expand):
+            batch = getattr(self.vector_store, "get_by_sources", None)
+            if not callable(expand) and not callable(batch):
                 return hits
             try:
                 safe_where = self._security_where(where, allowed_groups)
             except Exception:
                 safe_where = where
-            # 按source分组取全文（命中已按分数排，source首次出现顺序即相关度顺序）
+            # 按source分组取全文（命中已按分数排，source首次出现顺序即相关度顺序）。
+            # 优先用 get_by_sources 一次 $in 批量取回，替代逐 source 的 N+1 查询。
             seen: Dict[str, List[Hit]] = {}
+            sources: List[str] = []
             for h in hits:
                 src = str((h.metadata or {}).get("source") or "")
                 if src and src not in seen:
+                    seen[src] = []
+                    sources.append(src)
+            if callable(batch) and sources:
+                try:
+                    fetched = batch(sources, where=safe_where) or {}
+                    for src, hs in fetched.items():
+                        if src in seen:
+                            seen[src] = list(hs or [])
+                except Exception:
+                    for src in sources:
+                        seen[src] = []
+            elif callable(expand):
+                for src in sources:
                     try:
                         seen[src] = list(expand(src, where=safe_where) or [])
                     except Exception:
@@ -1399,11 +1415,23 @@ class RAGPipeline:
             if len(source_order) >= max_docs:
                 break
             source_order.append(source)
+            by_source[source] = []
+        batch = getattr(self.vector_store, "get_by_sources", None)
+        if callable(batch) and source_order:
             try:
-                by_source[source] = list(expand(source, where=safe_where) or [])
+                fetched = batch(source_order, where=safe_where) or {}
+                for source, hs in fetched.items():
+                    if source in by_source:
+                        by_source[source] = list(hs or [])
             except Exception as exc:  # noqa: BLE001
-                logger.warning("读取文档全文失败，保留检索片段（%s）: %s", source, exc)
-                by_source[source] = []
+                logger.warning("批量读取文档全文失败，保留检索片段: %s", exc)
+        else:
+            for source in source_order:
+                try:
+                    by_source[source] = list(expand(source, where=safe_where) or [])
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("读取文档全文失败，保留检索片段（%s）: %s", source, exc)
+                    by_source[source] = []
 
         merged: List[Hit] = []
         used = 0
