@@ -115,7 +115,10 @@ class LLMConcurrencyGate:
             self._release()
 
     async def __aenter__(self) -> _Lease:
-        return await self.acquire_async()
+        lease = await self.acquire_async()
+        # 把租约绑定到当前任务上下文，供同任务的 __aexit__ 读取并释放。
+        lease.context_token = self._lease_var.set(lease)
+        return lease
 
     async def __aexit__(self, exc_type, exc_val, exc_tb) -> bool:
         lease = self._lease_var.get()
@@ -148,17 +151,10 @@ class LLMConcurrencyGate:
             raise
         return self._new_lease()
 
-    async def release_async(self) -> None:
-        lease = self._lease_var.get()
-        if lease is None:
-            raise RuntimeError("release_async called without acquire_async")
-        self._lease_var.reset(lease.context_token)
-        lease.release()
-
     def _new_lease(self) -> _Lease:
-        lease = _Lease(self)
-        lease.context_token = self._lease_var.set(lease)
-        return lease
+        # 手工 acquire 路径不绑定 ContextVar：调用方用返回的 lease.release() 释放，
+        # 避免 ContextVar 在 asyncio.wait_for / gather 等跨任务场景下无法回传。
+        return _Lease(self)
 
     def _enqueue_or_acquire(
         self,

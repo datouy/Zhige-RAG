@@ -85,11 +85,12 @@ class TestGateApi:
         gate = LLMConcurrencyGate(max_concurrent=1)
 
         async def scenario():
-            await gate.acquire_async()
-            await gate.release_async()
-            # 释放后应能再次立即获取（若泄漏了就会挂死，这里用 wait_for 兜底）
-            await asyncio.wait_for(gate.acquire_async(), timeout=2.0)
-            await gate.release_async()
+            lease = await gate.acquire_async()
+            lease.release()
+            # 释放后应能再次立即获取（若泄漏了就会挂死，这里用 wait_for 兜底）。
+            # acquire 返回租约，跨 wait_for 也能拿到，不再依赖 ContextVar 回传。
+            lease2 = await asyncio.wait_for(gate.acquire_async(), timeout=2.0)
+            lease2.release()
 
         asyncio.run(scenario())
 
