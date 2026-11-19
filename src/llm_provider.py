@@ -44,6 +44,8 @@ from typing import Any, Dict, Generator, List, Optional
 from src.circuit_breaker import get_circuit_breaker
 from src.http_client import (
     RemoteServiceError,
+    async_post_json,
+    async_post_sse,
     build_headers,
     is_local_endpoint,
     post_json,
@@ -102,6 +104,7 @@ class OpenAICompatLLM:
         generation: Optional[GenerationConfig] = None,
         timeout: float = DEFAULT_TIMEOUT,
         provider_label: str = BACKEND_OPENAI,
+        http_backend: str = "sync",
     ) -> None:
         if not model_name:
             raise LLMProviderError(f"{provider_label} 后端缺少 model 配置")
@@ -114,6 +117,7 @@ class OpenAICompatLLM:
         self.gen_cfg = generation or GenerationConfig()
         self.timeout = float(timeout)
         self.provider_label = provider_label
+        self.http_backend = (http_backend or "sync").strip().lower()
 
     # ------------------------------------------------------------------
     def __repr__(self) -> str:  # pragma: no cover - 仅调试用
@@ -301,6 +305,79 @@ class OpenAICompatLLM:
                     yield delta
 
     # ------------------------------------------------------------------
+    #  可选异步后端（httpx）
+    # ------------------------------------------------------------------
+    @property
+    def supports_async(self) -> bool:
+        """是否启用异步 HTTP 后端（``llm.http_backend: httpx``）。"""
+        return self.http_backend == "httpx"
+
+    def achat(
+        self,
+        messages: List[Dict[str, str]],
+        generation: Optional[GenerationConfig] = None,
+        stream: bool = False,
+        timeout: Optional[float] = None,
+    ):
+        """异步对话生成（``httpx`` 非阻塞），签名与 ``chat`` 对齐。
+
+        - ``stream=False``：返回可 ``await`` 的协程，产出完整字符串；
+        - ``stream=True``：返回异步生成器，逐块产出增量文本。
+
+        供高并发异步消费者在事件循环内直接使用，避免同步 urllib 占住工作线程。
+        """
+        gen = generation or self.gen_cfg
+        if stream:
+            return self._astream_chat(messages, gen, timeout)
+        return self._achat_once(messages, gen, timeout)
+
+    async def _achat_once(
+        self, messages: List[Dict[str, str]], gen: GenerationConfig, timeout: Optional[float]
+    ) -> str:
+        breaker = get_circuit_breaker(
+            "llm",
+            failure_threshold=int(os.getenv("CB_LLM_FAILURE_THRESHOLD", "5") or 5),
+            timeout=float(os.getenv("CB_LLM_TIMEOUT", "60") or 60),
+        )
+        start = time.perf_counter()
+        async with get_llm_call_gate():
+            try:
+                data = await breaker.call_async(
+                    async_post_json,
+                    self._endpoint,
+                    self._build_payload(messages, gen, stream=False),
+                    headers=build_headers(self.api_key),
+                    timeout=timeout or self.timeout,
+                    label=self.provider_label,
+                    model=self.model_name,
+                )
+                metrics_collector.record_llm_request(
+                    "success", self.model_name, time.perf_counter() - start
+                )
+            except Exception:  # noqa: BLE001
+                metrics_collector.record_llm_request(
+                    "error", self.model_name, time.perf_counter() - start
+                )
+                raise
+        return self._parse_content(data)
+
+    async def _astream_chat(
+        self, messages: List[Dict[str, str]], gen: GenerationConfig, timeout: Optional[float]
+    ):
+        async with get_llm_call_gate():
+            async for chunk in async_post_sse(
+                self._endpoint,
+                self._build_payload(messages, gen, stream=True),
+                headers=build_headers(self.api_key),
+                timeout=timeout or self.timeout,
+                label=self.provider_label,
+                model=self.model_name,
+            ):
+                delta = self._extract_delta(chunk)
+                if delta:
+                    yield delta
+
+    # ------------------------------------------------------------------
     def _build_payload(
         self, messages: List[Dict[str, str]], gen: GenerationConfig, stream: bool
     ) -> Dict[str, Any]:
@@ -413,6 +490,7 @@ def _build_remote_llm(
         generation=gen,
         timeout=timeout,
         provider_label=backend,
+        http_backend=str(llm_cfg.get("http_backend") or "sync"),
     )
 
 

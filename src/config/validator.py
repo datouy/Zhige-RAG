@@ -55,6 +55,7 @@ class LLMGenerationConfig(_StrictModel):
 class LLMConfig(_StrictModel):
     """LLM 配置模型。"""
     backend: str = Field("local", description="local / ollama / openai")
+    http_backend: str = Field("sync", description="sync / httpx（可选异步 HTTP 后端）")
     ollama: Dict[str, Any] = Field(default_factory=dict)
     openai: Dict[str, Any] = Field(default_factory=dict)
     model_name: str = Field(..., description="模型名称或路径")

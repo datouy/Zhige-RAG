@@ -38,3 +38,9 @@ FlagEmbedding>=1.2.0
 # 多副本 / 多 worker 部署时安装，并设置 CACHE_STORAGE_URL（或 REDIS_URL），
 # 让不同进程共享检索与答案缓存，减少重复检索和 LLM 调用。
 redis>=4.0,<6.0
+
+# ---------- 可选异步 HTTP 后端（ollama/openai 高并发） ----------
+# 不装：远程 LLM/Embedding 走标准库 urllib 同步 I/O（默认，够用）。
+# 装了并设 llm.http_backend: httpx 后，异步问答接口可在事件循环内用
+# httpx.AsyncClient 做非阻塞请求，减少高并发下的线程与连接开销。
+httpx>=0.24,<0.29

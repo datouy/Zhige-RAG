@@ -393,6 +393,11 @@ decision:
 #   openai     —— 任意 OpenAI 兼容接口（可选）
 llm:
   backend: "extractive"
+  # 可选异步 HTTP 后端（仅 ollama/openai 后端生效）：
+  #   sync  —— 标准库 urllib，零额外依赖（默认，行为不变）
+  #   httpx —— httpx 异步客户端做非阻塞 I/O（需 pip install httpx），
+  #            供异步问答接口（astream_answer）等调用方按 supports_async 选用
+  http_backend: "sync"
 
   # --- backend: ollama ---
   # model 用 `ollama list` 显示的名字；Ollama 自带 OpenAI 兼容端点。

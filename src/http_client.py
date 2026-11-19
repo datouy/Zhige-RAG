@@ -352,6 +352,122 @@ def post_sse(
                 yield obj
 
 
+# ----------------------------------------------------------------------
+#  可选异步后端（httpx）
+# ----------------------------------------------------------------------
+def _httpx_import_error() -> RemoteServiceError:
+    return RemoteServiceError(
+        "异步 HTTP 后端需要安装 httpx：pip install -r requirements-optional.txt"
+    )
+
+
+def _async_trust_env(url: str) -> bool:
+    """异步后端同样要绕过本地/内网代理（与同步 ``opener_for`` 对齐）。"""
+    return not is_local_endpoint(url)
+
+
+async def async_post_json(
+    url: str,
+    payload: Dict[str, Any],
+    *,
+    headers: Dict[str, str],
+    timeout: float,
+    label: str,
+    model: str = "",
+) -> Dict[str, Any]:
+    """异步 POST 并返回解析后的 JSON 对象（``httpx.AsyncClient``）。
+
+    语义与 :func:`post_json` 一致，只是运行在事件循环里，不阻塞线程；
+    用于多 worker / 高并发下给远程 LLM 与 Embedding 提供真正的非阻塞 I/O。
+    未安装 ``httpx`` 时抛出带可操作提示的 :class:`RemoteServiceError`。
+    """
+    try:
+        import httpx
+    except ImportError as exc:
+        raise _httpx_import_error() from exc
+
+    try:
+        async with httpx.AsyncClient(timeout=timeout, trust_env=_async_trust_env(url)) as client:
+            resp = await client.post(url, json=payload, headers=headers)
+            if resp.status_code == 401:
+                raise RemoteServiceError(f"{label} 鉴权失败：请检查 api_key [url={url}, model={model}]")
+            if resp.status_code == 404:
+                raise RemoteServiceError(f"{label} 路径不存在：base_url 是否正确？ [url={url}, model={model}]")
+            if resp.status_code == 429:
+                raise RemoteServiceError(f"{label} 触发限流或余额不足 [url={url}, model={model}]")
+            if not (200 <= resp.status_code < 300):
+                raise RemoteServiceError(
+                    f"{label} 返回 HTTP {resp.status_code}。请检查 base_url、模型名与账号状态。[url={url}, model={model}]"
+                )
+            raw = resp.text
+    except RemoteServiceError:
+        raise
+    except httpx.HTTPError as exc:
+        raise RemoteServiceError(
+            describe_url_error(exc, label=label, base_url=url, model=model)
+        ) from exc
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RemoteServiceError(f"{label} 返回了非 JSON 内容：{raw[:200]}") from exc
+    if not isinstance(data, dict):
+        raise RemoteServiceError(f"{label} 返回体不是对象：{raw[:200]}")
+    return data
+
+
+async def async_post_sse(
+    url: str,
+    payload: Dict[str, Any],
+    *,
+    headers: Dict[str, str],
+    timeout: float,
+    label: str,
+    model: str = "",
+):
+    """异步 POST 并按 SSE 逐条产出解析后的 JSON 分片（``httpx`` 流式）。
+
+    语义与 :func:`post_sse` 一致：忽略注释行/空行，遇 ``data: [DONE]`` 结束。
+    """
+    try:
+        import httpx
+    except ImportError as exc:
+        raise _httpx_import_error() from exc
+
+    try:
+        async with httpx.AsyncClient(timeout=timeout, trust_env=_async_trust_env(url)) as client:
+            async with client.stream("POST", url, json=payload, headers=headers) as resp:
+                if resp.status_code == 401:
+                    raise RemoteServiceError(f"{label} 鉴权失败：请检查 api_key [url={url}, model={model}]")
+                if resp.status_code == 404:
+                    raise RemoteServiceError(f"{label} 路径不存在：base_url 是否正确？ [url={url}, model={model}]")
+                if resp.status_code == 429:
+                    raise RemoteServiceError(f"{label} 触发限流或余额不足 [url={url}, model={model}]")
+                if not (200 <= resp.status_code < 300):
+                    raise RemoteServiceError(
+                        f"{label} 返回 HTTP {resp.status_code}。请检查 base_url、模型名与账号状态。[url={url}, model={model}]"
+                    )
+                async for raw_line in resp.aiter_lines():
+                    line = raw_line.strip()
+                    if not line or not line.startswith("data:"):
+                        continue
+                    body = line[len("data:"):].strip()
+                    if body == "[DONE]":
+                        return
+                    try:
+                        obj = json.loads(body)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(obj, dict):
+                        yield obj
+    except RemoteServiceError:
+        raise
+    except httpx.HTTPError as exc:
+        raise RemoteServiceError(
+            describe_url_error(exc, label=label, base_url=url, model=model)
+        ) from exc
+
+
 __all__ = [
     "RemoteServiceError",
     "build_headers",
@@ -362,4 +478,6 @@ __all__ = [
     "opener_for",
     "post_json",
     "post_sse",
+    "async_post_json",
+    "async_post_sse",
 ]
