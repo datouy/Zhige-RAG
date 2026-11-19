@@ -143,3 +143,7 @@ python scripts/backfill_chunk_index.py --write
 | `rag.mapreduce.detail_chunks` | `0` | 摘要之外附多少块原始细节；`0` = 只给摘要 |
 | `rag.verification.synthesis_aware` | `true` | `false` 恢复旧行为（提炼句也会被判编造） |
 | `retrieval.top_k` | `8` | 候选分块数；检索不准时调大，但会被 `max_context_tokens` 截 |
+| `retrieval.cache_ttl_seconds` | `900` | 检索语义缓存 TTL（秒）；同问复用检索结果，多 worker 可配 Redis 共享 |
+| `retrieval.answer_cache_enabled` | `true` | 答案级语义缓存：同问同库 24h 内直接复用整答 |
+| `rag.extractive.min_term_hits` | `1` | 无 LLM 模式词面重叠兜底：所有命中块词面重叠低于该值就拒答而非硬答；`0` 恢复旧行为 |
+| `reranker.enabled` | `false` | 交叉编码器重排开关；需先安装 torch/FlagEmbedding 并下载重排权重，否则会“显示开启、实际停用” |

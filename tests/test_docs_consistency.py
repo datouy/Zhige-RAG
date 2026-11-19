@@ -74,6 +74,10 @@ DOC_PARAM_TO_CONFIG = {
     "rag.mapreduce.detail_chunks": "rag.mapreduce.detail_chunks",
     "rag.verification.synthesis_aware": "rag.verification.synthesis_aware",
     "retrieval.top_k": "retrieval.top_k",
+    "retrieval.cache_ttl_seconds": "retrieval.cache_ttl_seconds",
+    "retrieval.answer_cache_enabled": "retrieval.answer_cache_enabled",
+    "rag.extractive.min_term_hits": "rag.extractive.min_term_hits",
+    "reranker.enabled": "reranker.enabled",
 }
 
 
