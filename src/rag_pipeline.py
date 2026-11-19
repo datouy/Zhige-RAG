@@ -32,6 +32,13 @@ from .query_router import classify_query, is_aggregate_query
 from .reranker import BgeReranker
 from .utils import Timer, get_logger, load_config, merge_dict
 from .vector_store import ChromaStore, Hit, hybrid_kwargs
+from .cache import (
+    build_shared_cache,
+    deserialize_hits,
+    deserialize_result,
+    serialize_hits,
+    serialize_result,
+)
 
 logger = get_logger("rag_pipeline")
 
@@ -249,6 +256,9 @@ class RAGPipeline:
         # 命中时跳过检索+LLM，TTFT≈0。键含collection/kb防串库；有history/流式不缓存。
         self._answer_cache: Dict[Any, tuple[float, RAGResult]] = {}
         self._answer_cache_lock = threading.Lock()
+        # 跨进程共享缓存（可选 Redis）：多 worker 下复用检索/答案；未配置或未装
+        # redis 包时为 None（退化为纯进程内缓存，行为不变）。
+        self._shared_cache = build_shared_cache()
         self.reranker = reranker
         # d1 决策层（可选）：驱动重排 / 路由 / 校验三处增强。
         # 显式注入优先；未注入时 _get_decision_provider 按配置懒加载。
@@ -528,12 +538,26 @@ class RAGPipeline:
             self._retrieval_cache_lock = lock
             self._retrieval_cache = cache
         _move_to_end = getattr(cache, "move_to_end", None)
+        shared = getattr(self, "_shared_cache", None)
         with lock:
             entry = cache.get(key)
             if entry is not None and now - entry[0] < ttl:
                 if _move_to_end is not None:
                     _move_to_end(key)
                 return entry[1]
+
+        # 进程内未命中 → 尝试跨进程共享缓存（多 worker 共享命中）。Redis 不可用
+        # 时静默降级，继续走真实检索。
+        if shared is not None:
+            try:
+                raw = shared.get(self._cache_scope(), self._shared_key("r", key))
+                if raw is not None:
+                    hits = deserialize_hits(raw.decode("utf-8", errors="ignore"))
+                    with lock:
+                        cache[key] = (now, hits)
+                    return hits
+            except Exception:
+                pass
 
         try:
             with Timer("retrieve"):
@@ -563,7 +587,38 @@ class RAGPipeline:
                     cache.popitem(last=False)
                 else:
                     cache.pop(next(iter(cache)), None)
+        if shared is not None:
+            try:
+                shared.set(
+                    self._cache_scope(),
+                    self._shared_key("r", key),
+                    serialize_hits(hits).encode("utf-8"),
+                    ttl,
+                )
+            except Exception:
+                pass
         return hits
+
+    # ---------------- 跨进程共享缓存（可选 Redis） ----------------
+    def _cache_scope(self) -> str:
+        """共享缓存的 scope：按知识库隔离，避免多库/多租户串缓存。
+
+        用集合名的 SHA1 短摘要，规避集合名里可能含有的 Redis glob 元字符
+        （``*`` / ``?`` / ``[``）导致 ``scan_iter`` 匹配错位。
+        """
+        import hashlib
+
+        name = getattr(self.vector_store, "collection_name", "") or "default"
+        return hashlib.sha1(name.encode("utf-8")).hexdigest()[:16]
+
+    @staticmethod
+    def _shared_key(prefix: str, key: Any) -> str:
+        """把进程内缓存键（tuple）编码为共享缓存的稳定字符串键。"""
+        import json
+
+        return prefix + ":" + json.dumps(
+            key, sort_keys=True, default=str, ensure_ascii=False
+        )
 
     # ---------------- P1 答案级语义缓存 ----------------
     def _collection_version(self) -> Any:
@@ -623,25 +678,42 @@ class RAGPipeline:
             return None
         with lock:
             ent = cache.get(key)
-            if ent is None:
-                return None
-            ts, res = ent
-            if time.time() - ts >= ttl:
-                cache.pop(key, None)
-                return None
-            # 必须返回**副本**：调用方会就地改写返回对象（如给 timings 加
-            # cache_hit 标记），若直接返回缓存里的那一份，第一次命中就把
-            # 缓存本身改了 —— 后面所有命中都会带着上一次调用的脏数据，
-            # 计时信息也会被越写越乱。
-            return _copy_result(res)
+            if ent is not None:
+                ts, res = ent
+                if time.time() - ts >= ttl:
+                    cache.pop(key, None)
+                else:
+                    # 必须返回**副本**：调用方会就地改写返回对象（如给 timings 加
+                    # cache_hit 标记），若直接返回缓存里的那一份，第一次命中就把
+                    # 缓存本身改了 —— 后面所有命中都会带着上一次调用的脏数据，
+                    # 计时信息也会被越写越乱。
+                    return _copy_result(res)
+
+        # 进程内未命中 → 尝试跨进程共享缓存（多 worker 共享命中），命中后回填
+        # 进程内缓存，供本进程后续请求直接命中。
+        shared = getattr(self, "_shared_cache", None)
+        if shared is not None:
+            try:
+                raw = shared.get(self._cache_scope(), self._shared_key("a", key))
+                if raw is not None:
+                    res = deserialize_result(raw.decode("utf-8", errors="ignore"))
+                    with lock:
+                        cache[key] = (time.time(), _copy_result(res))
+                    return res
+            except Exception:
+                pass
+        return None
 
     def _answer_cache_put(self, key: Any, res: RAGResult) -> None:
         try:
             rcfg = self.config.get("retrieval", {}) or {}
             if not rcfg.get("answer_cache_enabled", True):
                 return
+            ttl = float(rcfg.get("answer_cache_ttl_seconds", 86400))
+        except (TypeError, ValueError):
+            ttl = 86400.0
         except Exception:
-            pass
+            ttl = 86400.0
         lock = getattr(self, "_answer_cache_lock", None)
         cache = getattr(self, "_answer_cache", None)
         if lock is None or cache is None:
@@ -653,6 +725,17 @@ class RAGPipeline:
             if len(cache) > 200:
                 oldest = next(iter(cache))
                 cache.pop(oldest, None)
+        shared = getattr(self, "_shared_cache", None)
+        if shared is not None:
+            try:
+                shared.set(
+                    self._cache_scope(),
+                    self._shared_key("a", key),
+                    serialize_result(res).encode("utf-8"),
+                    ttl,
+                )
+            except Exception:
+                pass
 
     def invalidate_answer_cache(self) -> None:
         """入库/配置变更后调用，避免旧答案残留。"""
@@ -663,6 +746,12 @@ class RAGPipeline:
                 self._retrieval_cache.clear()
         except Exception:
             pass
+        shared = getattr(self, "_shared_cache", None)
+        if shared is not None:
+            try:
+                shared.clear_scope(self._cache_scope())
+            except Exception:
+                pass
 
     def _query_variants(self, query: str) -> List[str]:
         """P1 多路召回：原问 + 去填充词 + HyDE假设答案（可选）取并集RRF。

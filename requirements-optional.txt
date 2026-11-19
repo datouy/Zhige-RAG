@@ -32,3 +32,9 @@ rank-bm25>=0.2.2
 # FlagEmbedding：bge-reranker 重排模型（config.yaml 的 reranker.enabled）。
 # 依赖较重，且需要另行下载 reranker 权重；不装时 reranker 自动跳过。
 FlagEmbedding>=1.2.0
+
+# ---------- 跨进程共享缓存（多 worker 部署） ----------
+# 不装：检索/答案缓存仅存活在单个进程内（单 worker 已足够）。
+# 多副本 / 多 worker 部署时安装，并设置 CACHE_STORAGE_URL（或 REDIS_URL），
+# 让不同进程共享检索与答案缓存，减少重复检索和 LLM 调用。
+redis>=4.0,<6.0

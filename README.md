@@ -342,6 +342,7 @@ EMBEDDING_BACKEND=onnx             # 本地 CPU 向量
 | LLM_QUEUE_TIMEOUT | 120 | LLM 调用排队等待超时（秒） |
 | RATE_LIMIT_STORAGE_URL | 空=内存 | 限流计数存储；多副本部署指向 redis://... |
 | REDIS_URL | 空 | Redis 地址（RATE_LIMIT_STORAGE_URL 未设时作为回退） |
+| CACHE_STORAGE_URL | 空=进程内 | 检索/答案共享缓存存储；多 worker 部署指向 redis://...（回退 REDIS_URL） |
 | HEALTH_CACHE_TTL | 5 | 健康检查结果缓存秒数，避免探针穿透下游 |
 | READY_TIMEOUT_SECONDS | 10 | 就绪探针（/api/ready）硬超时，防止依赖卡死 |
 | INGEST_MAX_PENDING | 100 | 异步入库排队上限；超出拒绝新任务（背压） |
