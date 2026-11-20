@@ -95,3 +95,14 @@ def test_stats_reports_pending():
     assert s["total"] == 2
     assert s["pending"] == 2
 
+
+def test_list_jobs_is_recent_first_and_filterable(monkeypatch):
+    older = ij.create_job("file", "older.txt")
+    newer = ij.create_job("url", "https://example.com")
+    ij._update(older, status="failed", error="network")
+    ij._update(newer, status="done")
+
+    assert [job["job_id"] for job in ij.list_jobs(limit=2)] == [newer, older]
+    assert [job["job_id"] for job in ij.list_jobs(status="failed")] == [older]
+    assert ij.list_jobs(limit=1)[0]["status"] == "done"
+

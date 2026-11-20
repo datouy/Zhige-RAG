@@ -25,7 +25,7 @@ import time
 import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from src.utils import get_logger, resolve_path
 
@@ -134,6 +134,23 @@ def get_job(job_id: str) -> Optional[Dict[str, Any]]:
     with _JOBS_LOCK:
         job = _JOBS.get(job_id)
         return dict(job) if job else None
+
+
+def list_jobs(limit: int = 50, status: Optional[str] = None) -> List[Dict[str, Any]]:
+    """返回最近任务快照，时间倒序；可按状态过滤。"""
+    capped = max(1, min(int(limit), 200))
+    with _JOBS_LOCK:
+        jobs = [dict(job) for job in _JOBS.values()]
+    if status:
+        jobs = [job for job in jobs if job.get("status") == status]
+    jobs.sort(
+        key=lambda job: (
+            float(job.get("created_at") or 0),
+            float(job.get("updated_at") or 0),
+        ),
+        reverse=True,
+    )
+    return jobs[:capped]
 
 
 def _update(job_id: str, **fields: Any) -> None:

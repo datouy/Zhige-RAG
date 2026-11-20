@@ -25,6 +25,7 @@ from fastapi import (
     File,
     Form,
     HTTPException,
+    Query,
     Request,
     UploadFile,
     WebSocket,
@@ -247,32 +248,149 @@ def _commit_ingestion_metadata(
         db.close()
 
 
+def _group_chunks_by_source(chunks: List[Any]) -> Dict[str, List[Any]]:
+    grouped: Dict[str, List[Any]] = {}
+    for chunk in chunks:
+        metadata = dict(chunk.metadata or {})
+        source = str(metadata.get("source") or metadata.get("filepath") or "unknown")
+        grouped.setdefault(source, []).append(chunk)
+    return grouped
+
+
+def _source_content_hash(source_chunks: List[Any]) -> str:
+    content = "\n".join(str(chunk.text or "") for chunk in source_chunks)
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+def _partition_changed_sources(
+    user_id: str,
+    kb_id: str,
+    chunks: List[Any],
+) -> tuple[List[Any], List[str], Dict[str, int]]:
+    """按来源比较现有 content_hash；读取失败时保守地全量重建。"""
+    grouped = _group_chunks_by_source(chunks)
+    if not grouped:
+        return [], [], {"scanned": 0, "changed": 0, "unchanged": 0}
+
+    sources = sorted(grouped)
+    db = SessionLocal()
+    try:
+        records = (
+            db.query(DocumentRecord.source, DocumentRecord.content_hash)
+            .filter(
+                DocumentRecord.user_id == user_id,
+                DocumentRecord.kb_id == kb_id,
+                DocumentRecord.source.in_(sources),
+            )
+            .all()
+        )
+        existing_hashes = {
+            str(row.source): str(row.content_hash or "") for row in records
+        }
+    except Exception as exc:  # noqa: BLE001 - 读台账失败时全量重建更安全
+        logger.warning("增量同步读取台账失败，改为全量写入: %s", exc)
+        existing_hashes = {}
+    finally:
+        db.close()
+
+    changed_sources: List[str] = []
+    changed_chunks: List[Any] = []
+    for source in sources:
+        source_chunks = grouped[source]
+        if existing_hashes.get(source) == _source_content_hash(source_chunks):
+            continue
+        changed_sources.append(source)
+        changed_chunks.extend(source_chunks)
+
+    return changed_chunks, changed_sources, {
+        "scanned": len(sources),
+        "changed": len(changed_sources),
+        "unchanged": len(sources) - len(changed_sources),
+    }
+
+
+def _replace_changed_sources(
+    *,
+    store: Any,
+    user_id: str,
+    kb_id: str,
+    chunks: List[Any],
+    report: Dict[str, Any],
+) -> tuple[int, Dict[str, int]]:
+    """只重嵌内容确实变化的来源，并把结果摘要写进入库报告。"""
+    changed_chunks, changed_sources, summary = _partition_changed_sources(
+        user_id, kb_id, chunks
+    )
+    report["incremental"] = summary
+    if not changed_sources:
+        return 0, summary
+    inserted = store.replace_chunks_for_sources(
+        changed_chunks,
+        changed_sources,
+        on_commit=lambda: _commit_ingestion_metadata(
+            user_id, changed_chunks, report, kb_id
+        ),
+    )
+    return inserted, summary
+
+
 # =========================== Documents ===========================
 @router.get("/api/v1/documents", tags=["文档"])
 async def list_documents(
+    kb_id: Optional[str] = Query(None, description="按知识库过滤"),
+    source_type: Optional[str] = Query(
+        None, pattern="^(file|web)$", description="按文件或网页过滤"
+    ),
+    sort: str = Query("recent", pattern="^(recent|name)$"),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
     """列出已入库文档（按 source 聚合，合并数据层台账的状态/权限/更新时间）。需要认证。"""
     user: User = current_user
     try:
-        records = (
-            db.query(DocumentRecord)
-            .filter(DocumentRecord.user_id == user.id)
-            .order_by(DocumentRecord.source.asc(), DocumentRecord.kb_id.asc())
-            .all()
-        )
+        query = db.query(DocumentRecord).filter(DocumentRecord.user_id == user.id)
+        if kb_id:
+            query = query.filter(DocumentRecord.kb_id == kb_id)
+        records = query.all()
+
+        def _document_type(record: DocumentRecord) -> str:
+            ext = str(record.file_ext or "").lower()
+            return "web" if ext == ".url" or str(record.source or "").startswith(("http://", "https://")) else "file"
+
+        if source_type:
+            records = [record for record in records if _document_type(record) == source_type]
+        if sort == "recent":
+            records.sort(
+                key=lambda record: (
+                    record.updated_at_source or record.updated_at or record.created_at
+                ).timestamp()
+                if (record.updated_at_source or record.updated_at or record.created_at)
+                else 0,
+                reverse=True,
+            )
+        else:
+            records.sort(
+                key=lambda record: (
+                    str(record.title or record.source or "").lower(),
+                    str(record.source or "").lower(),
+                )
+            )
+
         documents = [
             {
                 "source": record.source,
                 "title": record.title,
                 "kb_id": record.kb_id,
                 "chunks": int(record.chunk_count or 0),
+                "file_ext": record.file_ext,
+                "source_type": _document_type(record),
                 "doc_status": record.doc_status,
                 "acl": record.acl,
                 "updated_at_source": record.updated_at_source.strftime("%Y-%m-%d %H:%M:%S")
                 if record.updated_at_source
                 else None,
+                "created_at": record.created_at.isoformat() if record.created_at else None,
+                "updated_at": record.updated_at.isoformat() if record.updated_at else None,
                 "content_hash": record.content_hash,
             }
             for record in records
@@ -627,7 +745,9 @@ def _maybe_trigger_kg_build(user_id: str, cfg: Dict[str, Any]) -> None:
         from src.ingest_jobs import create_job, submit as _submit_job
         from scripts.build_kg import build as _build_kg
 
-        job_id = create_job("kg_build", "知识图谱自动构建", {"dir": str(raw_dir)})
+        job_id = create_job(
+            "kg_build", "知识图谱自动构建", {"dir": str(raw_dir), "user_id": user_id}
+        )
 
         def _bg(reporter) -> Dict[str, Any]:
             reporter(0.05, "extract")
@@ -689,7 +809,7 @@ async def ingest_file(
             _orig_name = file.filename
             _tmp = str(temp_path)
             job_id = create_job("file", _orig_name or safe_name,
-                               {"kb_id": _kbid, "path": _tmp})
+                               {"kb_id": _kbid, "path": _tmp, "user_id": user.id})
 
             def _bg_file(reporter) -> Dict[str, Any]:
                 from pathlib import Path as _P
@@ -724,14 +844,14 @@ async def ingest_file(
                             "collection_name": _kb_early["collection_name"]}
                 _store = TenantAwareFactory.get_chroma_store_by_name(
                     _kb_info["collection_name"], _cfg_snapshot)
-                _srcs = sorted({str(c.metadata.get("source")
-                                    or c.metadata.get("filepath") or "unknown")
-                                for c in chunks})
                 # 分批128由 add_chunks 内部处理；大文件不一次性爆内存
-                n = _store.replace_chunks_for_sources(
-                    chunks, _srcs,
-                    on_commit=lambda: _commit_ingestion_metadata(
-                        _uid, chunks, rep, _kbid))
+                n, incremental = _replace_changed_sources(
+                    store=_store,
+                    user_id=_uid,
+                    kb_id=_kbid,
+                    chunks=chunks,
+                    report=rep,
+                )
                 reporter(0.95, "invalidate")
                 try:
                     from api.deps import get_runtime_pipeline as _grp
@@ -741,6 +861,8 @@ async def ingest_file(
                 _maybe_trigger_kg_build(_uid, _cfg_snapshot)
                 return {"filename": _orig_name, "docs": len(docs),
                         "chunks": len(chunks), "ingested": n,
+                        "changed": incremental["changed"],
+                        "unchanged": incremental["unchanged"],
                         "kb_id": _kbid, "data_quality": rep}
 
             _submit_job(_bg_file, job_id)
@@ -795,23 +917,16 @@ async def ingest_file(
             c.metadata["kb_id"] = kb["id"]
         store = TenantAwareFactory.get_chroma_store_by_name(kb["collection_name"], cfg)
 
-        sources = sorted(
-            {
-                str(c.metadata.get("source") or c.metadata.get("filepath") or "unknown")
-                for c in all_chunks
-            }
-        )
-
-        def _replace() -> int:
-            return store.replace_chunks_for_sources(
-                all_chunks,
-                sources,
-                on_commit=lambda: _commit_ingestion_metadata(
-                    user.id, all_chunks, report, kb["id"]
-                ),
+        def _replace() -> tuple[int, Dict[str, int]]:
+            return _replace_changed_sources(
+                store=store,
+                user_id=user.id,
+                kb_id=kb["id"],
+                chunks=all_chunks,
+                report=report,
             )
 
-        n = await run_in_threadpool(_replace)
+        n, incremental = await run_in_threadpool(_replace)
 
         # P1：入库成功后失效答案/检索缓存，避免旧答案残留
         try:
@@ -827,6 +942,8 @@ async def ingest_file(
             "docs": docs_count,
             "chunks": len(all_chunks),
             "ingested": n,
+            "changed": incremental["changed"],
+            "unchanged": incremental["unchanged"],
             "data_quality": report,
         }
     except HTTPException:
@@ -834,6 +951,24 @@ async def ingest_file(
     except Exception as exc:
         logger.error("文件入库失败: %s", exc)
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.get("/api/v1/ingest/jobs", tags=["文档"])
+def ingest_job_list(
+    limit: int = Query(50, ge=1, le=200),
+    status: Optional[str] = Query(None, pattern="^(queued|running|done|failed|interrupted)$"),
+    current_user: User = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """最近入库任务；客户端任务中心和 AX 共用这一份稳定快照。"""
+    from src.ingest_jobs import list_jobs, stats
+
+    jobs = [
+        job
+        for job in list_jobs(limit=limit, status=status)
+        if not job.get("meta", {}).get("user_id")
+        or job["meta"]["user_id"] == current_user.id
+    ]
+    return {"jobs": jobs, "total": len(jobs), **stats()}
 
 
 @router.get("/api/v1/ingest/jobs/{job_id}", tags=["文档"])
@@ -850,6 +985,9 @@ def ingest_job_status(
 
     job = get_job(job_id)
     if job is None:
+        raise HTTPException(status_code=404, detail=f"任务不存在: {job_id}")
+    owner_id = job.get("meta", {}).get("user_id")
+    if owner_id and owner_id != current_user.id:
         raise HTTPException(status_code=404, detail=f"任务不存在: {job_id}")
     return job
 
@@ -893,7 +1031,11 @@ async def ingest_url(
             _cfg_snapshot = dict(cfg)
             _body_url, _body_title = body.url, body.title
             _body_timeout = body.timeout
-            job_id = create_job("url", _body_url, {"kb_id": _kbid})
+            job_id = create_job(
+                "url",
+                _body_url,
+                {"kb_id": _kbid, "url": _body_url, "user_id": user.id},
+            )
 
             def _bg_url(reporter) -> Dict[str, Any]:
                 from src.document_loader import Document as _Doc
@@ -925,10 +1067,13 @@ async def ingest_url(
                 reporter(0.7, "upsert")
                 _store = TenantAwareFactory.get_chroma_store_by_name(
                     _kb_early["collection_name"], _cfg_snapshot)
-                n = _store.replace_chunks_for_sources(
-                    chunks, [source],
-                    on_commit=lambda: _commit_ingestion_metadata(
-                        _uid, chunks, rep, _kbid))
+                n, incremental = _replace_changed_sources(
+                    store=_store,
+                    user_id=_uid,
+                    kb_id=_kbid,
+                    chunks=chunks,
+                    report=rep,
+                )
                 try:
                     from api.deps import get_runtime_pipeline as _grp
                     _grp(user_id=_uid).invalidate_answer_cache()
@@ -937,7 +1082,9 @@ async def ingest_url(
                 _maybe_trigger_kg_build(_uid, _cfg_snapshot)
                 return {"url": page["url"], "final_url": source, "title": title,
                         "chars": int(page["chars"]), "docs": len(docs),
-                        "chunks": len(chunks), "ingested": n, "kb_id": _kbid}
+                        "chunks": len(chunks), "ingested": n,
+                        "changed": incremental["changed"],
+                        "unchanged": incremental["unchanged"], "kb_id": _kbid}
 
             _submit_job(_bg_url, job_id)
             return {"job_id": job_id, "status": "queued", "url": body.url,
@@ -1003,16 +1150,16 @@ async def ingest_url(
             c.metadata["kb_id"] = kb["id"]
         store = TenantAwareFactory.get_chroma_store_by_name(kb["collection_name"], cfg)
 
-        def _replace() -> int:
-            return store.replace_chunks_for_sources(
-                chunks,
-                [source],
-                on_commit=lambda: _commit_ingestion_metadata(
-                    user.id, chunks, report, kb["id"]
-                ),
+        def _replace() -> tuple[int, Dict[str, int]]:
+            return _replace_changed_sources(
+                store=store,
+                user_id=user.id,
+                kb_id=kb["id"],
+                chunks=chunks,
+                report=report,
             )
 
-        n = await run_in_threadpool(_replace)
+        n, incremental = await run_in_threadpool(_replace)
 
         # P1：入库成功后失效答案/检索缓存，避免旧答案残留
         try:
@@ -1031,6 +1178,8 @@ async def ingest_url(
             "docs": len(docs),
             "chunks": len(chunks),
             "ingested": n,
+            "changed": incremental["changed"],
+            "unchanged": incremental["unchanged"],
             "data_quality": report,
         }
     except HTTPException:
@@ -1072,7 +1221,11 @@ async def ingest_directory(
 
             _kb_e, _uid, _cfg_s = kb, user.id, dict(cfg)
             _tgt, _rec = str(target), bool(recursive)
-            job_id = create_job("dir", _tgt, {"kb_id": _kb_e["id"]})
+            job_id = create_job(
+                "dir",
+                _tgt,
+                {"kb_id": _kb_e["id"], "dir": _tgt, "user_id": user.id},
+            )
 
             def _bg_dir(reporter) -> Dict[str, Any]:
                 reporter(0.1, "parse")
@@ -1104,13 +1257,13 @@ async def ingest_directory(
                 reporter(0.6, "upsert")
                 _store = TenantAwareFactory.get_chroma_store_by_name(
                     _kb_e["collection_name"], _cfg_s)
-                _srcs = sorted({str(c.metadata.get("source")
-                                    or c.metadata.get("filepath") or "unknown")
-                                for c in chunks})
-                n = _store.replace_chunks_for_sources(
-                    chunks, _srcs,
-                    on_commit=lambda: _commit_ingestion_metadata(
-                        _uid, chunks, rep, _kb_e["id"]))
+                n, incremental = _replace_changed_sources(
+                    store=_store,
+                    user_id=_uid,
+                    kb_id=_kb_e["id"],
+                    chunks=chunks,
+                    report=rep,
+                )
                 try:
                     from api.deps import get_runtime_pipeline as _grp2
                     _grp2(user_id=_uid).invalidate_answer_cache()
@@ -1118,7 +1271,8 @@ async def ingest_directory(
                     pass
                 _maybe_trigger_kg_build(_uid, _cfg_s)
                 return {"dir": _tgt, "docs": len(docs), "chunks": len(chunks),
-                        "ingested": n, "kb_id": _kb_e["id"]}
+                        "ingested": n, "changed": incremental["changed"],
+                        "unchanged": incremental["unchanged"], "kb_id": _kb_e["id"]}
 
             _submit_job(_bg_dir, job_id)
             return {"job_id": job_id, "status": "queued", "dir": str(target),
@@ -1164,23 +1318,16 @@ async def ingest_directory(
             raise HTTPException(status_code=400, detail="目录中没有可入库内容")
 
         store = TenantAwareFactory.get_chroma_store_by_name(kb["collection_name"], cfg)
-        sources = sorted(
-            {
-                str(c.metadata.get("source") or c.metadata.get("filepath") or "unknown")
-                for c in all_chunks
-            }
-        )
-
-        def _replace() -> int:
-            return store.replace_chunks_for_sources(
-                all_chunks,
-                sources,
-                on_commit=lambda: _commit_ingestion_metadata(
-                    user.id, all_chunks, report, kb["id"]
-                ),
+        def _replace() -> tuple[int, Dict[str, int]]:
+            return _replace_changed_sources(
+                store=store,
+                user_id=user.id,
+                kb_id=kb["id"],
+                chunks=all_chunks,
+                report=report,
             )
 
-        n = await run_in_threadpool(_replace)
+        n, incremental = await run_in_threadpool(_replace)
 
         # P1：入库成功后失效答案/检索缓存，避免旧答案残留
         try:
@@ -1196,6 +1343,8 @@ async def ingest_directory(
             "docs": docs_count,
             "chunks": len(all_chunks),
             "ingested": n,
+            "changed": incremental["changed"],
+            "unchanged": incremental["unchanged"],
             "kb_id": kb["id"],
             "data_quality": report,
         }
