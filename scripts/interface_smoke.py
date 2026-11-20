@@ -8,7 +8,9 @@
 """
 from __future__ import annotations
 
+import argparse
 import json
+import os
 import time
 import urllib.error
 import urllib.request
@@ -16,7 +18,7 @@ from datetime import datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-BASE = "http://127.0.0.1:8000"
+BASE = os.getenv("ZHIGE_API_BASE", "http://127.0.0.1:8000").rstrip("/")
 LOG = ROOT / "logs" / "interface_smoke.log"
 LOG.parent.mkdir(parents=True, exist_ok=True)
 
@@ -73,7 +75,7 @@ def _brief(payload, raw, limit: int = 200):
     return ""
 
 
-def main() -> int:
+def main(*, skip_chat: bool = False) -> int:
     print("=" * 72, flush=True)
     print(f"接口冒烟测试  {datetime.now():%Y-%m-%d %H:%M:%S}", flush=True)
     print(f"目标: {BASE}", flush=True)
@@ -94,8 +96,8 @@ def main() -> int:
     check("语义检索 search", "POST", "/api/v1/search",
           {"query": "RAG 是什么", "top_k": 3}, timeout=60)
     check("运行配置 config", "GET", "/api/v1/config", timeout=15)
-    check("订阅档位 tiers", "GET", "/api/v1/subscription/tiers", timeout=15)
-    check("当前订阅 current", "GET", "/api/v1/subscription/current", timeout=15)
+    check("配置默认值 defaults", "GET", "/api/v1/config/defaults", timeout=15)
+    check("会话列表 sessions", "GET", "/api/v1/sessions?limit=1", timeout=15)
     check("反馈统计 stats", "GET", "/api/v1/feedback/stats", timeout=15)
     check("长期记忆 memory", "GET", "/api/v1/memory", timeout=15)
     check("Agent 工具列表", "GET", "/api/v1/agent/tools", timeout=15)
@@ -110,13 +112,16 @@ def main() -> int:
           {"cypher": "MATCH (n) RETURN n LIMIT 3", "params": {}}, timeout=15)
 
     # 5) 聊天问答（会触发真实 LLM 加载，给足超时）
-    print("\n[...] 聊天接口将触发 LLM 加载，可能耗时数分钟 ...", flush=True)
-    st, body, dt = check("聊天问答 chat", "POST", "/api/v1/chat",
-                         {"query": "用一句话介绍中文 RAG 知识库", "top_k": 3},
-                         timeout=600, expect=(200,))
-    if isinstance(body, dict):
-        ans = body.get("answer") or body.get("text") or ""
-        print(f"      回答预览: {str(ans)[:120]}", flush=True)
+    if skip_chat:
+        print("\n[SKIP] 聊天问答 chat（--skip-chat）", flush=True)
+    else:
+        print("\n[...] 聊天接口将触发 LLM 加载，可能耗时数分钟 ...", flush=True)
+        st, body, dt = check("聊天问答 chat", "POST", "/api/v1/chat",
+                             {"query": "用一句话介绍中文 RAG 知识库", "top_k": 3},
+                             timeout=600, expect=(200,))
+        if isinstance(body, dict):
+            ans = body.get("answer") or body.get("text") or ""
+            print(f"      回答预览: {str(ans)[:120]}", flush=True)
 
     return _finish()
 
@@ -148,4 +153,11 @@ def _finish() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    parser = argparse.ArgumentParser(description="知阁接口冒烟测试")
+    parser.add_argument(
+        "--skip-chat",
+        action="store_true",
+        help="跳过会加载 LLM 的真实问答，适合本地快速检查或 CI",
+    )
+    args = parser.parse_args()
+    raise SystemExit(main(skip_chat=args.skip_chat))
