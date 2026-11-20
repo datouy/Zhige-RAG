@@ -23,9 +23,13 @@
 from __future__ import annotations
 
 import json
+import re
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
+from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import Response
 from pydantic import BaseModel, Field
 from sqlalchemy import func
 from sqlalchemy.orm import Session
@@ -117,6 +121,62 @@ def _session_dict(session, preview: Optional[str] = None) -> Dict[str, Any]:
     if preview is not None:
         data["preview"] = preview
     return data
+
+
+def _markdown_inline(value: Any) -> str:
+    """把任意来源字段压成安全、可读的一行 Markdown 文本。"""
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    return text.replace("\\", "\\\\").replace("`", "\\`")
+
+
+def _markdown_quote(value: Any) -> str:
+    lines = str(value or "").strip().splitlines() or [""]
+    return "\n".join(f"> {line}" if line else ">" for line in lines)
+
+
+def _export_markdown(session, messages: List[ChatMessage]) -> str:
+    """生成个人信息库可长期保存的纯 Markdown 会话档案。"""
+    exported_at = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+    title = _markdown_inline(session.title or "对话") or "对话"
+    lines = [
+        f"# {title}",
+        "",
+        f"- 创建：{(session.created_at.isoformat(timespec='seconds') if session.created_at else '未知')}",
+        f"- 导出：{exported_at}",
+        "",
+    ]
+    if not messages:
+        lines.extend(["暂无消息。", ""])
+        return "\n".join(lines)
+
+    for message in messages:
+        role = "用户" if message.role == "user" else "助手"
+        lines.extend([f"## {role}", "", (message.content or "").strip(), ""])
+        if message.role != "assistant" or not message.sources_json:
+            continue
+        try:
+            sources = json.loads(message.sources_json)
+        except (TypeError, ValueError):
+            sources = []
+        if not isinstance(sources, list) or not sources:
+            continue
+        lines.extend(["### 引用", ""])
+        for index, source in enumerate(sources, start=1):
+            if not isinstance(source, dict):
+                continue
+            source_title = _markdown_inline(
+                source.get("title") or source.get("source") or f"资料 {index}"
+            )
+            source_path = _markdown_inline(source.get("source") or "")
+            snippet = source.get("snippet") or source.get("text") or ""
+            lines.append(f"{index}. **{source_title}**")
+            if source_path:
+                lines.extend(["", f"   `{source_path}`"])
+            if snippet:
+                quoted = _markdown_quote(snippet)
+                lines.extend(["", "\n".join(f"   {line}" for line in quoted.splitlines())])
+            lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
 
 
 # ======================================================================
@@ -339,6 +399,33 @@ async def api_list_messages(
         ],
         "total": len(rows),
     }
+
+
+@router.get("/api/v1/sessions/{session_id}/export.md", tags=["会话"])
+async def api_export_session_markdown(
+    session_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> Response:
+    """下载完整会话，正文和引用按消息时间顺序导出为 Markdown。"""
+    try:
+        session = get_session(db, current_user.id, session_id)
+        messages = list_messages(db, current_user.id, session_id, limit=500)
+    except KBError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    filename_base = re.sub(r'[\\/:*?"<>|\r\n]+', "-", session.title or "对话").strip(" .-")
+    filename_base = filename_base[:80] or f"conversation-{session.id[:8]}"
+    fallback = f"conversation-{session.id[:8]}.md"
+    disposition = (
+        f'attachment; filename="{fallback}"; '
+        f"filename*=UTF-8''{quote(filename_base + '.md', safe='')}"
+    )
+    return Response(
+        content=_export_markdown(session, messages),
+        media_type="text/markdown; charset=utf-8",
+        headers={"Content-Disposition": disposition, "Cache-Control": "no-store"},
+    )
 
 
 @router.post("/api/v1/sessions/{session_id}/messages", status_code=201, tags=["会话"])
