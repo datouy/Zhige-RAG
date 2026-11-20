@@ -1,0 +1,180 @@
+{
+  "samples": 8,
+  "mode": "retrieval_only",
+  "retrieval_hit_rate": 1.0,
+  "ndcg_at_5": 0.9458096187769368,
+  "mrr": 1.0,
+  "recall_at_10": 1.0,
+  "avg_retrieval_latency_ms": 85.60837500044727,
+  "p95_retrieval_latency_ms": 420.74418999909506,
+  "details": [
+    {
+      "index": 1,
+      "question": "知阁科技总部位于哪座城市？",
+      "retrieval_hit": true,
+      "ndcg_at_5": 1.0,
+      "mrr": 1.0,
+      "recall_at_10": 1.0,
+      "latency_ms": 643.65,
+      "retrieved_sources": [
+        "员工手册.md",
+        "扫描件测试.pdf",
+        "员工手册.md",
+        "员工手册.md",
+        "测试手册.md",
+        "测试手册.md",
+        "产品规格.md",
+        "测试手册.md",
+        "产品规格.md"
+      ]
+    },
+    {
+      "index": 2,
+      "question": "一线城市差旅住宿每晚报销上限是多少？",
+      "retrieval_hit": true,
+      "ndcg_at_5": 0.787702056960637,
+      "mrr": 1.0,
+      "recall_at_10": 1.0,
+      "latency_ms": 6.45,
+      "retrieved_sources": [
+        "员工手册.md",
+        "扫描件测试.pdf",
+        "产品规格.md",
+        "产品规格.md",
+        "员工手册.md",
+        "测试手册.md",
+        "测试手册.md",
+        "员工手册.md",
+        "测试手册.md"
+      ]
+    },
+    {
+      "index": 3,
+      "question": "知阁科技是哪一年成立的？",
+      "retrieval_hit": true,
+      "ndcg_at_5": 0.8318724637288826,
+      "mrr": 1.0,
+      "recall_at_10": 1.0,
+      "latency_ms": 5.99,
+      "retrieved_sources": [
+        "员工手册.md",
+        "员工手册.md",
+        "扫描件测试.pdf",
+        "测试手册.md",
+        "产品规格.md",
+        "产品规格.md",
+        "测试手册.md",
+        "员工手册.md",
+        "测试手册.md"
+      ]
+    },
+    {
+      "index": 4,
+      "question": "青花瓷手机使用什么处理器？",
+      "retrieval_hit": true,
+      "ndcg_at_5": 1.0,
+      "mrr": 1.0,
+      "recall_at_10": 1.0,
+      "latency_ms": 6.45,
+      "retrieved_sources": [
+        "产品规格.md",
+        "产品规格.md",
+        "员工手册.md",
+        "测试手册.md",
+        "扫描件测试.pdf",
+        "员工手册.md",
+        "测试手册.md",
+        "测试手册.md",
+        "员工手册.md"
+      ]
+    },
+    {
+      "index": 5,
+      "question": "青花瓷手机的屏幕尺寸是多少？",
+      "retrieval_hit": true,
+      "ndcg_at_5": 1.0,
+      "mrr": 1.0,
+      "recall_at_10": 1.0,
+      "latency_ms": 4.83,
+      "retrieved_sources": [
+        "产品规格.md",
+        "产品规格.md",
+        "扫描件测试.pdf",
+        "测试手册.md",
+        "员工手册.md",
+        "员工手册.md",
+        "员工手册.md",
+        "测试手册.md",
+        "测试手册.md"
+      ]
+    },
+    {
+      "index": 6,
+      "question": "青花瓷手机的电池容量和售价分别是多少？",
+      "retrieval_hit": true,
+      "ndcg_at_5": 1.0,
+      "mrr": 1.0,
+      "recall_at_10": 1.0,
+      "latency_ms": 5.04,
+      "retrieved_sources": [
+        "产品规格.md",
+        "产品规格.md",
+        "扫描件测试.pdf",
+        "测试手册.md",
+        "员工手册.md",
+        "员工手册.md",
+        "测试手册.md",
+        "员工手册.md",
+        "测试手册.md"
+      ]
+    },
+    {
+      "index": 7,
+      "question": "测试手册中苹果出现在第几节？",
+      "retrieval_hit": true,
+      "ndcg_at_5": 0.9469024295259745,
+      "mrr": 1.0,
+      "recall_at_10": 1.0,
+      "latency_ms": 5.69,
+      "retrieved_sources": [
+        "测试手册.md",
+        "测试手册.md",
+        "员工手册.md",
+        "扫描件测试.pdf",
+        "测试手册.md",
+        "产品规格.md",
+        "产品规格.md",
+        "员工手册.md",
+        "员工手册.md"
+      ]
+    },
+    {
+      "index": 8,
+      "question": "测试手册中香蕉出现在第几节？",
+      "retrieval_hit": true,
+      "ndcg_at_5": 1.0,
+      "mrr": 1.0,
+      "recall_at_10": 1.0,
+      "latency_ms": 6.77,
+      "retrieved_sources": [
+        "测试手册.md",
+        "测试手册.md",
+        "测试手册.md",
+        "员工手册.md",
+        "扫描件测试.pdf",
+        "产品规格.md",
+        "员工手册.md",
+        "产品规格.md",
+        "员工手册.md"
+      ]
+    }
+  ],
+  "dataset_source_coverage": {
+    "expected": 4,
+    "present": 4,
+    "missing": 0,
+    "coverage": 1.0,
+    "missing_sources": []
+  },
+  "ts": "20261120-160929"
+}

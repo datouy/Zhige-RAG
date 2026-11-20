@@ -1,0 +1,113 @@
+{
+  "samples": 8,
+  "mode": "retrieval_only",
+  "collection": "u7ac1b8d7010bb6cd_chinese_rag_kb",
+  "reranker_enabled": true,
+  "retrieval_hit_rate": 1.0,
+  "ndcg_at_5": 1.0,
+  "mrr": 1.0,
+  "recall_at_10": 1.0,
+  "avg_retrieval_latency_ms": 408.0532750031125,
+  "p95_retrieval_latency_ms": 729.915795002307,
+  "details": [
+    {
+      "index": 1,
+      "question": "知阁科技总部位于哪座城市？",
+      "retrieval_hit": true,
+      "ndcg_at_5": 1.0,
+      "mrr": 1.0,
+      "recall_at_10": 1.0,
+      "latency_ms": 932.38,
+      "retrieved_sources": [
+        "员工手册.md",
+        "扫描件测试.pdf"
+      ]
+    },
+    {
+      "index": 2,
+      "question": "一线城市差旅住宿每晚报销上限是多少？",
+      "retrieval_hit": true,
+      "ndcg_at_5": 1.0,
+      "mrr": 1.0,
+      "recall_at_10": 1.0,
+      "latency_ms": 353.91,
+      "retrieved_sources": [
+        "员工手册.md",
+        "扫描件测试.pdf"
+      ]
+    },
+    {
+      "index": 3,
+      "question": "知阁科技是哪一年成立的？",
+      "retrieval_hit": true,
+      "ndcg_at_5": 1.0,
+      "mrr": 1.0,
+      "recall_at_10": 1.0,
+      "latency_ms": 351.57,
+      "retrieved_sources": [
+        "员工手册.md",
+        "扫描件测试.pdf"
+      ]
+    },
+    {
+      "index": 4,
+      "question": "青花瓷手机使用什么处理器？",
+      "retrieval_hit": true,
+      "ndcg_at_5": 1.0,
+      "mrr": 1.0,
+      "recall_at_10": 1.0,
+      "latency_ms": 337.58,
+      "retrieved_sources": [
+        "产品规格.md"
+      ]
+    },
+    {
+      "index": 5,
+      "question": "青花瓷手机的屏幕尺寸是多少？",
+      "retrieval_hit": true,
+      "ndcg_at_5": 1.0,
+      "mrr": 1.0,
+      "recall_at_10": 1.0,
+      "latency_ms": 297.18,
+      "retrieved_sources": [
+        "产品规格.md"
+      ]
+    },
+    {
+      "index": 6,
+      "question": "青花瓷手机的电池容量和售价分别是多少？",
+      "retrieval_hit": true,
+      "ndcg_at_5": 1.0,
+      "mrr": 1.0,
+      "recall_at_10": 1.0,
+      "latency_ms": 323.68,
+      "retrieved_sources": [
+        "产品规格.md"
+      ]
+    },
+    {
+      "index": 7,
+      "question": "测试手册中苹果出现在第几节？",
+      "retrieval_hit": true,
+      "ndcg_at_5": 1.0,
+      "mrr": 1.0,
+      "recall_at_10": 1.0,
+      "latency_ms": 343.19,
+      "retrieved_sources": [
+        "测试手册.md"
+      ]
+    },
+    {
+      "index": 8,
+      "question": "测试手册中香蕉出现在第几节？",
+      "retrieval_hit": true,
+      "ndcg_at_5": 1.0,
+      "mrr": 1.0,
+      "recall_at_10": 1.0,
+      "latency_ms": 324.93,
+      "retrieved_sources": [
+        "测试手册.md"
+      ]
+    }
+  ]
+}

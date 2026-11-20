@@ -1,0 +1,8 @@
+{"question":"知阁科技总部位于哪座城市？","expected_sources":["员工手册.md","扫描件测试.pdf"],"expected_keywords":["杭州"],"difficulty":"easy"}
+{"question":"一线城市差旅住宿每晚报销上限是多少？","expected_sources":["员工手册.md","扫描件测试.pdf"],"expected_keywords":["500"],"difficulty":"easy"}
+{"question":"知阁科技是哪一年成立的？","expected_sources":["员工手册.md","扫描件测试.pdf"],"expected_keywords":["2021"],"difficulty":"easy"}
+{"question":"青花瓷手机使用什么处理器？","expected_sources":["产品规格.md"],"expected_keywords":["骁龙"],"difficulty":"easy"}
+{"question":"青花瓷手机的屏幕尺寸是多少？","expected_sources":["产品规格.md"],"expected_keywords":["6.8"],"difficulty":"easy"}
+{"question":"青花瓷手机的电池容量和售价分别是多少？","expected_sources":["产品规格.md"],"expected_keywords":["5500","4999"],"difficulty":"medium"}
+{"question":"测试手册中苹果出现在第几节？","expected_sources":["测试手册.md"],"expected_keywords":["第一节"],"difficulty":"easy"}
+{"question":"测试手册中香蕉出现在第几节？","expected_sources":["测试手册.md"],"expected_keywords":["第二节"],"difficulty":"easy"}
