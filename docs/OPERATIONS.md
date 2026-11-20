@@ -49,13 +49,24 @@ Chroma 依赖已固定到 `1.5.0`。升级前必须先备份并检查，不能�
 
 ## 评估阈值
 
-评估脚本支持 CI 阈值，例如：
+评估脚本支持文件级和 evidence/chunk 级两种口径。带 `expected_evidence` 的
+数据集使用 Recall@K、HitRate@K、MRR@K；旧数据集继续使用 `expected_sources`
+文件级口径。标注格式和启动集见
+`data/eval/templates/README.md` 与 `data/eval/templates/evidence_retrieval.jsonl`。
+
+evidence 级 CI 门禁示例：
 
 ```bash
 python scripts/evaluate.py --retrieval-only \
-  --min-samples 30 --min-hit-rate 0.8 --min-ndcg 0.7 --max-p95-latency-ms 1500
+  --dataset data/eval/templates/evidence_retrieval.jsonl --top-k 10 \
+  --min-samples 11 --min-evidence-coverage 1 \
+  --min-recall-at-5 0.8 --min-recall-at-10 0.9 \
+  --min-hit-rate-at-10 0.9 --min-mrr-at-10 0.7 \
+  --max-p95-latency-ms 1500 --no-archive
 ```
 
+`--min-evidence-coverage 1` 会阻止过期标注集静默生成低分；引文无法映射时，
+该 query 会进入 `retrieval_evidence.excluded_samples`，不会被当成模型漏召。
 生成式评估还可增加 `--min-verified-rate 0.8`。报告仍会完整写出，未达到阈值时
 进程以非零状态退出。
 

@@ -1,4 +1,4 @@
-"""评估脚本：检索命中率、关键词覆盖率、平均响应时间、NDCG@5、MRR、TTFT、tokens/s。
+"""评估脚本：evidence 级 Recall/HitRate/MRR、关键词覆盖率、延迟与生成侧指标。
 
 评估数据格式（jsonl，每行一个样本）::
 
@@ -6,8 +6,21 @@
         "question": "什么是 RAG？",
         "reference_answer": "RAG 是检索增强生成……",
         "expected_sources": ["doc1.pdf", "doc2.pdf"],   // 可选
+        "expected_evidence": [                           // 可选；推荐
+            {
+                "evidence_id": "e1",
+                "source": "doc1.pdf",
+                "page": 3,
+                "section": "2. 权限模型",
+                "quote": "管理员可以查看审计日志。",
+                "relevance": 3
+            }
+        ],
         "expected_keywords": ["检索", "生成"]            // 可选
     }
+
+有 ``expected_evidence`` 时按 evidence/chunk 级计算 Recall、Hit Rate 与 MRR；
+没有时继续按文件级计算，保证旧评估集完全兼容。
 
 输出：
 - ``data/eval/report.json``          最新一份完整评估（含 details）
@@ -24,6 +37,7 @@ import re
 import sqlite3
 import sys
 import time
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -61,6 +75,58 @@ def load_eval_dataset(path: Path) -> List[Dict[str, Any]]:
             items.append(json.loads(line))
     logger.info("加载评估集：%d 条", len(items))
     return items
+
+
+def normalize_eval_text(value: Any) -> str:
+    """统一引文与 chunk 文本，避免全半角、英文大小写和空白造成假失配。"""
+    text = unicodedata.normalize("NFKC", str(value or ""))
+    return " ".join(text.casefold().split())
+
+
+def _evidence_relevance(evidence: Dict[str, Any]) -> Optional[float]:
+    """缺省 relevance 视为 2；非法值返回 None 并进入数据质量报告。"""
+    try:
+        return float(evidence.get("relevance", 2))
+    except (TypeError, ValueError):
+        return None
+
+
+def _evidence_page(value: Any) -> Optional[int]:
+    if value is None or str(value).strip() == "":
+        return None
+    return int(value)
+
+
+def evidence_anchor(
+    evidence: Dict[str, Any],
+) -> Optional[Tuple[str, Optional[int], str]]:
+    """返回可稳定重定位的 evidence 锚点；无效标注返回 None。"""
+    if not isinstance(evidence, dict):
+        return None
+    source = str(evidence.get("source") or "").strip().replace("\\", "/")
+    quote = normalize_eval_text(evidence.get("quote"))
+    if not source or not quote:
+        return None
+    try:
+        page = _evidence_page(evidence.get("page"))
+    except (TypeError, ValueError):
+        return None
+    return source, page, quote
+
+
+def _relevant_evidence(item: Dict[str, Any]) -> List[Dict[str, Any]]:
+    relevant: List[Dict[str, Any]] = []
+    for evidence in item.get("expected_evidence") or []:
+        if not isinstance(evidence, dict):
+            continue
+        relevance = _evidence_relevance(evidence)
+        if relevance is not None and relevance >= 2:
+            relevant.append(evidence)
+    return relevant
+
+
+def dataset_uses_evidence(items: Sequence[Dict[str, Any]]) -> bool:
+    return any(bool(item.get("expected_evidence")) for item in items)
 
 
 def synthesize_demo_dataset(md_path: Path, out_path: Path, n: int = 5) -> List[Dict[str, Any]]:
@@ -243,6 +309,286 @@ def recall_at_k(
     return matched / len(expected)
 
 
+def _chunk_id_text_metadata(chunk: Any) -> Tuple[str, str, Dict[str, Any]]:
+    if isinstance(chunk, dict):
+        chunk_id = str(chunk.get("id") or chunk.get("chunk_id") or "")
+        text = str(chunk.get("text") or chunk.get("document") or chunk.get("content") or "")
+        metadata = dict(chunk.get("metadata") or {})
+        return chunk_id, text, metadata
+    metadata = dict(getattr(chunk, "metadata", None) or {})
+    return str(getattr(chunk, "id", "") or ""), str(getattr(chunk, "text", "") or ""), metadata
+
+
+def _ranked_hit_ids(hits: Sequence[Any]) -> List[str]:
+    ids: List[str] = []
+    for hit in hits:
+        chunk_id, _, _ = _chunk_id_text_metadata(hit)
+        if chunk_id:
+            ids.append(chunk_id)
+    return ids
+
+
+def evidence_metrics_for_hits(
+    hit_ids: Sequence[str],
+    gold_chunk_ids: Sequence[Sequence[str]],
+    k: int,
+) -> Optional[Dict[str, Any]]:
+    """计算单个 query 的 evidence 级 Recall@K、HitRate@K 与 MRR@K。
+
+    ``gold_chunk_ids`` 的每个元素对应一条相关 evidence；一条引文映射到多个
+    当前 chunk 时，命中其中任意一个都算该 evidence 被召回。
+    """
+    groups = [set(group) for group in gold_chunk_ids if group]
+    if not groups:
+        return None
+    cutoff = max(0, int(k))
+    ranked = list(hit_ids or [])[:cutoff]
+    retrieved = set(ranked)
+    matched = sum(1 for group in groups if group & retrieved)
+    first_rank: Optional[int] = None
+    for rank, chunk_id in enumerate(ranked, 1):
+        if any(chunk_id in group for group in groups):
+            first_rank = rank
+            break
+    return {
+        "recall": matched / len(groups),
+        "hit_rate": 1.0 if matched else 0.0,
+        "mrr": (1.0 / first_rank) if first_rank is not None else 0.0,
+    }
+
+
+def _resolve_evidence_source(requested: str, available: Sequence[str]) -> str:
+    normalized = requested.strip().replace("\\", "/").strip("/")
+    exact = [source for source in available if source.replace("\\", "/") == normalized]
+    if exact:
+        return exact[0]
+    suffix_matches = [
+        source
+        for source in available
+        if source.replace("\\", "/").strip("/").endswith("/" + normalized)
+    ]
+    return suffix_matches[0] if len(suffix_matches) == 1 else requested
+
+
+def load_evidence_chunks(
+    vector_store: Any,
+    sources: Sequence[str],
+) -> Tuple[Dict[str, List[Any]], Dict[str, str]]:
+    """从当前 collection 批量读取 evidence 来源的所有可检索 chunk。"""
+    requested = sorted({str(source).strip().replace("\\", "/") for source in sources if source})
+    if not requested:
+        return {}, {}
+
+    available: List[str] = []
+    try:
+        rows = vector_store.list_sources()
+        available = [str(row.get("source") or "") for row in rows if row.get("source")]
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("无法读取 collection 来源列表，将按原 source 查询：%s", exc)
+
+    aliases = {source: _resolve_evidence_source(source, available) for source in requested}
+    actual_sources = sorted(set(aliases.values()))
+    if hasattr(vector_store, "get_by_sources"):
+        grouped = vector_store.get_by_sources(actual_sources)
+    elif hasattr(vector_store, "get_by_source"):
+        grouped = {
+            source: vector_store.get_by_source(source)
+            for source in actual_sources
+        }
+    else:
+        raise TypeError("vector_store 需要 get_by_sources 或 get_by_source")
+
+    normalized_grouped: Dict[str, List[Any]] = {}
+    for source, chunks in (grouped or {}).items():
+        normalized_grouped[str(source).replace("\\", "/")] = list(chunks or [])
+    return {
+        requested_source: normalized_grouped.get(actual.replace("\\", "/"), [])
+        for requested_source, actual in aliases.items()
+    }, aliases
+
+
+def build_evidence_chunk_map(
+    items: Sequence[Dict[str, Any]],
+    chunks_by_source: Dict[str, Sequence[Any]],
+) -> Tuple[Dict[Tuple[str, Optional[int], str], set[str]], Dict[str, Any]]:
+    """把标注引文映射到当前 collection 的 chunk ID。
+
+    只使用实际可检索的 chunk.text，不使用 metadata.parent_text，避免把不可
+    直接召回的父文本误算成正确答案。
+    """
+    rows: List[Tuple[int, Dict[str, Any], Tuple[str, Optional[int], str]]] = []
+    invalid_rows: List[Dict[str, Any]] = []
+    for item_index, item in enumerate(items, 1):
+        for evidence_index, raw in enumerate(item.get("expected_evidence") or [], 1):
+            if not isinstance(raw, dict):
+                invalid_rows.append(
+                    {
+                        "query_index": item_index,
+                        "question": item.get("question"),
+                        "evidence_index": evidence_index,
+                        "reason": "evidence_not_object",
+                    }
+                )
+                continue
+            relevance = _evidence_relevance(raw)
+            if relevance is None:
+                invalid_rows.append(
+                    {
+                        "query_index": item_index,
+                        "question": item.get("question"),
+                        "evidence_index": evidence_index,
+                        "evidence_id": raw.get("evidence_id"),
+                        "reason": "invalid_relevance",
+                    }
+                )
+                continue
+            if relevance < 2:
+                continue
+            anchor = evidence_anchor(raw)
+            if anchor is None:
+                invalid_rows.append(
+                    {
+                        "query_index": item_index,
+                        "question": item.get("question"),
+                        "evidence_index": evidence_index,
+                        "evidence_id": raw.get("evidence_id"),
+                        "source": raw.get("source"),
+                        "reason": "invalid_source_page_or_quote",
+                    }
+                )
+                continue
+            rows.append((item_index, raw, anchor))
+
+    anchors = {anchor for _, _, anchor in rows}
+    normalized_chunks: Dict[str, List[Tuple[str, str, Dict[str, Any]]]] = {}
+    for source, chunks in (chunks_by_source or {}).items():
+        normalized_source = str(source).strip().replace("\\", "/")
+        normalized_chunks[normalized_source] = [
+            _chunk_id_text_metadata(chunk) for chunk in (chunks or [])
+        ]
+
+    mapping: Dict[Tuple[str, Optional[int], str], set[str]] = {}
+    source_not_found = set()
+    quote_not_found = set()
+    for anchor in anchors:
+        source, page, quote = anchor
+        chunks = normalized_chunks.get(source, [])
+        if not chunks:
+            source_not_found.add(source)
+            continue
+        matched_ids: set[str] = set()
+        for chunk_id, text, metadata in chunks:
+            if not chunk_id:
+                continue
+            if page is not None:
+                try:
+                    chunk_page = int(metadata.get("page"))
+                except (TypeError, ValueError):
+                    continue
+                if chunk_page != page:
+                    continue
+            if quote in normalize_eval_text(text):
+                matched_ids.add(chunk_id)
+        if matched_ids:
+            mapping[anchor] = matched_ids
+        else:
+            quote_not_found.add(source)
+
+    unmapped_evidence: List[Dict[str, Any]] = list(invalid_rows)
+    for item_index, evidence, anchor in rows:
+        if anchor in mapping:
+            continue
+        unmapped_evidence.append(
+            {
+                "query_index": item_index,
+                "question": items[item_index - 1].get("question"),
+                "evidence_id": evidence.get("evidence_id"),
+                "source": anchor[0],
+                "page": anchor[1],
+                "quote": evidence.get("quote"),
+                "reason": "source_not_found" if anchor[0] in source_not_found else "quote_not_found",
+            }
+        )
+
+    evidence_total = len(anchors) + len(invalid_rows)
+    coverage = {
+        "mode": "evidence" if evidence_total else "file",
+        "evidence_total": evidence_total,
+        "mapped_evidence": len(mapping),
+        "coverage": (len(mapping) / evidence_total) if evidence_total else None,
+        "missing_sources": sorted(source_not_found),
+        "sources_without_quote": sorted(quote_not_found),
+        "unmapped_evidence": unmapped_evidence,
+    }
+    return mapping, coverage
+
+
+def prepare_evidence_evaluation(
+    items: Sequence[Dict[str, Any]],
+    vector_store: Any,
+) -> Tuple[Dict[Tuple[str, Optional[int], str], set[str]], Dict[str, Any]]:
+    """解析当前 collection，并返回 evidence 映射与可直接写入报告的覆盖率。"""
+    if not dataset_uses_evidence(items):
+        return {}, {
+            "mode": "file",
+            "evidence_total": 0,
+            "mapped_evidence": 0,
+            "coverage": None,
+            "unmapped_evidence": [],
+        }
+
+    sources = sorted(
+        {
+            evidence_anchor(evidence)[0]
+            for item in items
+            for evidence in _relevant_evidence(item)
+            if evidence_anchor(evidence) is not None
+        }
+    )
+    try:
+        chunks_by_source, aliases = load_evidence_chunks(vector_store, sources)
+        mapping, coverage = build_evidence_chunk_map(items, chunks_by_source)
+        coverage["source_aliases"] = aliases
+        return mapping, coverage
+    except Exception as exc:  # noqa: BLE001
+        logger.error("evidence 到当前 chunk 的映射失败：%s", exc)
+        mapping, coverage = build_evidence_chunk_map(
+            items,
+            {source: [] for source in sources},
+        )
+        coverage["error"] = str(exc)
+        coverage["coverage"] = 0.0
+        return mapping, coverage
+
+
+def evidence_gold_groups(
+    item: Dict[str, Any],
+    mapping: Dict[Tuple[str, Optional[int], str], set[str]],
+) -> Tuple[List[set[str]], List[Dict[str, Any]]]:
+    """返回该 query 的 evidence 金标 chunk 组，以及未映射的 evidence。"""
+    gold: List[set[str]] = []
+    missing: List[Dict[str, Any]] = []
+    seen: set[Tuple[str, Optional[int], str]] = set()
+    for evidence in _relevant_evidence(item):
+        anchor = evidence_anchor(evidence)
+        if anchor is None or anchor in seen:
+            continue
+        seen.add(anchor)
+        chunk_ids = mapping.get(anchor) or set()
+        if chunk_ids:
+            gold.append(set(chunk_ids))
+        else:
+            missing.append(
+                {
+                    "evidence_id": evidence.get("evidence_id"),
+                    "source": anchor[0],
+                    "page": anchor[1],
+                    "quote": evidence.get("quote"),
+                }
+            )
+    return gold, missing
+
+
 def percentile(values: Sequence[float], p: float) -> Optional[float]:
     """线性插值百分位数；空序列返回 None。"""
     if not values:
@@ -310,12 +656,22 @@ def expected_source_coverage(
     分词、召回或重排。
     """
     expected = {
-        str(source)
+        str(source).replace("\\", "/")
         for item in items
         for source in (item.get("expected_sources") or [])
         if source
     }
-    available = {str(source) for source in available_sources if source}
+    expected.update(
+        evidence_anchor(evidence)[0]
+        for item in items
+        for evidence in _relevant_evidence(item)
+        if evidence_anchor(evidence) is not None
+    )
+    available = {
+        str(source).replace("\\", "/")
+        for source in available_sources
+        if source
+    }
     present = sorted(
         source
         for source in expected
@@ -377,6 +733,10 @@ def evaluate(pipeline: RAGPipeline, items: List[Dict[str, Any]], llm_self_eval: 
     if n == 0:
         return {"samples": 0}
 
+    evidence_mode = dataset_uses_evidence(items)
+    evidence_map, evidence_coverage = prepare_evidence_evaluation(
+        items, getattr(pipeline, "vector_store", None)
+    )
     retrieval_hits = 0
     keyword_scores: List[float] = []
     sem_sims: List[float] = []
@@ -387,6 +747,12 @@ def evaluate(pipeline: RAGPipeline, items: List[Dict[str, Any]], llm_self_eval: 
     ndcgs: List[float] = []
     mrrs: List[float] = []
     recalls: List[float] = []
+    evidence_hits: List[float] = []
+    evidence_mrrs_at_5: List[float] = []
+    evidence_mrrs_at_10: List[float] = []
+    evidence_recalls_at_5: List[float] = []
+    evidence_recalls_at_10: List[float] = []
+    evidence_excluded = 0
     # 可验证性聚合（核心指标：答案必须可回溯到上下文）
     verifications: List[Dict[str, Any]] = []
     details: List[Dict[str, Any]] = []
@@ -409,32 +775,63 @@ def evaluate(pipeline: RAGPipeline, items: List[Dict[str, Any]], llm_self_eval: 
         # 检索命中 + NDCG/MRR
         retrieval_items = list(getattr(result, "raw_hits", None) or result.sources or [])
         retrieved_sources = []
-        for item in retrieval_items:
-            if isinstance(item, dict):
-                retrieved_sources.append(str(item.get("source") or ""))
+        for retrieval_item in retrieval_items:
+            if isinstance(retrieval_item, dict):
+                retrieved_sources.append(str(retrieval_item.get("source") or ""))
             else:
                 retrieved_sources.append(
-                    str((getattr(item, "metadata", None) or {}).get("source") or "")
+                    str((getattr(retrieval_item, "metadata", None) or {}).get("source") or "")
                 )
-        hit = 0
+        source_hit = 0
         if expected_sources:
             for src in retrieved_sources:
                 if any(es in src for es in expected_sources):
-                    hit = 1
+                    source_hit = 1
                     break
         else:
-            hit = 1
-        retrieval_hits += hit
+            source_hit = 1
+        retrieval_hits += source_hit
 
         ndcg = ndcg_at_k(retrieved_sources, expected_sources, k=5)
-        mrr_val = mrr(retrieved_sources, expected_sources)
-        recall_val = recall_at_k(retrieved_sources, expected_sources, k=10)
+        source_mrr = mrr(retrieved_sources, expected_sources)
+        source_recall = recall_at_k(retrieved_sources, expected_sources, k=10)
         if ndcg is not None:
             ndcgs.append(ndcg)
-        if mrr_val is not None:
-            mrrs.append(mrr_val)
-        if recall_val is not None:
-            recalls.append(recall_val)
+        if source_mrr is not None:
+            mrrs.append(source_mrr)
+        if source_recall is not None:
+            recalls.append(source_recall)
+
+        evidence_hit: Optional[float] = None
+        evidence_mrr_5: Optional[float] = None
+        evidence_mrr_10: Optional[float] = None
+        evidence_recall_5: Optional[float] = None
+        evidence_recall_10: Optional[float] = None
+        gold_groups: List[set[str]] = []
+        missing_evidence: List[Dict[str, Any]] = []
+        if evidence_mode:
+            gold_groups, missing_evidence = evidence_gold_groups(item, evidence_map)
+            if gold_groups and not missing_evidence:
+                hit_ids = _ranked_hit_ids(retrieval_items)
+                metrics_5 = evidence_metrics_for_hits(hit_ids, gold_groups, k=5)
+                metrics_10 = evidence_metrics_for_hits(hit_ids, gold_groups, k=10)
+                if metrics_5 is not None and metrics_10 is not None:
+                    evidence_hit = float(metrics_10["hit_rate"])
+                    evidence_mrr_5 = float(metrics_5["mrr"])
+                    evidence_mrr_10 = float(metrics_10["mrr"])
+                    evidence_recall_5 = float(metrics_5["recall"])
+                    evidence_recall_10 = float(metrics_10["recall"])
+                    evidence_hits.append(evidence_hit)
+                    evidence_mrrs_at_5.append(evidence_mrr_5)
+                    evidence_mrrs_at_10.append(evidence_mrr_10)
+                    evidence_recalls_at_5.append(evidence_recall_5)
+                    evidence_recalls_at_10.append(evidence_recall_10)
+            else:
+                evidence_excluded += 1
+
+        hit = evidence_hit if evidence_mode else source_hit
+        mrr_val = evidence_mrr_10 if evidence_mode else source_mrr
+        recall_val = evidence_recall_10 if evidence_mode else source_recall
 
         # 关键词覆盖率 + RAGAS 轻量语义指标（无外部依赖）
         kw_cov = keyword_coverage(result.answer, keywords) if keywords else None
@@ -473,12 +870,18 @@ def evaluate(pipeline: RAGPipeline, items: List[Dict[str, Any]], llm_self_eval: 
                 "tokens_generated": timings.get("tokens_generated"),
                 "tokens_per_sec": round(tps, 2) if isinstance(tps, (int, float)) else None,
                 "retrieval_hit": bool(hit),
+                "source_retrieval_hit": bool(source_hit),
                 "keyword_coverage": kw_cov,
                 "answer_similarity": round(_sim, 4) if _sim is not None else None,
                 "faithfulness": round(_faith, 4) if _faith is not None else None,
                 "ndcg_at_5": ndcg,
                 "mrr": mrr_val,
+                "mrr_at_10": evidence_mrr_10,
                 "recall_at_10": recall_val,
+                "recall_at_5": evidence_recall_5,
+                "hit_rate_at_10": evidence_hit,
+                "evidence_eval_eligible": evidence_hit is not None if evidence_mode else None,
+                "unmapped_evidence": missing_evidence,
                 "verification": verification,
             }
         )
@@ -497,9 +900,42 @@ def evaluate(pipeline: RAGPipeline, items: List[Dict[str, Any]], llm_self_eval: 
     # 可验证性汇总：verified 比例、平均引用覆盖率、编造事实计数
     answered = [v for v in verifications if not v.get("refused")]
     verified = [v for v in answered if v.get("status") == "verified"]
+    source_hit_rate = retrieval_hits / n if n else 0.0
+    source_mrr_mean = sum(mrrs) / len(mrrs) if mrrs else None
+    source_recall_mean = sum(recalls) / len(recalls) if recalls else None
+    evidence_summary = {
+        **evidence_coverage,
+        "evaluable_samples": len(evidence_hits),
+        "excluded_samples": evidence_excluded,
+        "recall_at_5": (
+            sum(evidence_recalls_at_5) / len(evidence_recalls_at_5)
+            if evidence_recalls_at_5
+            else None
+        ),
+        "recall_at_10": (
+            sum(evidence_recalls_at_10) / len(evidence_recalls_at_10)
+            if evidence_recalls_at_10
+            else None
+        ),
+        "hit_rate_at_10": (
+            sum(evidence_hits) / len(evidence_hits) if evidence_hits else None
+        ),
+        "mrr_at_5": (
+            sum(evidence_mrrs_at_5) / len(evidence_mrrs_at_5)
+            if evidence_mrrs_at_5
+            else None
+        ),
+        "mrr_at_10": (
+            sum(evidence_mrrs_at_10) / len(evidence_mrrs_at_10)
+            if evidence_mrrs_at_10
+            else None
+        ),
+    }
     summary: Dict[str, Any] = {
         "samples": n,
-        "retrieval_hit_rate": retrieval_hits / n if n else 0.0,
+        "retrieval_hit_rate": (
+            evidence_summary["hit_rate_at_10"] if evidence_mode else source_hit_rate
+        ),
         "avg_keyword_coverage": (
             sum(keyword_scores) / len(keyword_scores) if keyword_scores else None
         ),
@@ -509,8 +945,20 @@ def evaluate(pipeline: RAGPipeline, items: List[Dict[str, Any]], llm_self_eval: 
         "avg_latency_ms": sum(latencies) / len(latencies) if latencies else None,
         "p95_latency_ms": percentile(latencies, 0.95),
         "ndcg_at_5": sum(ndcgs) / len(ndcgs) if ndcgs else None,
-        "mrr": sum(mrrs) / len(mrrs) if mrrs else None,
-        "recall_at_10": sum(recalls) / len(recalls) if recalls else None,
+        "mrr": evidence_summary["mrr_at_10"] if evidence_mode else source_mrr_mean,
+        "mrr_at_10": evidence_summary["mrr_at_10"],
+        "recall_at_5": evidence_summary["recall_at_5"],
+        "recall_at_10": (
+            evidence_summary["recall_at_10"] if evidence_mode else source_recall_mean
+        ),
+        "hit_rate_at_10": evidence_summary["hit_rate_at_10"],
+        "retrieval_evidence": evidence_summary,
+        "source_retrieval": {
+            "hit_rate": source_hit_rate,
+            "mrr": source_mrr_mean,
+            "recall_at_10": source_recall_mean,
+            "ndcg_at_5": sum(ndcgs) / len(ndcgs) if ndcgs else None,
+        },
         "avg_ttft_ms": sum(ttfts) / len(ttfts) if ttfts else None,
         "p95_ttft_ms": percentile(ttfts, 0.95),
         "avg_tokens_per_sec": (
@@ -589,7 +1037,13 @@ def archive_report(summary: Dict[str, Any], report_path: Path) -> Dict[str, Any]
         "avg_latency_ms": summary.get("avg_latency_ms"),
         "ndcg_at_5": summary.get("ndcg_at_5"),
         "mrr": summary.get("mrr"),
+        "mrr_at_10": summary.get("mrr_at_10"),
+        "recall_at_5": summary.get("recall_at_5"),
         "recall_at_10": summary.get("recall_at_10"),
+        "hit_rate_at_10": summary.get("hit_rate_at_10"),
+        "evidence_coverage": (
+            summary.get("retrieval_evidence") or {}
+        ).get("coverage"),
         "avg_ttft_ms": summary.get("avg_ttft_ms"),
         "avg_tokens_per_sec": summary.get("avg_tokens_per_sec"),
         "verified_rate": ((summary.get("verifiability") or {}).get("verified_rate")),
@@ -615,16 +1069,28 @@ def evaluate_retrieval(
     """检索回归评估：只跑"召回 + 重排"，不加载 LLM、不生成答案。
 
     用途：UI 占用 GPU 时也能做检索质量回归（CPU 即可），改动分词/分块/
-    检索参数后快速看 hit_rate / NDCG / MRR 的涨跌。指标口径与全量评估
-    的检索部分一致（expected_sources 子串匹配）。
+    检索参数后快速看 Recall@K / HitRate@K / MRR@K 的涨跌。带
+    expected_evidence 的样本按 evidence/chunk 级计算；旧数据集继续按
+    expected_sources 做文件级计算。
     """
     n = len(items)
     if n == 0:
         return {"samples": 0}
-    hits_total = 0
+
+    evidence_mode = dataset_uses_evidence(items)
+    evidence_map, evidence_coverage = prepare_evidence_evaluation(
+        items, getattr(pipeline, "vector_store", None)
+    )
+    source_hits_total = 0
     ndcgs: List[float] = []
-    mrrs: List[float] = []
-    recalls: List[float] = []
+    source_mrrs: List[float] = []
+    source_recalls: List[float] = []
+    evidence_hits: List[float] = []
+    evidence_mrrs_at_5: List[float] = []
+    evidence_mrrs_at_10: List[float] = []
+    evidence_recalls_at_5: List[float] = []
+    evidence_recalls_at_10: List[float] = []
+    evidence_excluded = 0
     latencies: List[float] = []
     details: List[Dict[str, Any]] = []
     for i, item in enumerate(items, 1):
@@ -640,50 +1106,136 @@ def evaluate_retrieval(
         latency = (time.perf_counter() - t0) * 1000
         latencies.append(latency)
         sources = [str((h.metadata or {}).get("source") or "") for h in hits]
-        hit = 0
+        source_hit = 0
         if expected_sources:
             for src in sources:
                 if any(es in src for es in expected_sources):
-                    hit = 1
+                    source_hit = 1
                     break
         else:
-            hit = 1
-        hits_total += hit
+            source_hit = 1
+        source_hits_total += source_hit
         ndcg = ndcg_at_k(sources, expected_sources, k=5)
-        mrr_val = mrr(sources, expected_sources)
-        recall_val = recall_at_k(sources, expected_sources, k=10)
+        source_mrr = mrr(sources, expected_sources)
+        source_recall = recall_at_k(sources, expected_sources, k=10)
         if ndcg is not None:
             ndcgs.append(ndcg)
-        if mrr_val is not None:
-            mrrs.append(mrr_val)
-        if recall_val is not None:
-            recalls.append(recall_val)
+        if source_mrr is not None:
+            source_mrrs.append(source_mrr)
+        if source_recall is not None:
+            source_recalls.append(source_recall)
+
+        evidence_hit: Optional[float] = None
+        evidence_mrr_5: Optional[float] = None
+        evidence_mrr_10: Optional[float] = None
+        evidence_recall_5: Optional[float] = None
+        evidence_recall_10: Optional[float] = None
+        gold_groups: List[set[str]] = []
+        missing_evidence: List[Dict[str, Any]] = []
+        if evidence_mode:
+            gold_groups, missing_evidence = evidence_gold_groups(item, evidence_map)
+            if gold_groups and not missing_evidence:
+                hit_ids = _ranked_hit_ids(hits)
+                metrics_5 = evidence_metrics_for_hits(hit_ids, gold_groups, k=5)
+                metrics_10 = evidence_metrics_for_hits(hit_ids, gold_groups, k=10)
+                if metrics_5 is not None and metrics_10 is not None:
+                    evidence_hit = float(metrics_10["hit_rate"])
+                    evidence_mrr_5 = float(metrics_5["mrr"])
+                    evidence_mrr_10 = float(metrics_10["mrr"])
+                    evidence_recall_5 = float(metrics_5["recall"])
+                    evidence_recall_10 = float(metrics_10["recall"])
+                    evidence_hits.append(evidence_hit)
+                    evidence_mrrs_at_5.append(evidence_mrr_5)
+                    evidence_mrrs_at_10.append(evidence_mrr_10)
+                    evidence_recalls_at_5.append(evidence_recall_5)
+                    evidence_recalls_at_10.append(evidence_recall_10)
+            else:
+                evidence_excluded += 1
+
+        hit = evidence_hit if evidence_mode else source_hit
+        reported_mrr = evidence_mrr_10 if evidence_mode else source_mrr
+        reported_recall = evidence_recall_10 if evidence_mode else source_recall
         details.append(
             {
                 "index": i,
                 "question": q,
                 "retrieval_hit": bool(hit),
+                "source_retrieval_hit": bool(source_hit),
                 "ndcg_at_5": ndcg,
-                "mrr": mrr_val,
-                "recall_at_10": recall_val,
+                "mrr": reported_mrr,
+                "mrr_at_10": evidence_mrr_10,
+                "recall_at_10": reported_recall,
+                "recall_at_5": evidence_recall_5,
+                "hit_rate_at_10": evidence_hit,
+                "evidence_eval_eligible": evidence_hit is not None if evidence_mode else None,
+                "unmapped_evidence": missing_evidence,
                 "latency_ms": round(latency, 2),
-                "retrieved_sources": sources[:10],
+                "retrieved_sources": sources[:top_k],
             }
         )
         logger.info(
-            "[%d/%d] 命中=%s NDCG=%s MRR=%s 检索延迟=%.0fms",
+            "[%d/%d] 命中=%s NDCG=%s MRR@K=%s 检索延迟=%.0fms",
             i, n, bool(hit),
             f"{ndcg:.2f}" if ndcg is not None else "—",
-            f"{mrr_val:.2f}" if mrr_val is not None else "—",
+            f"{reported_mrr:.2f}" if reported_mrr is not None else "—",
             latency,
         )
+
+    source_hit_rate = source_hits_total / n if n else 0.0
+    source_mrr_mean = sum(source_mrrs) / len(source_mrrs) if source_mrrs else None
+    source_recall_mean = (
+        sum(source_recalls) / len(source_recalls) if source_recalls else None
+    )
+    evidence_summary = {
+        **evidence_coverage,
+        "evaluable_samples": len(evidence_hits),
+        "excluded_samples": evidence_excluded,
+        "unlabeled_samples": n - sum(bool(item.get("expected_evidence")) for item in items),
+        "recall_at_5": (
+            sum(evidence_recalls_at_5) / len(evidence_recalls_at_5)
+            if evidence_recalls_at_5
+            else None
+        ),
+        "recall_at_10": (
+            sum(evidence_recalls_at_10) / len(evidence_recalls_at_10)
+            if evidence_recalls_at_10
+            else None
+        ),
+        "hit_rate_at_10": (
+            sum(evidence_hits) / len(evidence_hits) if evidence_hits else None
+        ),
+        "mrr_at_5": (
+            sum(evidence_mrrs_at_5) / len(evidence_mrrs_at_5)
+            if evidence_mrrs_at_5
+            else None
+        ),
+        "mrr_at_10": (
+            sum(evidence_mrrs_at_10) / len(evidence_mrrs_at_10)
+            if evidence_mrrs_at_10
+            else None
+        ),
+    }
     return {
         "samples": n,
         "mode": "retrieval_only",
-        "retrieval_hit_rate": hits_total / n if n else 0.0,
+        "retrieval_hit_rate": (
+            evidence_summary["hit_rate_at_10"] if evidence_mode else source_hit_rate
+        ),
         "ndcg_at_5": sum(ndcgs) / len(ndcgs) if ndcgs else None,
-        "mrr": sum(mrrs) / len(mrrs) if mrrs else None,
-        "recall_at_10": sum(recalls) / len(recalls) if recalls else None,
+        "mrr": evidence_summary["mrr_at_10"] if evidence_mode else source_mrr_mean,
+        "mrr_at_10": evidence_summary["mrr_at_10"],
+        "recall_at_5": evidence_summary["recall_at_5"],
+        "recall_at_10": (
+            evidence_summary["recall_at_10"] if evidence_mode else source_recall_mean
+        ),
+        "hit_rate_at_10": evidence_summary["hit_rate_at_10"],
+        "retrieval_evidence": evidence_summary,
+        "source_retrieval": {
+            "hit_rate": source_hit_rate,
+            "mrr": source_mrr_mean,
+            "recall_at_10": source_recall_mean,
+            "ndcg_at_5": sum(ndcgs) / len(ndcgs) if ndcgs else None,
+        },
         "avg_retrieval_latency_ms": sum(latencies) / len(latencies) if latencies else None,
         "p95_retrieval_latency_ms": percentile(latencies, 0.95),
         "details": details,
@@ -714,6 +1266,39 @@ def check_thresholds(summary: Dict[str, Any], args: argparse.Namespace) -> List[
         if actual < min_recall:
             failures.append(f"recall_at_10 {actual:.3f} < {min_recall:.3f}")
 
+    recall_at_5 = summary.get("recall_at_5")
+    min_recall_at_5 = getattr(args, "min_recall_at_5", None)
+    if min_recall_at_5 is not None:
+        actual = float(recall_at_5 or 0.0)
+        if actual < min_recall_at_5:
+            failures.append(
+                f"recall_at_5 {actual:.3f} < {min_recall_at_5:.3f}"
+            )
+
+    min_recall_at_10 = getattr(args, "min_recall_at_10", None)
+    if min_recall_at_10 is not None:
+        actual = float(recall_value or 0.0)
+        if actual < min_recall_at_10:
+            failures.append(
+                f"recall_at_10 {actual:.3f} < {min_recall_at_10:.3f}"
+            )
+
+    hit_rate_at_10 = summary.get("hit_rate_at_10")
+    min_hit_rate_at_10 = getattr(args, "min_hit_rate_at_10", None)
+    if min_hit_rate_at_10 is not None:
+        actual = float(hit_rate_at_10 or 0.0)
+        if actual < min_hit_rate_at_10:
+            failures.append(
+                f"hit_rate_at_10 {actual:.3f} < {min_hit_rate_at_10:.3f}"
+            )
+
+    mrr_at_10 = summary.get("mrr_at_10")
+    min_mrr_at_10 = getattr(args, "min_mrr_at_10", None)
+    if min_mrr_at_10 is not None:
+        actual = float(mrr_at_10 or 0.0)
+        if actual < min_mrr_at_10:
+            failures.append(f"mrr_at_10 {actual:.3f} < {min_mrr_at_10:.3f}")
+
     source_coverage = summary.get("dataset_source_coverage") or {}
     source_coverage_value = source_coverage.get("coverage")
     min_source_coverage = getattr(args, "min_source_coverage", None)
@@ -723,6 +1308,21 @@ def check_thresholds(summary: Dict[str, Any], args: argparse.Namespace) -> List[
             failures.append(
                 f"dataset_source_coverage {actual:.3f} < {min_source_coverage:.3f}"
             )
+
+    evidence_coverage = summary.get("retrieval_evidence") or {}
+    min_evidence_coverage = getattr(args, "min_evidence_coverage", None)
+    if min_evidence_coverage is not None:
+        if evidence_coverage.get("mode") != "evidence":
+            failures.append(
+                "retrieval_evidence.coverage unavailable (dataset has no expected_evidence)"
+            )
+        else:
+            actual = float(evidence_coverage.get("coverage") or 0.0)
+            if actual < min_evidence_coverage:
+                failures.append(
+                    "retrieval_evidence.coverage "
+                    f"{actual:.3f} < {min_evidence_coverage:.3f}"
+                )
 
     verified_rate = (summary.get("verifiability") or {}).get("verified_rate")
     if args.min_verified_rate is not None:
@@ -774,6 +1374,36 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--min-hit-rate", type=float, default=None, help="CI：最低检索命中率")
     p.add_argument("--min-ndcg", type=float, default=None, help="CI：最低 NDCG@5")
     p.add_argument("--min-recall", type=float, default=None, help="CI：最低 Recall@10")
+    p.add_argument(
+        "--min-recall-at-5",
+        type=float,
+        default=None,
+        help="CI：evidence 级最低 Recall@5",
+    )
+    p.add_argument(
+        "--min-recall-at-10",
+        type=float,
+        default=None,
+        help="CI：evidence 级最低 Recall@10",
+    )
+    p.add_argument(
+        "--min-hit-rate-at-10",
+        type=float,
+        default=None,
+        help="CI：evidence 级最低 HitRate@10",
+    )
+    p.add_argument(
+        "--min-mrr-at-10",
+        type=float,
+        default=None,
+        help="CI：evidence 级最低 MRR@10",
+    )
+    p.add_argument(
+        "--min-evidence-coverage",
+        type=float,
+        default=None,
+        help="CI：expected_evidence 能映射到当前 collection chunk 的最低比例",
+    )
     p.add_argument(
         "--min-source-coverage",
         type=float,
@@ -886,15 +1516,47 @@ def main():
         if source_coverage is not None
         else "评测源覆盖率      : —"
     )
-    print(f"检索命中率        : {summary['retrieval_hit_rate']:.2%}")
+    hit_rate_value = summary.get("retrieval_hit_rate")
+    print(
+        f"检索命中率        : {hit_rate_value:.2%}"
+        if hit_rate_value is not None
+        else "检索命中率        : —"
+    )
+    evidence_summary = summary.get("retrieval_evidence") or {}
+    if evidence_summary.get("mode") == "evidence":
+        evidence_cov = evidence_summary.get("coverage")
+        print(
+            f"Evidence 覆盖率   : {evidence_cov:.2%}"
+            if evidence_cov is not None
+            else "Evidence 覆盖率   : —"
+        )
+        print(
+            "可评测 / 排除     : "
+            f"{evidence_summary.get('evaluable_samples', 0)} / "
+            f"{evidence_summary.get('excluded_samples', 0)}"
+        )
     if summary.get("mode") == "retrieval_only":
         print("(retrieval-only 模式：不含生成侧指标)")
         n5 = summary.get("ndcg_at_5")
         print(f"NDCG@5            : {n5:.3f}" if n5 is not None else "NDCG@5            : —")
-        mr = summary.get("mrr")
-        print(f"MRR               : {mr:.3f}" if mr is not None else "MRR               : —")
+        mr = summary.get("mrr_at_10")
+        if mr is None and evidence_summary.get("mode") != "evidence":
+            mr = summary.get("mrr")
+        print(f"MRR@10            : {mr:.3f}" if mr is not None else "MRR@10            : —")
+        recall5 = summary.get("recall_at_5")
+        print(
+            f"Recall@5          : {recall5:.2%}"
+            if recall5 is not None
+            else "Recall@5          : —"
+        )
         recall = summary.get("recall_at_10")
         print(f"Recall@10         : {recall:.2%}" if recall is not None else "Recall@10         : —")
+        hit10 = summary.get("hit_rate_at_10")
+        print(
+            f"HitRate@10        : {hit10:.2%}"
+            if hit10 is not None
+            else "HitRate@10        : —"
+        )
         rl = summary.get("avg_retrieval_latency_ms")
         print(f"平均检索延迟      : {rl:.0f}ms" if rl is not None else "平均检索延迟      : —")
         p95 = summary.get("p95_retrieval_latency_ms")
@@ -920,10 +1582,20 @@ def main():
     print(f"P95 响应时间      : {p95:.0f} ms" if p95 is not None else "P95 响应时间      : —")
     ndcg = summary.get("ndcg_at_5")
     print(f"NDCG@5            : {ndcg:.4f}" if ndcg is not None else "NDCG@5            : —")
-    mrr_val = summary.get("mrr")
-    print(f"MRR               : {mrr_val:.4f}" if mrr_val is not None else "MRR               : —")
+    mrr_val = summary.get("mrr_at_10")
+    if mrr_val is None and evidence_summary.get("mode") != "evidence":
+        mrr_val = summary.get("mrr")
+    print(f"MRR@10            : {mrr_val:.4f}" if mrr_val is not None else "MRR@10            : —")
+    recall5 = summary.get("recall_at_5")
+    print(
+        f"Recall@5          : {recall5:.2%}"
+        if recall5 is not None
+        else "Recall@5          : —"
+    )
     recall = summary.get("recall_at_10")
     print(f"Recall@10         : {recall:.2%}" if recall is not None else "Recall@10         : —")
+    hit10 = summary.get("hit_rate_at_10")
+    print(f"HitRate@10        : {hit10:.2%}" if hit10 is not None else "HitRate@10        : —")
     ttft = summary.get("avg_ttft_ms")
     print(f"平均 TTFT         : {ttft:.0f} ms" if ttft is not None else "平均 TTFT         : —")
     tps = summary.get("avg_tokens_per_sec")
