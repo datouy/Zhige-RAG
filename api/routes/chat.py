@@ -14,8 +14,10 @@ Pipeline 复用 LLM / Embedding（P1.4）。
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -1374,6 +1376,11 @@ async def websocket_chat(websocket: WebSocket):
         await websocket.accept()
         while True:
             data = await websocket.receive_json()
+            request_id = str(data.get("request_id") or uuid.uuid4().hex)
+
+            def _with_request_id(event: Dict[str, Any]) -> Dict[str, Any]:
+                return {**event, "request_id": request_id}
+
             query = data.get("query", "")
             # 缺省回落：前端不传 top_k 时用配置里的 retrieval.top_k。
             # 此前写死 4，配置的 top_k 对 WebSocket 完全失效。
@@ -1386,7 +1393,9 @@ async def websocket_chat(websocket: WebSocket):
             direct = data.get("direct", False)
 
             if not query:
-                await websocket.send_json({"event": "error", "data": "query is required"})
+                await websocket.send_json(
+                    _with_request_id({"event": "error", "data": "query is required"})
+                )
                 continue
 
             # P0-1 修复：使用 LLMConcurrencyGate 替代已删除的 AsyncLLMExecutor
@@ -1400,7 +1409,7 @@ async def websocket_chat(websocket: WebSocket):
                     kb = _resolve_kb(ws_user, _cfg_ws, kb_id)
                 except HTTPException as kb_exc:
                     await websocket.send_json(
-                        {"event": "error", "data": str(kb_exc.detail)}
+                        _with_request_id({"event": "error", "data": str(kb_exc.detail)})
                     )
                     continue
 
@@ -1416,6 +1425,22 @@ async def websocket_chat(websocket: WebSocket):
             history = SESSION_MEMORY.get_history(user_id, session_id)
             answer_buf = {"text": ""}
             metadata_buf = {"sources": [], "verification": None, "timings": {}}
+            cancel_requested = {"value": False}
+
+            async def _watch_cancel() -> None:
+                """同一连接上等待取消消息；request_id 为空时取消当前请求。"""
+                try:
+                    while True:
+                        incoming = await websocket.receive_json()
+                        action = incoming.get("event") or incoming.get("type")
+                        incoming_id = incoming.get("request_id")
+                        if action in {"cancel", "stop"} and (
+                            not incoming_id or str(incoming_id) == request_id
+                        ):
+                            cancel_requested["value"] = True
+                            return
+                except (WebSocketDisconnect, RuntimeError):
+                    return
 
             # P1-4：记录时机，用于流式响应的性能元数据
             retrieval_start = time.perf_counter()
@@ -1423,41 +1448,54 @@ async def websocket_chat(websocket: WebSocket):
             first_token_time: Optional[float] = None
 
             # P1.3：semaphore 保护，避免并发 WS 流量击穿 LLM
-            async def _run():
+            async def _run() -> bool:
                 nonlocal ttft_ms, first_token_time
                 pipeline: RAGPipeline = get_runtime_pipeline(user_id=user_id, kb=kb)
-                async for event in pipeline.astream_answer(
-                    query,
-                    top_k=top_k,
-                    history=history,
-                    user_id=user_id,
-                    allowed_groups=_allowed_groups(ws_user),
-                    direct=direct,
-                ):
-                    event_type = event.get("event")
-                    
-                    # P1-4 修复：收集流式元数据
-                    if event_type == "hits":
-                        metadata_buf["sources"] = event.get("data", [])
-                        metadata_buf["timings"]["retrieval_ms"] = round(
-                            (time.perf_counter() - retrieval_start) * 1000, 2
-                        )
-                    elif event_type == "token":
-                        if first_token_time is None:
-                            first_token_time = time.perf_counter()
-                            ttft_ms = round((first_token_time - started) * 1000, 2)
-                            metadata_buf["timings"]["ttft_ms"] = ttft_ms
-                        answer_buf["text"] += str(event.get("data") or "")
-                    elif event_type == "done":
-                        metadata_buf["sources"] = event.get("data", [])
-                        metadata_buf["verification"] = event.get("verification")
-                        # 计算生成总时长
-                        if first_token_time:
-                            metadata_buf["timings"]["generation_ms"] = round(
-                                (time.perf_counter() - first_token_time) * 1000, 2
+                watcher = asyncio.create_task(_watch_cancel())
+                try:
+                    async for event in pipeline.astream_answer(
+                        query,
+                        top_k=top_k,
+                        history=history,
+                        user_id=user_id,
+                        allowed_groups=_allowed_groups(ws_user),
+                        direct=direct,
+                    ):
+                        if cancel_requested["value"]:
+                            break
+                        event_type = event.get("event")
+
+                        # P1-4 修复：收集流式元数据
+                        if event_type == "hits":
+                            metadata_buf["sources"] = event.get("data", [])
+                            metadata_buf["timings"]["retrieval_ms"] = round(
+                                (time.perf_counter() - retrieval_start) * 1000, 2
                             )
-                    
-                    await websocket.send_json(event)
+                        elif event_type == "token":
+                            if first_token_time is None:
+                                first_token_time = time.perf_counter()
+                                ttft_ms = round((first_token_time - started) * 1000, 2)
+                                metadata_buf["timings"]["ttft_ms"] = ttft_ms
+                            answer_buf["text"] += str(event.get("data") or "")
+                        elif event_type == "done":
+                            metadata_buf["sources"] = event.get("data", [])
+                            metadata_buf["verification"] = event.get("verification")
+                            # 计算生成总时长
+                            if first_token_time:
+                                metadata_buf["timings"]["generation_ms"] = round(
+                                    (time.perf_counter() - first_token_time) * 1000, 2
+                                )
+
+                        await websocket.send_json(_with_request_id(event))
+                finally:
+                    watcher.cancel()
+                    try:
+                        await watcher
+                    except (asyncio.CancelledError, WebSocketDisconnect, RuntimeError):
+                        pass
+
+                if cancel_requested["value"]:
+                    return True
                 
                 # P1-4：流式结束后发送汇总元数据事件
                 total_ms = round((time.perf_counter() - started) * 1000, 2)
@@ -1469,8 +1507,10 @@ async def websocket_chat(websocket: WebSocket):
                         "sources": metadata_buf["sources"],
                         "verification": metadata_buf["verification"],
                         "timings": metadata_buf["timings"],
-                    }
+                    },
+                    "request_id": request_id,
                 })
+                return False
 
             try:
                 # 用 gate 本身做上下文管理器（而不是 gate.semaphore）：
@@ -1479,9 +1519,9 @@ async def websocket_chat(websocket: WebSocket):
                 # "bound to a different event loop"。
                 if gate is not None:
                     async with gate:
-                        await _run()
+                        was_cancelled = await _run()
                 else:
-                    await _run()
+                    was_cancelled = await _run()
                 # 回写即时记忆
                 SESSION_MEMORY.append(user_id, session_id, "user", query)
                 SESSION_MEMORY.append(user_id, session_id, "assistant", answer_buf["text"])
@@ -1499,9 +1539,18 @@ async def websocket_chat(websocket: WebSocket):
                         pass
                     except Exception as exc:  # noqa: BLE001
                         logger.warning("WS 会话消息落库失败（已忽略）: %s", exc)
+                if was_cancelled:
+                    await websocket.send_json(
+                        _with_request_id({
+                            "event": "cancelled",
+                            "data": metadata_buf["sources"],
+                        })
+                    )
             except Exception as exc:
                 logger.error("WebSocket 流式生成失败: %s", exc)
-                await websocket.send_json({"event": "error", "data": str(exc)})
+                await websocket.send_json(
+                    _with_request_id({"event": "error", "data": str(exc)})
+                )
                 # 错误后必须补一条 done：客户端普遍以 "done" 作为"本轮结束"的
                 # 信号，只发 error 就结束会让前端一直转圈 / 测试 receive_json 永久阻塞。
                 try:
@@ -1509,6 +1558,7 @@ async def websocket_chat(websocket: WebSocket):
                         "event": "done",
                         "data": metadata_buf["sources"],
                         "verification": metadata_buf["verification"],
+                        "request_id": request_id,
                     })
                 except Exception:  # noqa: BLE001 - 连接可能已断开
                     pass

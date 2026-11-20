@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 from pathlib import Path
 
@@ -60,6 +61,39 @@ def test_websocket_chat_ignores_legacy_token_param(client):
         ws.send_json({"query": ""})
         msg = ws.receive_json()
         assert msg.get("event") == "error"
+
+
+def test_websocket_chat_cancels_same_request(client, monkeypatch):
+    """同一连接可以按 request_id 取消；后续 token 不再发送。"""
+    import api.routes.chat as chat_module
+
+    class _SlowPipeline:
+        long_term_store = None
+
+        async def astream_answer(self, *args, **kwargs):
+            yield {"event": "hits", "data": []}
+            await asyncio.sleep(0.05)
+            yield {"event": "token", "data": "不应出现"}
+            yield {"event": "done", "data": []}
+
+    monkeypatch.setattr(
+        chat_module,
+        "get_runtime_pipeline",
+        lambda user_id=None, kb=None: _SlowPipeline(),
+    )
+    with client.websocket_connect("/ws/chat") as ws:
+        ws.send_json({"query": "慢问题", "request_id": "req-cancel"})
+        first = ws.receive_json()
+        assert first["request_id"] == "req-cancel"
+        ws.send_json({"event": "cancel", "request_id": "req-cancel"})
+        events = []
+        while True:
+            event = ws.receive_json()
+            events.append(event)
+            if event.get("event") == "cancelled":
+                break
+        assert all(item.get("event") != "token" for item in events)
+        assert events[-1]["request_id"] == "req-cancel"
 
 
 # ----------------------------------------------------------------------
