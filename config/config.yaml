@@ -115,6 +115,7 @@ text_splitter:
   chunk_size: 400                 # 中文推荐 300-500，太大语义稀释，太小不完整
   chunk_overlap: 50              # 块间重叠，防止边界语义丢失
   min_chunk_size: 32             # 最小块大小
+  custom_dict_path: "config/custom_dict.txt"  # BM25 与入库分块共用；可通过 API 热加载
   chinese_separators:             # 中文标点优先（关键！）
     - "\n\n"                    # 段落分隔
     - "\n"                      # 换行

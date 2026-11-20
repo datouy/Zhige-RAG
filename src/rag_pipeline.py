@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import inspect
 import re
 import threading
 import time
@@ -510,8 +511,47 @@ class RAGPipeline:
             acl_groups=allowed_groups if retrieval_cfg.get("acl_filter", True) else None,
         )
 
+    def _query_vector_store(
+        self,
+        query_text: str,
+        top_k: int,
+        security_where: Optional[Dict[str, Any]],
+        score_threshold: float,
+        keyword_query: Optional[str],
+    ) -> List[Hit]:
+        """调用向量库，并兼容不支持新参数的历史测试/后端替身。"""
+        query_fn = self.vector_store.query
+        supports_keyword_query = getattr(
+            self, "_supports_keyword_query_arg", None
+        )
+        if supports_keyword_query is None:
+            try:
+                params = inspect.signature(query_fn).parameters.values()
+                supports_keyword_query = any(
+                    p.name == "keyword_query"
+                    or p.kind is inspect.Parameter.VAR_KEYWORD
+                    for p in params
+                )
+            except (TypeError, ValueError):
+                supports_keyword_query = True
+            self._supports_keyword_query_arg = supports_keyword_query
+
+        kwargs: Dict[str, Any] = {
+            "query_text": query_text,
+            "top_k": top_k,
+            "where": security_where,
+            "score_threshold": score_threshold,
+        }
+        if supports_keyword_query and keyword_query is not None:
+            kwargs["keyword_query"] = keyword_query
+        return query_fn(**kwargs)
+
     def _cached_vector_query(
-        self, query_text: str, top_k: int, security_where: Optional[Dict[str, Any]]
+        self,
+        query_text: str,
+        top_k: int,
+        security_where: Optional[Dict[str, Any]],
+        keyword_query: Optional[str] = None,
     ) -> List[Hit]:
         """带 TTL 缓存的向量检索；失败时降级为未命中（返回空列表）。"""
         import json
@@ -525,9 +565,11 @@ class RAGPipeline:
         key = (
             getattr(self.vector_store, "collection_name", ""),
             query_text,
+            keyword_query if keyword_query is not None else query_text,
             int(top_k),
             json.dumps(security_where, sort_keys=True, default=str, ensure_ascii=False),
             score_threshold,
+            getattr(self.vector_store, "lexical_signature", ""),
         )
         now = time.time()
         lock = getattr(self, "_retrieval_cache_lock", None)
@@ -561,11 +603,12 @@ class RAGPipeline:
 
         try:
             with Timer("retrieve"):
-                hits = self.vector_store.query(
+                hits = self._query_vector_store(
                     query_text=query_text,
                     top_k=top_k,
-                    where=security_where,
+                    security_where=security_where,
                     score_threshold=score_threshold,
+                    keyword_query=keyword_query,
                 )
         except Exception as exc:  # noqa: BLE001 - Chroma 不可读时降级为未命中
             logger.error("向量检索失败，已降级为未命中（查询：%s）: %s", query_text[:50], exc)
@@ -656,6 +699,7 @@ class RAGPipeline:
         return (
             getattr(self.vector_store, "collection_name", ""),
             self._collection_version(),
+            getattr(self.vector_store, "lexical_signature", ""),
             norm[:500],
             int(top_k or 0),
             where_s,
@@ -869,7 +913,10 @@ class RAGPipeline:
             variants = [norm_query]
         if len(variants) == 1:
             hits = self._cached_vector_query(
-                self._apply_query_instruction(variants[0]), fetch_k, security_where
+                self._apply_query_instruction(variants[0]),
+                fetch_k,
+                security_where,
+                keyword_query=variants[0],
             )
         else:
             # P0 并发：多路召回各自编码+检索，串行 for 会累加每路 embedding
@@ -877,11 +924,19 @@ class RAGPipeline:
             # 的 Tokenizer 均线程安全，缓存由 _retrieval_cache_lock 串行保护。
             from concurrent.futures import ThreadPoolExecutor
 
-            queries = [self._apply_query_instruction(v) for v in variants]
+            queries = [
+                (self._apply_query_instruction(variant), variant)
+                for variant in variants
+            ]
             ranked_lists: List[List[Hit]] = []
             with ThreadPoolExecutor(max_workers=max(1, min(len(queries), 4))) as pool:
                 for result in pool.map(
-                    lambda q: self._cached_vector_query(q, fetch_k, security_where),
+                    lambda pair: self._cached_vector_query(
+                        pair[0],
+                        fetch_k,
+                        security_where,
+                        keyword_query=pair[1],
+                    ),
                     queries,
                 ):
                     if result:
@@ -895,11 +950,12 @@ class RAGPipeline:
             and self.config.get("retrieval", {}).get("status_filter_fallback", True)
         ):
             with Timer("retrieve_unfiltered_fallback"):
-                hits = self.vector_store.query(
+                hits = self._query_vector_store(
                     query_text=self._apply_query_instruction(norm_query),
                     top_k=fetch_k,
-                    where=where,
+                    security_where=where,
                     score_threshold=self.config.get("retrieval", {}).get("score_threshold", 0.0),
+                    keyword_query=norm_query,
                 )
             if hits:
                 logger.warning(

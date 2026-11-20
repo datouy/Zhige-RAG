@@ -6,6 +6,7 @@
 - PUT    /api/v1/settings/model         更新配置并**立即生效**（写 local_overrides.yaml）
 - POST   /api/v1/settings/model/test    测试某个后端是否可用（不写入配置）
 - DELETE /api/v1/settings/model         清除界面覆盖，恢复到 config.yaml
+- POST   /api/v1/settings/dictionary/reload  热加载自定义词典并失效 BM25
 
 设计说明见 :mod:`src.settings_service`：界面改动写在
 ``config/local_overrides.yaml``，不碰 ``config/config.yaml``，
@@ -120,3 +121,29 @@ async def api_clear_model_settings(
     result = get_model_settings()
     result["warnings"] = ["已恢复为 config/config.yaml 中的配置"]
     return result
+
+
+@router.post("/api/v1/settings/dictionary/reload", tags=["设置"])
+async def api_reload_dictionary(
+    current_user: User = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """热加载固定路径的自定义词典，并让 BM25 在下次查询时重建。"""
+    if not current_user.is_admin:
+        raise HTTPException(status_code=403, detail="仅管理员可热加载全局词典")
+
+    from api.deps import get_runtime_config
+    from src.vector_store import reload_custom_dictionary
+
+    try:
+        cfg = get_runtime_config()
+        path = (
+            (cfg.get("text_splitter") or {}).get("custom_dict_path")
+            or "config/custom_dict.txt"
+        )
+        result = reload_custom_dictionary(str(path))
+        result["status"] = "ok"
+        result["bm25_rebuild"] = "next_query"
+        return result
+    except Exception as exc:  # noqa: BLE001
+        logger.error("热加载自定义词典失败: %s", exc)
+        raise HTTPException(status_code=500, detail=f"热加载自定义词典失败：{exc}") from exc

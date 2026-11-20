@@ -11,7 +11,7 @@
 - 统计信息（chunk 数、来源数）
 
 优化点：
-- BM25 多粒度分词（完整词 + bigram + unigram）
+- BM25 实体感知多粒度分词（标识符 + jieba 词 + bigram）
 - 自定义领域词典支持
 - 混合检索 RRF 融合
 - count() 结果缓存
@@ -24,6 +24,7 @@ import logging
 import math
 import re
 import threading
+import weakref
 from collections import Counter
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
@@ -85,7 +86,14 @@ class BaseVectorStore:
     def replace_chunks_for_sources(self, chunks, sources, on_commit=None) -> int:  # pragma: no cover
         raise NotImplementedError
 
-    def query(self, query_text: str, top_k: int = 5, where=None, score_threshold: float = 0.0):  # pragma: no cover
+    def query(
+        self,
+        query_text: str,
+        top_k: int = 5,
+        where=None,
+        score_threshold: float = 0.0,
+        keyword_query: Optional[str] = None,
+    ):  # pragma: no cover
         raise NotImplementedError
 
     def delete_by_ids(self, ids) -> int:  # pragma: no cover
@@ -177,7 +185,18 @@ def probe_collections(client: Any) -> Dict[str, Any]:
 # 自定义词典支持行业术语、专有名词等
 #
 
-_TOKEN_RE = re.compile(r"[A-Za-z0-9]+|[\u4e00-\u9fff]+")
+TOKENIZER_VERSION = 2
+
+_ASCII_ENTITY_RE = re.compile(
+    r"(?<![A-Za-z0-9])([A-Za-z0-9](?:[A-Za-z0-9._+#/\-]*[A-Za-z0-9+#])?)(?![A-Za-z0-9])"
+)
+_CJK_RUN_RE = re.compile(r"[\u4e00-\u9fff]+")
+_STANDARD_PREFIX_RE = re.compile(
+    r"^(?:gb|iso|iec|ansi|astm|ieee|rfc|yy|ws|db|jt|hj|sj|jb|tsg)"
+    r"(?:/[a-z0-9]+)?$"
+)
+_STANDARD_CONTINUATION_RE = re.compile(r"\s+(\d{2,}(?:[./_-]\d+)*)(?![A-Za-z0-9])")
+_IDENTIFIER_PART_RE = re.compile(r"[a-z0-9]+")
 
 # 中文停用词表（高频无区分力虚词）
 _CJK_STOPWORDS = frozenset(
@@ -192,6 +211,10 @@ _CJK_STOPWORDS = frozenset(
 _JIEBA_STATE = "unknown"
 _JIEBA_CUSTOM_WORDS: Set[str] = set()
 _JIEBA_INITIALIZED = False
+_TOKENIZER_SIGNATURE_CACHE: Optional[str] = None
+_DICTIONARY_GENERATION = 0
+_ACTIVE_BM25_STORES: "weakref.WeakSet[ChromaStore]" = weakref.WeakSet()
+_ACTIVE_BM25_STORES_LOCK = threading.Lock()
 
 
 def _init_jieba_with_custom_dict() -> None:
@@ -231,15 +254,114 @@ def _init_jieba_with_custom_dict() -> None:
         logger.warning(f"jieba 初始化失败: {exc}")
 
 
+def _read_custom_dictionary(path: str = "config/custom_dict.txt") -> Set[str]:
+    """读取去重后的自定义词典；热加载时文件必须存在。"""
+    dictionary = resolve_path(path)
+    if not dictionary.exists():
+        raise FileNotFoundError(f"自定义词典不存在：{dictionary}")
+    words: Set[str] = set()
+    for line in dictionary.read_text(encoding="utf-8").splitlines():
+        word = line.strip()
+        if word and not word.startswith("#"):
+            words.add(word)
+    return words
+
+
+def _tokenizer_signature() -> str:
+    """返回分词算法、jieba 状态和词典内容的稳定指纹。"""
+    global _TOKENIZER_SIGNATURE_CACHE
+    if _TOKENIZER_SIGNATURE_CACHE:
+        return _TOKENIZER_SIGNATURE_CACHE
+    if not _JIEBA_INITIALIZED:
+        _init_jieba_with_custom_dict()
+    payload = "\n".join(
+        [str(TOKENIZER_VERSION), _JIEBA_STATE]
+        + sorted(_JIEBA_CUSTOM_WORDS)
+    )
+    _TOKENIZER_SIGNATURE_CACHE = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+    return _TOKENIZER_SIGNATURE_CACHE
+
+
+def _invalidate_registered_bm25_indexes(discard_disk: bool = True) -> None:
+    """词典/算法变化后，使进程内所有 collection 的 BM25 缓存失效。"""
+    with _ACTIVE_BM25_STORES_LOCK:
+        stores = list(_ACTIVE_BM25_STORES)
+    for store in stores:
+        try:
+            store._invalidate_bm25(discard_disk=discard_disk)
+        except Exception as exc:  # noqa: BLE001 - 单个 store 失效不能阻断热更新
+            logger.warning("使 BM25 索引失效失败：%s", exc)
+
+
+def reload_custom_dictionary(path: str = "config/custom_dict.txt") -> Dict[str, Any]:
+    """热加载固定词典文件，并让所有已注册 collection 的 BM25 下次重建。
+
+    jieba 的运行时词典是进程级全局状态。这里同时处理新增和删除词；
+    若删除词需要彻底清理 jieba 内部缓存，仍建议在低峰期重启服务。
+    """
+    global _JIEBA_CUSTOM_WORDS, _JIEBA_INITIALIZED, _JIEBA_STATE
+    global _TOKENIZER_SIGNATURE_CACHE, _DICTIONARY_GENERATION
+
+    words = _read_custom_dictionary(path)
+    previous = set(_JIEBA_CUSTOM_WORDS)
+    try:
+        import jieba
+
+        jieba.setLogLevel(logging.ERROR)
+        if not _JIEBA_INITIALIZED:
+            _JIEBA_CUSTOM_WORDS = words
+            _init_jieba_with_custom_dict()
+        else:
+            del_word = getattr(jieba, "del_word", None)
+            if callable(del_word):
+                for word in previous - words:
+                    del_word(word)
+            for word in words - previous:
+                jieba.add_word(word)
+            _JIEBA_CUSTOM_WORDS = words
+            _JIEBA_STATE = "on"
+        _JIEBA_INITIALIZED = True
+    except ImportError:
+        _JIEBA_CUSTOM_WORDS = words
+        _JIEBA_STATE = "off"
+        _JIEBA_INITIALIZED = True
+    except Exception as exc:
+        _JIEBA_CUSTOM_WORDS = words
+        _JIEBA_STATE = "off"
+        _JIEBA_INITIALIZED = True
+        logger.warning("热加载自定义词典失败，BM25 将使用回退分词：%s", exc)
+
+    _TOKENIZER_SIGNATURE_CACHE = None
+    _DICTIONARY_GENERATION += 1
+    signature = _tokenizer_signature()
+    _invalidate_registered_bm25_indexes(discard_disk=True)
+    result = {
+        "word_count": len(words),
+        "generation": _DICTIONARY_GENERATION,
+        "signature": signature,
+        "path": str(resolve_path(path)),
+    }
+    logger.info(
+        "自定义词典已热加载：%d 词，generation=%d，signature=%s",
+        len(words),
+        _DICTIONARY_GENERATION,
+        signature,
+    )
+    return result
+
+
 def add_custom_words(words: List[str]) -> None:
     """添加自定义词典词汇（用于领域术语、专有名词等）。"""
-    global _JIEBA_CUSTOM_WORDS
+    global _JIEBA_CUSTOM_WORDS, _TOKENIZER_SIGNATURE_CACHE, _DICTIONARY_GENERATION
     _JIEBA_CUSTOM_WORDS.update(words)
     if _JIEBA_INITIALIZED and _JIEBA_STATE == "on":
         import jieba
 
         for word in words:
             jieba.add_word(word)
+    _TOKENIZER_SIGNATURE_CACHE = None
+    _DICTIONARY_GENERATION += 1
+    _invalidate_registered_bm25_indexes(discard_disk=True)
     logger.info(f"已添加 {len(words)} 个自定义词典词")
 
 
@@ -260,30 +382,35 @@ def _jieba_cut(seg: str) -> Optional[List[str]]:
 def _multi_granularity_tokens(seg: str) -> List[str]:
     """
     多粒度分词策略：
-    1. jieba 完整词
-    2. 双字 bigram
-    3. 单字 unigram（兜底）
+    1. jieba 完整词（有 jieba 时）
+    2. 双字 bigram（始终补充，覆盖词典未收录的新词）
+    3. 单字 unigram（仅无 jieba 时兜底）
     """
-    # 1. 完整词（优先）
     words = _jieba_cut(seg)
-    if words is not None:
-        return words
-    
-    # 2. 回退到 unigram + bigram
     chars = list(seg)
-    tokens = []
-    
-    # unigram（所有字符）
-    for c in chars:
-        if c not in _CJK_STOPWORDS:
-            tokens.append(c)
-    
-    # bigram（相邻字符对）
+    tokens = list(words or [])
+
+    if words is None:
+        for c in chars:
+            if c not in _CJK_STOPWORDS:
+                tokens.append(c)
+
     for i in range(len(chars) - 1):
         bigram = chars[i] + chars[i + 1]
         if bigram not in _CJK_STOPWORDS:
             tokens.append(bigram)
-    
+
+    return tokens
+
+
+def _identifier_tokens(raw: str, continuation: Optional[str] = None) -> List[str]:
+    """保留完整标识符，同时加入其可独立检索的组成部分。"""
+    text = raw.lower()
+    if continuation:
+        text = f"{text} {continuation.lower()}"
+    full = re.sub(r"\s+", "", text)
+    tokens = [full]
+    tokens.extend(_IDENTIFIER_PART_RE.findall(text))
     return tokens
 
 
@@ -294,22 +421,29 @@ def _tokenize(text: str) -> List[str]:
     """
     tokens: List[str] = []
     seen: Set[str] = set()
-    
-    for m in _TOKEN_RE.finditer(text or ""):
-        seg = m.group(0)
-        if seg[0].isascii():
-            # 英文/数字：整词匹配
-            token = seg.lower()
-            if token not in seen:
+    source = text or ""
+    units: List[Tuple[int, int, str, bool]] = []
+    for match in _ASCII_ENTITY_RE.finditer(source):
+        units.append((match.start(), match.end(), match.group(1), True))
+    for match in _CJK_RUN_RE.finditer(source):
+        units.append((match.start(), match.end(), match.group(0), False))
+    units.sort(key=lambda item: item[0])
+
+    for _, end, seg, is_identifier in units:
+        if is_identifier:
+            continuation = None
+            if _STANDARD_PREFIX_RE.fullmatch(seg.lower()):
+                tail = _STANDARD_CONTINUATION_RE.match(source[end:])
+                if tail:
+                    continuation = tail.group(1)
+            candidates = _identifier_tokens(seg, continuation)
+        else:
+            candidates = _multi_granularity_tokens(seg)
+        for token in candidates:
+            if token and token not in seen:
                 tokens.append(token)
                 seen.add(token)
-        else:
-            # 中文：多粒度
-            for tok in _multi_granularity_tokens(seg):
-                if tok not in seen:
-                    tokens.append(tok)
-                    seen.add(tok)
-    
+
     return tokens
 
 
@@ -330,13 +464,19 @@ class BM25Index:
         texts: Sequence[str], 
         metadatas: Sequence[Dict[str, Any]], 
         k1: float = 1.5, 
-        b: float = 0.75
+        b: float = 0.75,
+        tokenizer_signature: Optional[str] = None,
     ) -> None:
         self._lock = threading.RLock()
         self.ids = list(ids)
         self.metadatas = list(metadatas)
         self.texts = list(texts)
         self.k1, self.b = k1, b
+        self.tokenizer_signature = (
+            tokenizer_signature
+            if tokenizer_signature is not None
+            else _tokenizer_signature()
+        )
         self.docs_tokens: List[List[str]] = [_tokenize(t) for t in self.texts]
         self._id_to_pos: Dict[str, int] = {cid: i for i, cid in enumerate(self.ids)}
         self.N = len(self.ids)
@@ -396,7 +536,8 @@ class BM25Index:
                 "metadatas": list(self.metadatas),
                 "k1": self.k1,
                 "b": self.b,
-                "version": 1,
+                "version": TOKENIZER_VERSION,
+                "tokenizer_signature": self.tokenizer_signature,
             }
 
     @classmethod
@@ -407,6 +548,7 @@ class BM25Index:
             metadatas=data.get("metadatas") or [],
             k1=float(data.get("k1", 1.5)),
             b=float(data.get("b", 0.75)),
+            tokenizer_signature=str(data.get("tokenizer_signature") or ""),
         )
 
     def save(self, path: Any) -> None:
@@ -435,7 +577,12 @@ class BM25Index:
             pass
 
     @classmethod
-    def load(cls, path: Any) -> Optional["BM25Index"]:
+    def load(
+        cls,
+        path: Any,
+        expected_signature: Optional[str] = None,
+    ) -> Optional["BM25Index"]:
+        """读取索引；签名不匹配时在分词前直接拒绝旧 pickle。"""
         try:
             import os
             import pickle
@@ -446,6 +593,11 @@ class BM25Index:
             with open(p, "rb") as f:
                 data = pickle.load(f)
             if not isinstance(data, dict):
+                return None
+            if (
+                expected_signature is not None
+                and str(data.get("tokenizer_signature") or "") != expected_signature
+            ):
                 return None
             return cls.from_dict(data)
         except Exception:
@@ -736,9 +888,16 @@ class ChromaStore(BaseVectorStore):
         # （取值理由见 _fuse_hybrid 的说明）
         self.hybrid_bm25_weight = max(0.0, float(hybrid_bm25_weight))
         self._bm25: Optional[BM25Index] = None
-        self._bm25_lock = threading.Lock()
+        self._bm25_lock = threading.RLock()
         # P1：BM25 磁盘持久化路径（与 collection 同目录，避免冷启全量 get+分词）
         self._bm25_path = self.persist_directory / f"bm25_{collection_name}.pkl"
+        with _ACTIVE_BM25_STORES_LOCK:
+            _ACTIVE_BM25_STORES.add(self)
+
+    @property
+    def lexical_signature(self) -> str:
+        """当前词法算法与词典指纹，供检索缓存和 pickle 校验使用。"""
+        return _tokenizer_signature()
 
     def health_check(self, query_probe: bool = True) -> Dict[str, Any]:
         """执行不会写数据的一致性探测，失败时抛出明确异常。"""
@@ -783,13 +942,28 @@ class ChromaStore(BaseVectorStore):
         report["query_probe"] = bool(can_query_probe)
         return report
 
-    def _invalidate_bm25(self) -> None:
+    def _invalidate_bm25(self, discard_disk: bool = False) -> None:
         """数据变更后使 BM25 索引失效（并尽力落盘，下次冷启直接复用）。"""
-        try:
-            if self._bm25 is not None:
-                self._bm25.save(getattr(self, "_bm25_path", "bm25.pkl"))
-        except Exception:
-            pass
+        lock = getattr(self, "_bm25_lock", None)
+        if lock is None:
+            return self._invalidate_bm25_unlocked(discard_disk)
+        with lock:
+            return self._invalidate_bm25_unlocked(discard_disk)
+
+    def _invalidate_bm25_unlocked(self, discard_disk: bool) -> None:
+        bm25_path = getattr(self, "_bm25_path", None)
+        if discard_disk:
+            try:
+                if bm25_path:
+                    resolve_path(bm25_path).unlink(missing_ok=True)
+            except Exception:
+                pass
+        else:
+            try:
+                if self._bm25 is not None and bm25_path:
+                    self._bm25.save(bm25_path)
+            except Exception:
+                pass
         self._bm25 = None
 
     def _ensure_bm25(self) -> BM25Index:
@@ -799,7 +973,10 @@ class ChromaStore(BaseVectorStore):
                 if self._bm25 is None:
                     # P1：优先读磁盘持久化，N 对不上再全量重建（万级以上冷启分钟级→秒级）
                     try:
-                        cached = BM25Index.load(getattr(self, "_bm25_path", "bm25.pkl"))
+                        cached = BM25Index.load(
+                            getattr(self, "_bm25_path", "bm25.pkl"),
+                            expected_signature=self.lexical_signature,
+                        )
                         if cached is not None:
                             try:
                                 cur_n = int(self.collection.count())
@@ -815,6 +992,7 @@ class ChromaStore(BaseVectorStore):
                         ids=got.get("ids") or [],
                         texts=got.get("documents") or [],
                         metadatas=got.get("metadatas") or [],
+                        tokenizer_signature=self.lexical_signature,
                     )
                     try:
                         self._bm25.save(getattr(self, "_bm25_path", "bm25.pkl"))
@@ -1114,11 +1292,22 @@ class ChromaStore(BaseVectorStore):
         top_k: int = 5,
         where: Optional[Dict[str, Any]] = None,
         score_threshold: float = 0.0,
+        keyword_query: Optional[str] = None,
     ) -> List[Hit]:
-        """检索 Top-K 命中文档。"""
+        """检索 Top-K 命中文档。
+
+        ``query_text`` 用于向量编码，可能包含 BGE 查询指令；
+        ``keyword_query`` 是剥离指令后的原始检索词，专供 BM25。
+        """
         if self.count() == 0:
             return []
-        results = self.query_batch([query_text], top_k=top_k, where=where, score_threshold=score_threshold)
+        results = self.query_batch(
+            [query_text],
+            top_k=top_k,
+            where=where,
+            score_threshold=score_threshold,
+            keyword_queries=[keyword_query] if keyword_query is not None else None,
+        )
         return results[0] if results else []
 
     def query_batch(
@@ -1127,10 +1316,13 @@ class ChromaStore(BaseVectorStore):
         top_k: int = 5,
         where: Optional[Dict[str, Any]] = None,
         score_threshold: float = 0.0,
+        keyword_queries: Optional[List[str]] = None,
     ) -> List[List[Hit]]:
         """批量检索：多个 query 并行编码，一次 Chroma 调用返回。"""
         if not query_texts:
             return []
+        if keyword_queries is not None and len(keyword_queries) != len(query_texts):
+            raise ValueError("keyword_queries 与 query_texts 数量必须一致")
 
         if self.embedding_model is None:
             raise RuntimeError("当前未配置 embedding 模型，无法进行语义检索")
@@ -1178,7 +1370,12 @@ class ChromaStore(BaseVectorStore):
                 )
             
             if self.hybrid_enabled:
-                hits = self._fuse_hybrid(query_text, hits, top_k, where=where)
+                lexical_query = (
+                    keyword_queries[qi]
+                    if keyword_queries is not None
+                    else query_text
+                )
+                hits = self._fuse_hybrid(lexical_query, hits, top_k, where=where)
             results.append(hits)
         
         return results

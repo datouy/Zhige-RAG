@@ -179,7 +179,15 @@ class PgVectorStore(BaseVectorStore):
             on_commit()
         return n
 
-    def query(self, query_text: str, top_k: int = 5, where: Optional[Dict[str, Any]] = None, score_threshold: float = 0.0) -> List[Hit]:
+    def query(
+        self,
+        query_text: str,
+        top_k: int = 5,
+        where: Optional[Dict[str, Any]] = None,
+        score_threshold: float = 0.0,
+        keyword_query: Optional[str] = None,
+    ) -> List[Hit]:
+        """pgvector 当前只实现向量路；keyword_query 为统一接口保留。"""
         if self.embedding_model is None:
             raise RuntimeError("当前未配置 embedding 模型，无法进行语义检索")
         qv = self.embedding_model.encode([query_text], batch_size=1).tolist()[0]

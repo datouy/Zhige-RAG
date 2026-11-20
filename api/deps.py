@@ -336,6 +336,7 @@ def get_splitter(cfg: Optional[Dict[str, Any]] = None):
             separators=sp.get("chinese_separators") or sp.get("separators"),
             keep_separator=sp.get("keep_separator", True),
             min_chunk_size=sp.get("min_chunk_size", 32),
+            custom_dict_path=sp.get("custom_dict_path") or "config/custom_dict.txt",
         )
     return RecursiveTextSplitter(
         chunk_size=sp.get("chunk_size", 512),

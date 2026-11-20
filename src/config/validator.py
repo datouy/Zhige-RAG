@@ -224,6 +224,7 @@ class TextSplitterConfig(_StrictModel):
     min_chunk_size: int = Field(50, ge=1, description="最小块大小")
     chinese_separators: List[str] = Field(default_factory=list)
     separators: List[str] = Field(default_factory=list)
+    custom_dict_path: str = Field("config/custom_dict.txt", description="自定义词典路径")
     keep_separator: bool = True
     strip_whitespace: bool = True
     

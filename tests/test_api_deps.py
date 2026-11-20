@@ -190,6 +190,7 @@ class TestRouteModuleSurface:
             "/api/v1/agent/chat",
             "/api/v1/eval/run",
             "/api/v1/config",
+            "/api/v1/settings/dictionary/reload",
             "/ws/chat",
             "/api/v1/ws/agent",
         ):
