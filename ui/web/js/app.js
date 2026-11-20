@@ -1,254 +1,276 @@
-/**
- * 知阁 Web UI —— 本地知识库问答前端
- * 
- * 开箱即用设计：
- * - 无需登录：所有请求自动归属固定的本地用户
- * - 首次使用引导
- * - 模型状态可视化
- * 
- * 依赖后端 REST + WebSocket：
- *   GET/POST/PATCH/DELETE /api/v1/kb       知识库
- *   GET/POST/PATCH/DELETE /api/v1/sessions 会话
- *   POST /api/v1/ingest                    文件入库（multipart，可带 kb_id）
- *   POST /api/v1/ingest/url                网页入库
- *   WS   /ws/chat                          流式问答
- */
 class ChatApp {
     constructor() {
         this.ws = null;
+        this.agentWs = null;
         this.connected = false;
-        this.currentSources = [];
+        this.isStreaming = false;
+        this.activeRequestId = null;
+        this.activeSocket = null;
         this.topK = 8;
         this.directMode = false;
-
-        this.knowledgeBases = [];
+        this.agentMode = false;
         this.currentKb = null;
-        this.sessions = [];
+        this.knowledgeBases = [];
+        this.agents = [];
+        this.activeAgent = null;
+        this.mcpServers = [];
+        this.pendingAgentPersist = null;
         this.currentSession = null;
-        
-        // 默认直接进入聊天界面：欢迎引导只在用户主动"重置引导"后才出现
-        // （旧逻辑 `!== 'false'` 会让新用户首访被引导弹窗挡住，看不到聊天界面）
-        this.firstVisit = localStorage.getItem('zhige_first_visit') === 'true';
-
+        this.sessions = [];
+        this.currentSources = [];
+        this.lastUserQuery = "";
+        this.citationSequence = 0;
+        this.documents = [];
+        this.ingestJobs = [];
+        this.tasksTimer = null;
+        this.searchHits = [];
+        this.searchSequence = 0;
+        this.searchTimer = null;
+        this.reconnectTimer = null;
         this.el = {};
-
         this.init();
     }
-
-    // ================= 基础设施 =================
 
     async init() {
         this.cacheElements();
         this.bindEvents();
-
-        // 显示首次使用引导
-        if (this.firstVisit) {
-            this.showWelcome();
-        } else {
-            await this.bootstrap();
-        }
-    }
-    
-    showWelcome() {
-        const overlay = document.getElementById('welcome-overlay');
-        if (overlay) {
-            overlay.classList.add('active');
-            this.checkModelStatus();
-        }
-    }
-    
-    async checkModelStatus() {
-        const box = document.getElementById('model-status-content');
-        if (!box) return;
-        
+        this.updateShortcutLabel();
         try {
-            const s = await this.api('/settings/model');
-            const llmBackend = (s.llm && s.llm.backend) || 'extractive';
-            const embBackend = (s.embedding && s.embedding.backend) || 'onnx';
-            const backendLabel = {
-                extractive: '原文摘录（无 LLM）',
-                onnx: '本地 CPU 向量',
-                local: '本机权重',
-                ollama: '本机 Ollama',
-                openai: '云端 API',
-            };
-            let html = '<ul class="status-list">';
-
-            html += `<li class="ok">
-                    <span class="status-dot green"></span>
-                    <span>对话模型: ${llmBackend}（${backendLabel[llmBackend] || llmBackend}）</span>
-                </li>`;
-            html += `<li class="ok">
-                    <span class="status-dot green"></span>
-                    <span>向量模型: ${embBackend}（${backendLabel[embBackend] || embBackend}）</span>
-                </li>`;
-
-            html += '</ul>';
-
-            // 添加帮助提示
-            if (llmBackend === 'extractive' && embBackend === 'onnx') {
-                html += `<div class="status-ready">
-                    ✅ 无 LLM 模式：BM25 + 本地 ONNX 向量混合检索，答案直接引用原文
-                </div>`;
-            } else {
-                html += `<div class="status-help">
-                    <p>当前使用可选的自定义后端，可在「模型设置」里测试连通性。</p>
-                </div>`;
-            }
-
-            box.innerHTML = html;
-        } catch (e) {
-            box.innerHTML = '<span class="warn">无法检测模型状态，请启动后端后重试</span>';
+            await this.bootstrap();
+        } catch (error) {
+            this.showAlert(`启动失败：${error.message}`, "error");
         }
-    }
-
-    hideWelcome() {
-        const overlay = document.getElementById('welcome-overlay');
-        if (overlay) {
-            overlay.classList.remove('active');
-            // 不再显示引导（用户可重置）
-            localStorage.setItem('zhige_first_visit', 'false');
-        }
-    }
-    
-    resetWelcome() {
-        localStorage.setItem('zhige_first_visit', 'true');
-        this.firstVisit = true;
-        this.showWelcome();
     }
 
     cacheElements() {
         const ids = [
-            'app-layout', 'kb-list', 'session-list',
-            'messages', 'chat-input', 'send-btn', 'status', 'current-kb-name',
-            'kb-meta', 'file-input', 'modal', 'modal-title', 'modal-body',
-            'welcome-state', 'welcome-overlay',
-            'direct-toggle',
-            // 模型设置
-            'settings-modal', 'settings-btn', 'settings-result', 'settings-save', 'settings-reset',
-            'llm-backend', 'llm-remote', 'llm-base-url', 'llm-model', 'llm-api-key', 'llm-test',
-            'emb-backend', 'emb-remote', 'emb-base-url', 'emb-model', 'emb-api-key', 'emb-test',
-            // 文档管理
-            'docs-modal', 'docs-content', 'docs-kb-name', 'docs-refresh', 'docs-back', 'docs-btn',
+            "app-layout", "messages", "chat-input", "send-btn", "stop-btn", "composer", "status",
+            "current-kb-name", "kb-meta", "kb-list", "session-list", "file-input",
+            "mode-btn", "mode-menu", "mode-label", "search-modal", "search-input", "search-results",
+            "export-btn",
+            "import-modal", "import-form", "import-url-input", "import-url-submit",
+            "modal", "modal-title", "modal-body", "docs-modal", "docs-content", "docs-filter",
+            "docs-kb-name", "docs-refresh", "docs-back", "docs-btn", "docs-source-filter", "settings-modal",
+            "settings-result", "settings-save", "settings-reset", "llm-backend", "llm-remote",
+            "llm-base-url", "llm-model", "llm-api-key", "llm-test", "emb-backend", "emb-remote",
+            "emb-base-url", "emb-model", "emb-api-key", "emb-test", "upload-btn", "url-btn",
+            "settings-btn", "new-kb-btn", "new-session-btn", "search-btn", "sidebar",
+            "sidebar-open", "sidebar-close", "sidebar-backdrop", "drop-overlay",
+            "ingest-status", "ingest-status-text", "ingest-progress",
+            "citation-panel", "citation-title", "citation-source", "citation-close", "citation-content",
+            "tasks-btn", "tasks-modal", "tasks-content",
+            "agents-modal", "agents-list-view", "agents-list", "agent-new", "agent-form",
+            "agent-id", "agent-name", "agent-kb", "agent-instructions", "agent-tools",
+            "agent-form-result", "agent-delete", "agent-cancel", "agent-save",
+            "mcp-open", "mcp-modal", "mcp-servers-list", "mcp-form", "mcp-name",
+            "mcp-command", "mcp-args", "mcp-form-result",
         ];
         ids.forEach((id) => { this.el[id] = document.getElementById(id); });
     }
 
     bindEvents() {
-        // ---- 首次使用引导 ----
-        document.getElementById('welcome-start')?.addEventListener('click', () => {
-            this.hideWelcome();
-            this.bootstrap();
+        document.querySelectorAll("[data-upload]").forEach((button) => {
+            button.addEventListener("click", () => this.el["file-input"].click());
+        });
+        document.querySelectorAll("[data-import-url]").forEach((button) => {
+            button.addEventListener("click", () => this.openImport());
+        });
+        document.querySelectorAll("[data-search]").forEach((button) => {
+            button.addEventListener("click", () => this.openSearch());
         });
 
-        // ---- 侧边栏 ----
-        document.getElementById('new-kb-btn')?.addEventListener('click', () => this.promptNewKb());
-        document.getElementById('new-session-btn')?.addEventListener('click', () => this.newSession());
-        document.getElementById('upload-btn')?.addEventListener('click', () => this.el['file-input'].click());
-        document.getElementById('url-btn')?.addEventListener('click', () => this.promptImportUrl());
-        document.getElementById('guide-btn')?.addEventListener('click', () => this.showGuide());
-        this.el['file-input']?.addEventListener('change', (e) => this.uploadFiles(e.target.files));
+        this.el["file-input"]?.addEventListener("change", (event) => {
+            this.uploadFiles(event.target.files);
+            event.target.value = "";
+        });
+        this.el["upload-btn"]?.addEventListener("click", () => this.el["file-input"].click());
+        this.el["url-btn"]?.addEventListener("click", () => this.openImport());
+        this.el["new-kb-btn"]?.addEventListener("click", () => this.promptNewKb());
+        this.el["new-session-btn"]?.addEventListener("click", () => this.newSession());
+        this.el["export-btn"]?.addEventListener("click", () => this.exportSession());
+        this.el["search-btn"]?.addEventListener("click", () => this.openSearch());
+        this.el["docs-btn"]?.addEventListener("click", () => this.openDocs());
+        this.el["tasks-btn"]?.addEventListener("click", () => this.openTasks());
+        this.el["settings-btn"]?.addEventListener("click", () => this.openSettings());
+        this.el["agent-new"]?.addEventListener("click", () => this.startAgentEditor());
+        this.el["agent-cancel"]?.addEventListener("click", () => this.showAgentsList());
+        this.el["agent-delete"]?.addEventListener("click", () => this.deleteAgent());
+        this.el["agent-form"]?.addEventListener("submit", (event) => {
+            event.preventDefault();
+            this.saveAgent();
+        });
+        this.el["agent-kb"]?.addEventListener("change", () => this.loadAgentToolOptions());
+        this.el["mcp-open"]?.addEventListener("click", () => this.openMcpServers());
+        this.el["mcp-form"]?.addEventListener("submit", (event) => {
+            event.preventDefault();
+            this.createMcpServer();
+        });
 
-        // ---- 对话 ----
-        this.el['send-btn']?.addEventListener('click', () => this.sendMessage());
-        this.el['chat-input']?.addEventListener('keypress', (e) => {
-            if (e.key === 'Enter' && !e.shiftKey) {
-                e.preventDefault();
+        this.el["composer"]?.addEventListener("submit", (event) => {
+            event.preventDefault();
+            this.sendMessage();
+        });
+        this.el["stop-btn"]?.addEventListener("click", () => this.stopStreaming());
+        this.el["chat-input"]?.addEventListener("input", () => this.resizeComposer());
+        this.el["chat-input"]?.addEventListener("keydown", (event) => {
+            if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
+                event.preventDefault();
                 this.sendMessage();
             }
         });
-        this.el['direct-toggle']?.addEventListener('change', (e) => {
-            this.directMode = !!e.target.checked;
-            const label = document.getElementById('direct-toggle-label');
-            if (label) {
-                label.classList.toggle('on', this.directMode);
+
+        this.el["mode-btn"]?.addEventListener("click", () => this.toggleModeMenu());
+        this.el["mode-menu"]?.querySelectorAll("[data-mode]").forEach((button) => {
+            button.addEventListener("click", () => {
+                this.chooseConversationMode(button.dataset.mode);
+                this.closeModeMenu();
+                this.el["mode-btn"].focus();
+            });
+        });
+
+        this.el["search-input"]?.addEventListener("input", () => this.scheduleSearch());
+        this.el["import-form"]?.addEventListener("submit", (event) => {
+            event.preventDefault();
+            this.importUrl(this.el["import-url-input"].value.trim());
+        });
+        this.el["docs-refresh"]?.addEventListener("click", () => this.loadDocs());
+        this.el["docs-back"]?.addEventListener("click", () => this.loadDocs());
+        this.el["docs-filter"]?.addEventListener("input", () => this.renderDocs(this.documents));
+        this.el["docs-source-filter"]?.addEventListener("change", () => this.renderDocs(this.documents));
+        this.el["citation-close"]?.addEventListener("click", () => this.closeCitation());
+
+        ["llm", "emb"].forEach((kind) => {
+            document.getElementById(`${kind}-backend`)?.addEventListener("change", () => this.syncRemoteFields(kind));
+            document.getElementById(`${kind}-test`)?.addEventListener("click", () => this.testModel(kind));
+        });
+        this.el["settings-save"]?.addEventListener("click", () => this.saveSettings());
+        this.el["settings-reset"]?.addEventListener("click", () => this.resetSettings());
+
+        this.el["sidebar-open"]?.addEventListener("click", () => this.setSidebarOpen(true));
+        this.el["sidebar-close"]?.addEventListener("click", () => this.setSidebarOpen(false));
+        this.el["sidebar-backdrop"]?.addEventListener("click", () => this.setSidebarOpen(false));
+
+        document.addEventListener("click", (event) => {
+            if (event.target.classList.contains("modal")) this.closeAllModals();
+            if (event.target.closest(".modal-close")) this.closeAllModals();
+            if (!event.target.closest(".mode-control")) this.closeModeMenu();
+        });
+
+        document.addEventListener("keydown", (event) => {
+            const modifier = event.metaKey || event.ctrlKey;
+            if (modifier && event.key.toLowerCase() === "k") {
+                event.preventDefault();
+                this.openSearch();
+            } else if (modifier && event.key.toLowerCase() === "n") {
+                event.preventDefault();
+                this.newSession();
+            } else if (event.key === "Escape") {
+                if (document.querySelector(".modal.active")) this.closeAllModals();
+                else if (!this.el["citation-panel"].hidden) this.closeCitation();
+                else this.setSidebarOpen(false);
             }
         });
 
-        // ---- 模型设置 ----
-        this.el['settings-btn']?.addEventListener('click', () => this.openSettings());
-        ['llm', 'emb'].forEach((k) => {
-            document.getElementById(`${k}-backend`)
-                ?.addEventListener('change', () => this.syncRemoteFields(k));
-            document.getElementById(`${k}-test`)
-                ?.addEventListener('click', () => this.testModel(k));
+        let dragDepth = 0;
+        window.addEventListener("dragenter", (event) => {
+            if (!this.hasFiles(event)) return;
+            event.preventDefault();
+            dragDepth += 1;
+            document.body.classList.add("is-dragging");
         });
-        this.el['settings-save']?.addEventListener('click', () => this.saveSettings());
-        this.el['settings-reset']?.addEventListener('click', () => this.resetSettings());
-
-        // ---- 文档管理 ----
-        this.el['docs-btn']?.addEventListener('click', () => this.openDocs());
-        this.el['docs-refresh']?.addEventListener('click', () => this.loadDocs());
-        this.el['docs-back']?.addEventListener('click', () => { this.el['docs-back'].hidden = true; this.loadDocs(); });
-
-        // ---- 弹窗关闭（通用 modal 与设置弹窗共用）----
-        document.addEventListener('click', (e) => {
-            if (e.target.classList.contains('modal') || e.target.classList.contains('modal-close')) {
-                document.querySelectorAll('.modal.active').forEach((m) => m.classList.remove('active'));
-            }
+        window.addEventListener("dragover", (event) => {
+            if (!this.hasFiles(event)) return;
+            event.preventDefault();
+            event.dataTransfer.dropEffect = "copy";
+        });
+        window.addEventListener("dragleave", (event) => {
+            if (!this.hasFiles(event)) return;
+            dragDepth = Math.max(0, dragDepth - 1);
+            if (!dragDepth) document.body.classList.remove("is-dragging");
+        });
+        window.addEventListener("drop", (event) => {
+            if (!this.hasFiles(event)) return;
+            event.preventDefault();
+            dragDepth = 0;
+            document.body.classList.remove("is-dragging");
+            this.uploadFiles(event.dataTransfer.files);
         });
     }
 
-    /** 统一请求封装：统一错误处理 */
-    async api(path, { method = 'GET', body = null, raw = false } = {}) {
-        const headers = {};
-        if (body && !raw) headers['Content-Type'] = 'application/json';
+    hasFiles(event) {
+        return Array.from(event.dataTransfer?.types || []).includes("Files");
+    }
 
-        const resp = await fetch(`/api/v1${path}`, {
+    updateShortcutLabel() {
+        const label = this.el["search-btn"]?.querySelector("kbd");
+        if (label && !/Mac|iPhone|iPad/.test(navigator.platform)) label.textContent = "Ctrl K";
+    }
+
+    async api(path, { method = "GET", body = null, raw = false } = {}) {
+        const headers = {};
+        if (body && !raw) headers["Content-Type"] = "application/json";
+        const response = await fetch(`/api/v1${path}`, {
             method,
             headers,
             body: body ? (raw ? body : JSON.stringify(body)) : undefined,
         });
-
-        const text = await resp.text();
+        const text = await response.text();
         let data = null;
         try { data = text ? JSON.parse(text) : null; } catch { data = text; }
-
-        if (!resp.ok) {
-            const msg = (data && (data.detail || data.message || data.error)) || text || `HTTP ${resp.status}`;
-            throw new Error(typeof msg === 'string' ? msg : JSON.stringify(msg));
+        if (!response.ok) {
+            const detail = data && (data.detail || data.message || data.error);
+            throw new Error(typeof detail === "string" ? detail : (detail ? JSON.stringify(detail) : text || `HTTP ${response.status}`));
         }
         return data;
     }
 
-    /** 进入主界面：拉知识库、会话，并建立 WS */
     async bootstrap() {
-        this.el['app-layout'].hidden = false;
+        this.el["app-layout"].hidden = false;
         await this.loadDefaults();
         await this.loadKnowledgeBases();
+        await this.loadAgents();
         await this.loadSessions();
+        await this.restoreSessionFromUrl();
         this.connectWebSocket();
+        this.el["chat-input"].focus();
     }
 
-    /**
-     * 从后端读取生效的默认值（检索条数等）。
-     *
-     * 为什么必须读而不是前端写死：top_k 的真值只有 `retrieval.top_k` 一处，
-     * 前端硬编码 8、后端请求体默认 4，三者互相矛盾 —— 用户改 config.yaml
-     * 对界面毫无影响。改成同源后，界面与 API 用同一套值。
-     */
     async loadDefaults() {
         try {
-            const d = await this.api('/config/defaults');
-            if (d && Number.isFinite(d.top_k) && d.top_k > 0) {
-                this.topK = d.top_k;
-            }
-        } catch (e) {
-            // 后端不可用时保留构造函数的默认值，不阻断启动
-            console.warn('读取后端默认值失败，沿用默认 top_k:', e);
+            const defaults = await this.api("/config/defaults");
+            if (Number.isFinite(defaults?.top_k) && defaults.top_k > 0) this.topK = defaults.top_k;
+        } catch {
+            // The configured frontend default remains usable when this endpoint is unavailable.
         }
     }
 
-    // ================= 知识库 =================
+    urlState() {
+        const params = new URLSearchParams(window.location.search);
+        return { kbId: params.get("kb"), sessionId: params.get("session") };
+    }
+
+    syncUrl() {
+        const url = new URL(window.location.href);
+        if (this.currentKb?.id) url.searchParams.set("kb", this.currentKb.id);
+        else url.searchParams.delete("kb");
+        if (this.currentSession?.id) url.searchParams.set("session", this.currentSession.id);
+        else url.searchParams.delete("session");
+        window.history.replaceState(null, "", url);
+    }
+
+    async restoreSessionFromUrl() {
+        const state = this.urlState();
+        if (!state.sessionId) return;
+        const session = this.sessions.find((item) => item.id === state.sessionId);
+        if (session) await this.openSession(session.id, { syncUrl: false });
+    }
 
     async loadKnowledgeBases() {
-        const data = await this.api('/kb');
+        const data = await this.api("/kb");
         this.knowledgeBases = data.knowledge_bases || [];
-        // 始终换成列表里的新对象：否则上传/删除后侧边栏已是新计数，顶栏还
-        // 拿着旧对象（表现为一直显示「0 文档 / 0 分块」）。
-        const fresh = this.knowledgeBases.find((k) => this.currentKb && k.id === this.currentKb.id);
-        this.currentKb = fresh
-            || this.knowledgeBases.find((k) => k.is_default)
+        const preferredId = this.currentKb?.id || this.urlState().kbId;
+        this.currentKb = this.knowledgeBases.find((kb) => kb.id === preferredId)
+            || this.knowledgeBases.find((kb) => kb.is_default)
             || this.knowledgeBases[0]
             || null;
         this.renderKnowledgeBases();
@@ -256,724 +278,1666 @@ class ChatApp {
     }
 
     renderKnowledgeBases() {
-        const list = this.el['kb-list'];
+        const list = this.el["kb-list"];
         if (!list) return;
         if (!this.knowledgeBases.length) {
             list.innerHTML = '<li class="list-empty">暂无知识库</li>';
             return;
         }
         list.innerHTML = this.knowledgeBases.map((kb) => `
-            <li class="list-item ${this.currentKb && kb.id === this.currentKb.id ? 'active' : ''}"
-                data-kb="${kb.id}">
-                <span class="item-main" title="${this.esc(kb.description || kb.name)}">
-                    ${kb.is_default ? '🏠' : '📁'} ${this.esc(kb.name)}
-                </span>
-                <span class="item-meta">${kb.doc_count}</span>
-                ${kb.is_default ? '' : `<button class="item-del" data-del-kb="${kb.id}" title="删除知识库" type="button">×</button>`}
+            <li class="list-item ${this.currentKb?.id === kb.id ? "active" : ""}" data-kb-row="${this.esc(kb.id)}">
+                <button class="item-select" type="button" data-kb="${this.esc(kb.id)}"
+                        ${this.currentKb?.id === kb.id ? 'aria-current="true"' : ""}>
+                    <span class="item-main">${this.esc(kb.name)}</span>
+                    <span class="item-meta">${Number(kb.doc_count || 0)}</span>
+                </button>
+                ${kb.is_default ? "" : `<button class="item-del" data-del-kb="${this.esc(kb.id)}" aria-label="删除知识库" type="button">×</button>`}
             </li>
-        `).join('');
+        `).join("");
 
-        list.querySelectorAll('[data-kb]').forEach((li) => {
-            li.addEventListener('click', (e) => {
-                if (e.target.dataset.delKb) return;
-                this.selectKb(li.dataset.kb);
-            });
+        list.querySelectorAll("[data-kb]").forEach((button) => {
+            button.addEventListener("click", () => this.selectKb(button.dataset.kb));
         });
-        list.querySelectorAll('[data-del-kb]').forEach((btn) => {
-            btn.addEventListener('click', () => this.deleteKb(btn.dataset.delKb));
+        list.querySelectorAll("[data-del-kb]").forEach((button) => {
+            button.addEventListener("click", () => this.deleteKb(button.dataset.delKb));
         });
-
     }
 
     renderCurrentKb() {
         if (!this.currentKb) return;
-        this.el['current-kb-name'].textContent = this.currentKb.name;
-        this.el['kb-meta'].textContent =
-            `${this.currentKb.doc_count} 文档 / ${this.currentKb.chunk_count} 分块`;
+        this.el["current-kb-name"].textContent = this.currentKb.name;
+        this.el["kb-meta"].textContent = `${Number(this.currentKb.doc_count || 0)} 文档 · ${Number(this.currentKb.chunk_count || 0)} 分块`;
     }
 
     async selectKb(kbId) {
-        this.currentKb = this.knowledgeBases.find((k) => k.id === kbId) || this.currentKb;
+        const kb = this.knowledgeBases.find((item) => item.id === kbId);
+        if (!kb) return;
+        this.currentKb = kb;
+        this.setConversationMode("knowledge");
         this.currentSession = null;
         this.renderKnowledgeBases();
         this.renderCurrentKb();
         this.clearMessages();
+        this.syncUrl();
+        this.setSidebarOpen(false);
         await this.loadSessions();
     }
 
     async promptNewKb() {
-        const name = prompt('新建知识库，输入名称：');
-        if (!name || !name.trim()) return;
+        const name = prompt("知识库名称");
+        if (!name?.trim()) return;
         try {
-            await this.api('/kb', { method: 'POST', body: { name: name.trim(), description: '' } });
-            this.showAlert('知识库已创建', 'success');
+            const kb = await this.api("/kb", { method: "POST", body: { name: name.trim(), description: "" } });
             await this.loadKnowledgeBases();
-        } catch (e) {
-            this.showAlert('创建失败：' + e.message, 'error');
+            if (kb?.id) await this.selectKb(kb.id);
+        } catch (error) {
+            this.showAlert(`创建失败：${error.message}`, "error");
         }
     }
 
     async deleteKb(kbId) {
-        const kb = this.knowledgeBases.find((k) => k.id === kbId);
-        if (!kb) return;
-        if (!confirm(`删除知识库「${kb.name}」？\n其中的文档、向量数据与该库的会话都会被一并删除，且不可恢复。`)) return;
+        const kb = this.knowledgeBases.find((item) => item.id === kbId);
+        if (!kb || !confirm(`删除「${kb.name}」及其中的资料？`)) return;
         try {
-            await this.api(`/kb/${kbId}`, { method: 'DELETE' });
-            this.showAlert('知识库已删除', 'success');
-            if (this.currentKb && this.currentKb.id === kbId) this.currentKb = null;
+            await this.api(`/kb/${kbId}`, { method: "DELETE" });
+            if (this.activeAgent?.kb_id === kbId) this.activeAgent = null;
+            if (this.currentKb?.id === kbId) this.currentKb = null;
+            this.currentSession = null;
             await this.loadKnowledgeBases();
+            await this.loadAgents();
             await this.loadSessions();
-        } catch (e) {
-            this.showAlert('删除失败：' + e.message, 'error');
+            this.setConversationMode("knowledge");
+            this.clearMessages();
+            this.syncUrl();
+        } catch (error) {
+            this.showAlert(`删除失败：${error.message}`, "error");
         }
     }
 
-    // ================= 会话 =================
-
     async loadSessions() {
-        const q = this.currentKb ? `?kb_id=${encodeURIComponent(this.currentKb.id)}` : '';
-        try {
-            const data = await this.api(`/sessions${q}`);
-            this.sessions = data.sessions || [];
-            this.renderSessions();
-        } catch (e) {
+        if (!this.currentKb) {
             this.sessions = [];
             this.renderSessions();
+            return;
         }
+        try {
+            const data = await this.api(`/sessions?kb_id=${encodeURIComponent(this.currentKb.id)}`);
+            this.sessions = data.sessions || [];
+            if (this.currentSession) {
+                this.currentSession = this.sessions.find((item) => item.id === this.currentSession.id) || this.currentSession;
+            }
+        } catch {
+            this.sessions = [];
+        }
+        this.renderSessions();
     }
 
     renderSessions() {
-        const list = this.el['session-list'];
+        const list = this.el["session-list"];
+        this.syncExportButton();
         if (!list) return;
         if (!this.sessions.length) {
-            list.innerHTML = '<li class="list-empty">暂无会话，点 ＋ 开始</li>';
+            list.innerHTML = '<li class="list-empty">还没有对话</li>';
             return;
         }
-        list.innerHTML = this.sessions.map((s) => `
-            <li class="list-item ${this.currentSession && s.id === this.currentSession.id ? 'active' : ''}"
-                data-session="${s.id}">
-                <span class="item-main" title="${this.esc(s.preview || s.title)}">
-                    💬 ${this.esc(s.title || '新会话')}
-                </span>
-                <button class="item-ren" data-ren="${s.id}" title="重命名" type="button">✎</button>
-                <button class="item-del" data-del-session="${s.id}" title="删除会话" type="button">×</button>
+        list.innerHTML = this.sessions.map((session) => `
+            <li class="list-item ${this.currentSession?.id === session.id ? "active" : ""}" data-session-row="${this.esc(session.id)}">
+                <button class="item-select" type="button" data-session="${this.esc(session.id)}"
+                        title="${this.esc(session.preview || session.title)}"
+                        aria-label="${this.esc(session.title || "新对话")}"
+                        ${this.currentSession?.id === session.id ? 'aria-current="true"' : ""}>
+                    <span class="item-main">${this.esc(session.title || "新对话")}</span>
+                </button>
+                <button class="item-ren" data-ren="${this.esc(session.id)}" aria-label="重命名" type="button">✎</button>
+                <button class="item-del" data-del-session="${this.esc(session.id)}" aria-label="删除" type="button">×</button>
             </li>
-        `).join('');
+        `).join("");
 
-        list.querySelectorAll('[data-session]').forEach((li) => {
-            li.addEventListener('click', (e) => {
-                if (e.target.dataset.ren || e.target.dataset.delSession) return;
-                this.openSession(li.dataset.session);
-            });
+        list.querySelectorAll("[data-session]").forEach((button) => {
+            button.addEventListener("click", () => this.openSession(button.dataset.session));
         });
-        list.querySelectorAll('[data-ren]').forEach((btn) => {
-            btn.addEventListener('click', () => this.renameSession(btn.dataset.ren));
+        list.querySelectorAll("[data-ren]").forEach((button) => {
+            button.addEventListener("click", () => this.renameSession(button.dataset.ren));
         });
-        list.querySelectorAll('[data-del-session]').forEach((btn) => {
-            btn.addEventListener('click', () => this.deleteSession(btn.dataset.delSession));
+        list.querySelectorAll("[data-del-session]").forEach((button) => {
+            button.addEventListener("click", () => this.deleteSession(button.dataset.delSession));
         });
     }
 
     async newSession() {
+        if (!this.currentKb) {
+            this.showAlert("请先选择知识库", "error");
+            return null;
+        }
         try {
-            const s = await this.api('/sessions', {
-                method: 'POST',
-                body: { kb_id: this.currentKb ? this.currentKb.id : null },
+            const session = await this.api("/sessions", {
+                method: "POST",
+                body: { kb_id: this.currentKb.id },
             });
-            this.currentSession = s;
+            this.currentSession = session;
             this.clearMessages();
             await this.loadSessions();
-            this.el['chat-input'].focus();
-        } catch (e) {
-            this.showAlert('新建会话失败：' + e.message, 'error');
+            this.syncUrl();
+            this.setSidebarOpen(false);
+            this.el["chat-input"].focus();
+            return session;
+        } catch (error) {
+            this.showAlert(`新建对话失败：${error.message}`, "error");
+            return null;
         }
     }
 
-    async openSession(sessionId) {
-        this.currentSession = this.sessions.find((s) => s.id === sessionId) || null;
+    async openSession(sessionId, { syncUrl = true } = {}) {
+        this.currentSession = this.sessions.find((item) => item.id === sessionId) || null;
+        if (!this.currentSession) return;
         this.renderSessions();
         this.clearMessages();
+        if (syncUrl) this.syncUrl();
+        this.setSidebarOpen(false);
         try {
             const data = await this.api(`/sessions/${sessionId}/messages`);
-            (data.messages || []).forEach((m) => {
-                this.appendMessage(m.role, m.content);
-                if (m.role === 'assistant' && m.sources && m.sources.length) {
-                    this.showSources(m.sources);
+            let queryForAnswer = "";
+            (data.messages || []).forEach((message) => {
+                if (message.role === "user") queryForAnswer = message.content;
+                const node = this.appendMessage(message.role, message.content);
+                if (message.role === "user") this.addUserActions(node, message.content);
+                if (message.role === "assistant") {
+                    const sources = message.sources || [];
+                    this.addMessageActions(node, queryForAnswer, sources);
+                    if (sources.length) this.showSources(sources);
                 }
             });
-        } catch (e) {
-            this.showAlert('加载历史失败：' + e.message, 'error');
+            this.scrollBottom();
+        } catch (error) {
+            this.showAlert(`加载历史失败：${error.message}`, "error");
         }
+    }
+
+    syncExportButton() {
+        const button = this.el["export-btn"];
+        if (button) button.disabled = !this.currentSession?.id;
+    }
+
+    exportSession() {
+        if (!this.currentSession?.id) return;
+        const link = document.createElement("a");
+        link.href = `/api/v1/sessions/${encodeURIComponent(this.currentSession.id)}/export.md`;
+        link.rel = "noopener";
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
     }
 
     async renameSession(sessionId) {
-        const s = this.sessions.find((x) => x.id === sessionId);
-        const title = prompt('重命名会话：', s ? s.title : '');
-        if (!title || !title.trim()) return;
+        const session = this.sessions.find((item) => item.id === sessionId);
+        const title = prompt("对话名称", session?.title || "");
+        if (!title?.trim()) return;
         try {
-            await this.api(`/sessions/${sessionId}`, { method: 'PATCH', body: { title: title.trim() } });
+            await this.api(`/sessions/${sessionId}`, { method: "PATCH", body: { title: title.trim() } });
             await this.loadSessions();
-        } catch (e) {
-            this.showAlert('重命名失败：' + e.message, 'error');
+        } catch (error) {
+            this.showAlert(`重命名失败：${error.message}`, "error");
         }
     }
 
     async deleteSession(sessionId) {
-        if (!confirm('删除该会话及其消息？')) return;
+        if (!confirm("删除这段对话？")) return;
         try {
-            await this.api(`/sessions/${sessionId}`, { method: 'DELETE' });
-            if (this.currentSession && this.currentSession.id === sessionId) {
+            await this.api(`/sessions/${sessionId}`, { method: "DELETE" });
+            if (this.currentSession?.id === sessionId) {
                 this.currentSession = null;
                 this.clearMessages();
             }
             await this.loadSessions();
-        } catch (e) {
-            this.showAlert('删除失败：' + e.message, 'error');
+            this.syncUrl();
+        } catch (error) {
+            this.showAlert(`删除失败：${error.message}`, "error");
         }
     }
-
-    // ================= WebSocket 问答 =================
 
     connectWebSocket() {
-        const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        const url = `${proto}//${window.location.host}/ws/chat`;
-
+        if (this.ws && [WebSocket.OPEN, WebSocket.CONNECTING].includes(this.ws.readyState)) return;
+        clearTimeout(this.reconnectTimer);
+        const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
         try {
-            this.ws = new WebSocket(url);
-        } catch (e) {
-            this.updateStatus('连接失败', false);
+            this.ws = new WebSocket(`${protocol}//${window.location.host}/ws/chat`);
+        } catch {
+            this.updateStatus("连接失败", false);
+            this.scheduleReconnect();
             return;
         }
-
         this.ws.onopen = () => {
             this.connected = true;
-            this.updateStatus('已就绪', true);
+            this.updateStatus("已连接", true);
         };
-        this.ws.onmessage = (ev) => {
-            try { this.handleEvent(JSON.parse(ev.data)); } catch (e) { console.error(e); }
+        this.ws.onmessage = (event) => {
+            try {
+                this.handleEvent(JSON.parse(event.data)).catch((error) => console.error(error));
+            } catch (error) {
+                console.error(error);
+            }
         };
-        this.ws.onclose = (ev) => {
+        this.ws.onclose = () => {
             this.connected = false;
-            this.updateStatus('已断开，重连中…', false);
-            setTimeout(() => this.connectWebSocket(), 3000);
+            this.updateStatus("连接中断", false);
+            if (this.isStreaming) {
+                this.isStreaming = false;
+                this.activeRequestId = null;
+                this.hideTypingIndicator();
+                this.finalizeAssistant();
+                this.setInputBusy(false);
+            }
+            this.scheduleReconnect();
         };
-        this.ws.onerror = () => this.updateStatus('连接错误', false);
+        this.ws.onerror = () => this.updateStatus("连接错误", false);
     }
 
-    updateStatus(text, ok) {
-        const el = this.el.status;
-        if (!el) return;
-        el.textContent = text;
-        el.className = ok ? 'status connected' : 'status disconnected';
+    async ensureAgentWebSocket() {
+        if (this.agentWs?.readyState === WebSocket.OPEN) return this.agentWs;
+        const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+        const socket = new WebSocket(`${protocol}//${window.location.host}/api/v1/ws/agent`);
+        this.agentWs = socket;
+        socket.onmessage = (event) => {
+            try {
+                this.handleEvent(JSON.parse(event.data)).catch((error) => console.error(error));
+            } catch (error) {
+                console.error(error);
+            }
+        };
+        socket.onclose = () => {
+            if (this.agentMode && this.isStreaming) {
+                this.isStreaming = false;
+                this.activeRequestId = null;
+                this.activeSocket = null;
+                this.hideTypingIndicator();
+                this.finalizeAssistant();
+                this.setInputBusy(false);
+                this.persistAgentTurn().catch(() => {});
+            }
+        };
+        await new Promise((resolve, reject) => {
+            const timer = setTimeout(() => reject(new Error("Agent 连接超时")), 5000);
+            socket.onopen = () => {
+                clearTimeout(timer);
+                resolve();
+            };
+            socket.onerror = () => {
+                clearTimeout(timer);
+                reject(new Error("Agent 连接失败"));
+            };
+        });
+        return socket;
     }
 
-    sendMessage() {
-        const input = this.el['chat-input'];
-        const query = input.value.trim();
+    scheduleReconnect() {
+        clearTimeout(this.reconnectTimer);
+        this.reconnectTimer = setTimeout(() => this.connectWebSocket(), 3000);
+    }
+
+    updateStatus(text, connected) {
+        if (!this.el.status) return;
+        this.el.status.textContent = text;
+        this.el.status.className = `status ${connected ? "connected" : "disconnected"}`;
+    }
+
+    async sendMessage(queryOverride = null) {
+        if (this.isStreaming) return;
+        const input = this.el["chat-input"];
+        const query = String(queryOverride ?? input.value).trim();
         if (!query) return;
-        if (!this.connected) {
-            this.showAlert('连接尚未就绪，请稍候…', 'error');
+        if (!this.currentKb) {
+            this.showAlert("请先选择知识库", "error");
             return;
         }
-        if (!this.currentSession) {
-            // 没选会话就自动开一个，保证问答能被记录
-            this.newSession().then(() => this.sendMessage());
-            input.value = query;  // newSession 会清空输入，这里还原
+        if (this.agentMode && !this.activeAgent) {
+            this.openAgents();
             return;
+        }
+        if (!this.agentMode && !this.connected) {
+            this.showAlert("连接尚未就绪", "error");
+            return;
+        }
+        if (!this.currentSession && !(await this.newSession())) return;
+
+        let socket = this.ws;
+        if (this.agentMode) {
+            try {
+                socket = await this.ensureAgentWebSocket();
+            } catch (error) {
+                this.showAlert(error.message, "error");
+                return;
+            }
         }
 
-        this.appendMessage('user', query);
-        input.value = '';
-        input.disabled = true;
-        this.el['send-btn'].disabled = true;
+        const userMessage = this.appendMessage("user", query);
+        this.addUserActions(userMessage, query);
+        input.value = "";
+        this.resizeComposer();
+        this.isStreaming = true;
+        this.activeRequestId = window.crypto?.randomUUID?.()
+            || `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+        this.activeSocket = socket;
+        this.lastUserQuery = query;
         this.currentSources = [];
+        this.pendingAgentPersist = this.agentMode ? { query } : null;
+        this.setInputBusy(true);
         this.showTypingIndicator();
-
-        this.ws.send(JSON.stringify({
+        socket.send(JSON.stringify({
             query,
             top_k: this.topK,
             session_id: this.currentSession.id,
-            kb_id: this.currentKb ? this.currentKb.id : null,
+            kb_id: this.currentKb.id,
             direct: this.directMode,
+            agent_id: this.agentMode ? this.activeAgent.id : null,
+            request_id: this.activeRequestId,
         }));
     }
 
-    handleEvent(evt) {
-        const { event, data } = evt;
-        if (event === 'hits') {
+    async handleEvent(payload) {
+        const { event, data } = payload;
+        if (payload.request_id && payload.request_id !== this.activeRequestId) return;
+        if (event === "hits") {
             this.currentSources = data || [];
-        } else if (event === 'token') {
+        } else if (event === "token") {
             this.hideTypingIndicator();
-            this.appendToken(String(data ?? ''));
-        } else if (event === 'done') {
+            this.appendToken(String(data ?? ""));
+        } else if (event === "done") {
             this.hideTypingIndicator();
+            this.isStreaming = false;
+            this.activeRequestId = null;
             this.finalizeAssistant();
             this.showSources(this.currentSources);
-            this.enableInput();
-            this.loadSessions();   // 会话标题/预览可能已更新
-            if (this.currentKb) { this.loadKnowledgeBases(); }
-        } else if (event === 'error') {
+            await this.persistAgentTurn();
+            this.setInputBusy(false);
+            this.loadSessions();
+            this.loadKnowledgeBases();
+        } else if (event === "error") {
             this.hideTypingIndicator();
+            this.isStreaming = false;
+            this.activeRequestId = null;
             this.finalizeAssistant();
-            this.showAlert('错误：' + data, 'error');
-            this.enableInput();
+            this.setInputBusy(false);
+            await this.persistAgentTurn();
+            this.showAlert(`回答失败：${data}`, "error");
+        } else if (event === "cancelled") {
+            this.finishStoppedStream();
+        } else if (event === "metadata" && Array.isArray(data?.sources)) {
+            this.currentSources = data.sources;
+        } else if (event === "action" && data?.tool) {
+            const indicator = document.querySelector("#typing-indicator .typing-indicator");
+            if (indicator) indicator.setAttribute("aria-label", `正在使用 ${data.tool}`);
         }
     }
 
-    // ================= 消息渲染 =================
+    setInputBusy(busy) {
+        this.el["chat-input"].disabled = busy;
+        this.el["send-btn"].hidden = busy;
+        this.el["stop-btn"].hidden = !busy;
+        this.el["send-btn"].disabled = false;
+        if (!busy) this.el["chat-input"].focus();
+    }
+
+    stopStreaming() {
+        if (!this.isStreaming) return;
+        const requestId = this.activeRequestId;
+        const socket = this.activeSocket || (this.agentMode ? this.agentWs : this.ws);
+        if (requestId && socket?.readyState === WebSocket.OPEN) {
+            socket.send(JSON.stringify({ event: "cancel", request_id: requestId }));
+        }
+        this.activeRequestId = null;
+        this.activeSocket = null;
+        this.finishStoppedStream();
+    }
+
+    finishStoppedStream() {
+        if (!this.isStreaming && this.activeRequestId == null) return;
+        this.hideTypingIndicator();
+        this.isStreaming = false;
+        this.activeRequestId = null;
+        this.finalizeAssistant();
+        if (this.currentSources.length) this.showSources(this.currentSources);
+        this.setInputBusy(false);
+        this.persistAgentTurn().catch(() => {});
+    }
+
+    async persistAgentTurn() {
+        const pending = this.pendingAgentPersist;
+        this.pendingAgentPersist = null;
+        if (!pending || !this.currentSession?.id) return;
+        try {
+            await this.api(`/sessions/${this.currentSession.id}/messages`, {
+                method: "POST",
+                body: { role: "user", content: pending.query },
+            });
+            const assistant = Array.from(this.el.messages.querySelectorAll(".message.assistant .message-content")).pop();
+            const answer = assistant?.textContent?.trim() || "";
+            if (answer) {
+                await this.api(`/sessions/${this.currentSession.id}/messages`, {
+                    method: "POST",
+                    body: { role: "assistant", content: answer, sources: [] },
+                });
+            }
+        } catch (error) {
+            console.error("Agent 消息保存失败", error);
+        }
+    }
+
+    resizeComposer() {
+        const input = this.el["chat-input"];
+        if (!input) return;
+        input.style.height = "auto";
+        input.style.height = `${Math.min(input.scrollHeight, 180)}px`;
+    }
 
     clearMessages() {
-        this.el['messages'].innerHTML = `
-            <div class="empty-state">
-                <div class="icon">💬</div>
-                <p>向当前知识库提问</p>
-                <p class="muted small">在左侧切换知识库与会话；先上传文档或导入网页</p>
+        this.el.messages.innerHTML = `
+            <div class="empty-state" id="welcome-state">
+                <h2>开始提问</h2>
+                <div class="empty-actions">
+                    <button type="button" data-upload>${this.icon("upload")}添加文档</button>
+                    <button type="button" data-import-url>${this.icon("link")}导入网页</button>
+                    <button type="button" data-search>${this.icon("search")}搜索资料</button>
+                </div>
             </div>`;
+        this.el.messages.querySelectorAll("[data-upload]").forEach((button) => {
+            button.addEventListener("click", () => this.el["file-input"].click());
+        });
+        this.el.messages.querySelectorAll("[data-import-url]").forEach((button) => {
+            button.addEventListener("click", () => this.openImport());
+        });
+        this.el.messages.querySelectorAll("[data-search]").forEach((button) => {
+            button.addEventListener("click", () => this.openSearch());
+        });
         this.currentSources = [];
     }
 
     appendMessage(role, content) {
-        const wrap = document.createElement('div');
+        this.el.messages.querySelector(".empty-state")?.remove();
+        const wrap = document.createElement("div");
         wrap.className = `message ${role}`;
-        const body = document.createElement('div');
-        body.className = 'message-content';
-        body.textContent = content;
+        const body = document.createElement("div");
+        body.className = "message-content";
+        if (role === "assistant") this.setRichText(body, content);
+        else body.textContent = content;
         wrap.appendChild(body);
-        this.el['messages'].appendChild(wrap);
+        this.el.messages.appendChild(wrap);
         this.scrollBottom();
+        return wrap;
     }
 
     appendToken(token) {
-        let last = this.el['messages'].querySelector('.message.assistant.streaming');
-        if (!last) {
-            last = document.createElement('div');
-            last.className = 'message assistant streaming';
-            const body = document.createElement('div');
-            body.className = 'message-content';
-            last.appendChild(body);
-            this.el['messages'].appendChild(last);
+        let message = this.el.messages.querySelector(".message.assistant.streaming");
+        if (!message) {
+            message = document.createElement("div");
+            message.className = "message assistant streaming";
+            const body = document.createElement("div");
+            body.className = "message-content";
+            message.appendChild(body);
+            this.el.messages.appendChild(message);
         }
-        last.querySelector('.message-content').textContent += token;
+        message.querySelector(".message-content").textContent += token;
         this.scrollBottom();
     }
 
     finalizeAssistant() {
-        // 回答结束/出错时移除 streaming 标记，避免下一次回答 token 继续追加到上一条回答里
-        this.el['messages'].querySelectorAll('.message.assistant.streaming').forEach((el) => {
-            el.classList.remove('streaming');
+        this.el.messages.querySelectorAll(".message.assistant.streaming").forEach((message) => {
+            message.classList.remove("streaming");
+            const body = message.querySelector(".message-content");
+            this.setRichText(body, body.textContent);
+            this.addMessageActions(message, this.lastUserQuery, this.currentSources);
         });
-    }
-
-    showSources(sources) {
-        if (!sources || !sources.length) return;
-        const box = document.createElement('details');
-        box.className = 'message sources';
-        const title = document.createElement('summary');
-        title.textContent = `📎 引用来源（${sources.length} 条）`;
-        box.appendChild(title);
-
-        const ul = document.createElement('ul');
-        sources.forEach((s, i) => {
-            const li = document.createElement('li');
-            // 分数来源不同、量纲也不同：dense 是余弦相似度，rerank 是交叉编码器
-            // 相关度，keyword 是 BM25 命中强度。混在一起叫「相似度」会误导。
-            const has = typeof s.score === 'number';
-            const label = s.score_kind === 'keyword' ? '关键词'
-                : s.score_kind === 'rerank' ? '相关度' : '相似度';
-            const head = has ? `${label} ${s.score.toFixed(3)}` : label;
-            li.innerHTML = `<strong>[${i + 1}]</strong> ${this.esc(s.title || s.source || '未知')}
-                <span class="score">${head}</span>`;
-            li.addEventListener('click', () => this.showChunkDetail(s));
-            ul.appendChild(li);
-        });
-        box.appendChild(ul);
-        this.el['messages'].appendChild(box);
-        this.scrollBottom();
-    }
-
-    showChunkDetail(src) {
-        this.openModal('分块详情', src.content || src.snippet || '无内容', true);
     }
 
     showTypingIndicator() {
         this.hideTypingIndicator();
-        const el = document.createElement('div');
-        el.className = 'message assistant';
-        el.id = 'typing-indicator';
-        el.innerHTML = '<div class="typing-indicator"><span></span><span></span><span></span></div>';
-        this.el['messages'].appendChild(el);
+        const message = document.createElement("div");
+        message.className = "message assistant";
+        message.id = "typing-indicator";
+        message.innerHTML = '<div class="typing-indicator" aria-label="正在回答"><span></span><span></span><span></span></div>';
+        this.el.messages.appendChild(message);
         this.scrollBottom();
     }
 
     hideTypingIndicator() {
-        document.getElementById('typing-indicator')?.remove();
+        document.getElementById("typing-indicator")?.remove();
     }
 
-    enableInput() {
-        this.el['chat-input'].disabled = false;
-        this.el['send-btn'].disabled = false;
-        this.el['chat-input'].focus();
+    showSources(sources) {
+        if (!sources?.length) return;
+        const box = document.createElement("details");
+        box.className = "message sources";
+        const summary = document.createElement("summary");
+        summary.textContent = `来源 ${sources.length}`;
+        box.appendChild(summary);
+        const list = document.createElement("ul");
+        sources.forEach((source, index) => {
+            const item = document.createElement("li");
+            const button = document.createElement("button");
+            button.type = "button";
+            button.className = "source-link";
+            const score = typeof source.score === "number" ? this.scoreLabel(source) : "";
+            button.innerHTML = `<strong>${this.esc(source.index || index + 1)}</strong><span>${this.esc(source.title || source.source || "资料")}</span><span class="score">${this.esc(score)}</span>`;
+            button.addEventListener("click", () => this.showChunkDetail(source));
+            item.appendChild(button);
+            list.appendChild(item);
+        });
+        box.appendChild(list);
+        this.el.messages.appendChild(box);
+        this.scrollBottom();
+    }
+
+    scoreLabel(source) {
+        const label = source.score_kind === "keyword" ? "词面" : source.score_kind === "rerank" ? "相关" : "相近";
+        return `${label} ${source.score.toFixed(2)}`;
+    }
+
+    async showChunkDetail(source) {
+        const panel = this.el["citation-panel"];
+        if (!panel) return;
+        const sequence = ++this.citationSequence;
+        const metadata = source.metadata || {};
+        const sourcePath = source.source || source.filepath || metadata.source || metadata.filepath || "";
+        const title = source.title || metadata.title || sourcePath || "引用";
+        this.el["citation-title"].textContent = title;
+        this.el["citation-source"].textContent = sourcePath;
+        this.el["citation-source"].title = sourcePath;
+        this.el["citation-content"].innerHTML = `<div class="citation-loading">${this.esc(source.snippet || source.text || "")}</div>`;
+        panel.hidden = false;
+
+        if (!sourcePath) {
+            this.renderCitationFallback(source);
+            return;
+        }
+        const params = new URLSearchParams({ limit: "200" });
+        if (this.currentKb?.id) params.set("kb_id", this.currentKb.id);
+        try {
+            const data = await this.api(`/documents/${encodeURIComponent(sourcePath)}/chunks?${params}`);
+            if (sequence !== this.citationSequence) return;
+            this.renderCitationChunks(data.chunks || [], source);
+        } catch (error) {
+            if (sequence !== this.citationSequence) return;
+            this.renderCitationFallback(source, error.message);
+        }
+    }
+
+    renderCitationChunks(chunks, source) {
+        const box = this.el["citation-content"];
+        if (!chunks.length) {
+            this.renderCitationFallback(source);
+            return;
+        }
+        const metadata = source.metadata || {};
+        const citedId = source.chunk_id || metadata.chunk_id || source.id || "";
+        const citedIndex = source.chunk_index ?? metadata.chunk_index;
+        const citedText = source.snippet || source.text || source.content || "";
+        const sorted = chunks.slice().sort((a, b) => Number(a.metadata?.chunk_index || 0) - Number(b.metadata?.chunk_index || 0));
+        let selected = citedId ? sorted.findIndex((chunk) => chunk.id === citedId) : -1;
+        if (selected < 0 && citedIndex != null) {
+            selected = sorted.findIndex((chunk) => Number(chunk.metadata?.chunk_index) === Number(citedIndex));
+        }
+        if (selected < 0 && citedText) {
+            selected = sorted.findIndex((chunk) => chunk.text === citedText || String(chunk.text || "").startsWith(citedText));
+        }
+        box.innerHTML = sorted.map((chunk, index) => {
+            const section = chunk.metadata?.chunk_prefix || chunk.metadata?.breadcrumb || (index === selected ? "引用原文" : "");
+            return `<article class="citation-chunk ${index === selected ? "active" : ""}" data-citation-chunk="${this.esc(chunk.id)}"
+                    ${index === selected ? 'aria-current="true"' : ""}>
+                <div class="citation-chunk-head">
+                    <span>${this.esc(section || `第 ${index + 1} 段`)}</span>
+                    <span>${index + 1}/${sorted.length}</span>
+                </div>
+                <div class="citation-chunk-text">${this.esc(chunk.text || "")}</div>
+            </article>`;
+        }).join("");
+        const active = box.querySelector(".citation-chunk.active");
+        requestAnimationFrame(() => active?.scrollIntoView({ block: "center" }));
+    }
+
+    renderCitationFallback(source, error = "") {
+        const text = source.snippet || source.content || source.text || "";
+        this.el["citation-content"].innerHTML = text
+            ? `<article class="citation-chunk active"><div class="citation-chunk-text">${this.esc(text)}</div></article>`
+            : `<div class="citation-empty">${this.esc(error || "原文不可用")}</div>`;
+    }
+
+    closeCitation() {
+        const panel = this.el["citation-panel"];
+        if (!panel) return;
+        this.citationSequence += 1;
+        panel.hidden = true;
+    }
+
+    addUserActions(message, query) {
+        if (!message || message.querySelector(".message-actions")) return;
+        const actions = document.createElement("div");
+        actions.className = "message-actions";
+        const edit = this.actionButton("edit", "编辑并重发");
+        edit.addEventListener("click", () => this.editQuery(query));
+        const regenerate = this.actionButton("refresh", "重新生成");
+        regenerate.addEventListener("click", () => this.regenerate(query));
+        actions.append(edit, regenerate);
+        message.appendChild(actions);
+    }
+
+    editQuery(query) {
+        if (this.isStreaming) this.stopStreaming();
+        const input = this.el["chat-input"];
+        input.value = query;
+        this.resizeComposer();
+        input.focus();
+        input.setSelectionRange(input.value.length, input.value.length);
+    }
+
+    async regenerate(query) {
+        if (this.isStreaming) this.stopStreaming();
+        const input = this.el["chat-input"];
+        input.value = query;
+        this.resizeComposer();
+        await this.sendMessage();
+    }
+
+    addMessageActions(message, query, sources = []) {
+        if (!message || message.querySelector(".message-actions")) return;
+        const actions = document.createElement("div");
+        actions.className = "message-actions";
+        const answer = message.querySelector(".message-content")?.textContent || "";
+
+        const copy = this.actionButton("copy", "复制");
+        copy.addEventListener("click", async () => {
+            try {
+                await navigator.clipboard.writeText(answer);
+                copy.setAttribute("aria-label", "已复制");
+                setTimeout(() => copy.setAttribute("aria-label", "复制"), 1200);
+            } catch {
+                this.showAlert("复制失败", "error");
+            }
+        });
+
+        const helpful = this.actionButton("up", "有帮助");
+        const notHelpful = this.actionButton("down", "没帮助");
+        helpful.addEventListener("click", () => this.submitFeedback(helpful, notHelpful, "helpful", query, answer, sources));
+        notHelpful.addEventListener("click", () => this.submitFeedback(notHelpful, helpful, "not_helpful", query, answer, sources));
+
+        const regenerate = this.actionButton("refresh", "重新生成");
+        regenerate.addEventListener("click", () => this.regenerate(query));
+
+        actions.append(copy, helpful, notHelpful, regenerate);
+        message.appendChild(actions);
+    }
+
+    actionButton(icon, label) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.setAttribute("aria-label", label);
+        button.title = label;
+        button.innerHTML = this.icon(icon);
+        return button;
+    }
+
+    async submitFeedback(selected, other, rating, query, answer, sources) {
+        if (!query) return;
+        try {
+            await this.api("/feedback", {
+                method: "POST",
+                body: {
+                    query,
+                    answer,
+                    sources_json: JSON.stringify(sources || []),
+                    rating,
+                    correction: "",
+                    question_type: "",
+                },
+            });
+            selected.setAttribute("aria-pressed", "true");
+            other.setAttribute("aria-pressed", "false");
+            this.showAlert("已记录");
+        } catch (error) {
+            this.showAlert(`反馈失败：${error.message}`, "error");
+        }
     }
 
     scrollBottom() {
-        this.el['messages'].scrollTop = this.el['messages'].scrollHeight;
+        this.el.messages.scrollTop = this.el.messages.scrollHeight;
     }
 
-    // ================= 入库 =================
+    openSearch() {
+        this.openModalElement(this.el["search-modal"]);
+        this.el["search-input"].value = "";
+        this.el["search-results"].innerHTML = "";
+        requestAnimationFrame(() => this.el["search-input"].focus());
+    }
 
-    async uploadFiles(files) {
-        if (!files || !files.length) return;
-        if (!this.currentKb) { this.showAlert('请先选择知识库', 'error'); return; }
-
-        const fd = new FormData();
-        for (const f of files) fd.append('file', f);
-        fd.append('kb_id', this.currentKb.id);   // 上传到当前知识库
-
-        const btn = document.getElementById('upload-btn');
-        const old = btn.textContent;
-        btn.disabled = true;
-        btn.textContent = '上传中…';
-        try {
-            const r = await this.api('/ingest', { method: 'POST', body: fd, raw: true });
-            this.showAlert(`已入库：${r.docs} 篇 / ${r.chunks} 个分块`, 'success');
-            await this.loadKnowledgeBases();
-        } catch (e) {
-            this.showAlert('入库失败：' + e.message, 'error');
-        } finally {
-            btn.disabled = false;
-            btn.textContent = old;
-            this.el['file-input'].value = '';
+    scheduleSearch() {
+        clearTimeout(this.searchTimer);
+        const query = this.el["search-input"].value.trim();
+        if (query.length < 2) {
+            this.searchHits = [];
+            this.el["search-results"].innerHTML = "";
+            return;
         }
+        this.searchTimer = setTimeout(() => this.runSearch(query), 180);
     }
 
-    promptImportUrl() {
-        const url = prompt('导入网页，输入 URL：\n（抓取正文并入库到当前知识库）');
-        if (!url || !url.trim()) return;
-        this.importUrl(url.trim());
-    }
-
-    async importUrl(url) {
-        if (!this.currentKb) { this.showAlert('请先选择知识库', 'error'); return; }
-        const btn = document.getElementById('url-btn');
-        const old = btn.textContent;
-        btn.disabled = true;
-        btn.textContent = '抓取中…';
+    async runSearch(query) {
+        const sequence = ++this.searchSequence;
+        this.el["search-results"].innerHTML = '<div class="command-empty">搜索中</div>';
         try {
-            const r = await this.api('/ingest/url', {
-                method: 'POST',
-                body: { url, kb_id: this.currentKb.id },
+            const data = await this.api("/search", {
+                method: "POST",
+                body: {
+                    query,
+                    top_k: Math.min(this.topK, 8),
+                    kb_id: this.currentKb?.id || null,
+                },
             });
-            this.showAlert(`已导入：${r.title}（${r.chars} 字 / ${r.chunks} 分块）`, 'success');
-            await this.loadKnowledgeBases();
-        } catch (e) {
-            this.showAlert('导入失败：' + e.message, 'error');
-        } finally {
-            btn.disabled = false;
-            btn.textContent = old;
+            if (sequence !== this.searchSequence) return;
+            this.searchHits = data.hits || [];
+            this.renderSearchResults();
+        } catch (error) {
+            if (sequence !== this.searchSequence) return;
+            this.el["search-results"].innerHTML = `<div class="command-empty">${this.esc(error.message)}</div>`;
         }
     }
 
-    // ================= 模型设置 =================
-
-    async openSettings() {
-        this.setSettingsResult('', '');
-        try {
-            const s = await this.api('/settings/model');
-            this.fillSettings(s);
-            this.el['settings-modal'].classList.add('active');
-        } catch (e) {
-            this.showAlert('读取模型设置失败：' + e.message, 'error');
+    renderSearchResults() {
+        const box = this.el["search-results"];
+        if (!this.searchHits.length) {
+            box.innerHTML = '<div class="command-empty">无结果</div>';
+            return;
         }
-    }
-
-    /** 用后端返回的配置填充表单 */
-    fillSettings(s) {
-        ['llm', 'emb'].forEach((k) => {
-            const src = (k === 'llm' ? s.llm : s.embedding) || {};
-            const backend = src.backend || (k === 'llm' ? 'extractive' : 'onnx');
-            const select = document.getElementById(`${k}-backend`);
-            if (select) select.value = backend;
-
-            const sec = src[backend] || {};
-            const set = (id, val) => { const el = document.getElementById(id); if (el) el.value = val || ''; };
-            set(`${k}-base-url`, sec.base_url);
-            set(`${k}-model`, sec.model);
-            set(`${k}-api-key`, '');
-            const keyEl = document.getElementById(`${k}-api-key`);
-            if (keyEl) {
-                keyEl.placeholder = sec.api_key
-                    ? `已保存（${sec.api_key}），留空表示不修改`
-                    : '本地服务可留空';
-            }
-            this.syncRemoteFields(k);
+        box.innerHTML = this.searchHits.map((hit, index) => `
+            <button class="command-result" type="button" data-hit="${index}">
+                <span class="command-result-head">
+                    <span>${this.esc(hit.metadata?.title || hit.metadata?.source || "资料")}</span>
+                    <span>${this.esc(hit.metadata?.breadcrumb || hit.metadata?.source || "")}</span>
+                </span>
+                <p>${this.esc(hit.text || "")}</p>
+            </button>
+        `).join("");
+        box.querySelectorAll("[data-hit]").forEach((button) => {
+            button.addEventListener("click", () => {
+                const hit = this.searchHits[Number(button.dataset.hit)];
+                this.closeAllModals();
+                if (hit) this.showChunkDetail({ ...hit, title: hit.metadata?.title || hit.metadata?.source });
+            });
         });
     }
 
-    /** 显示/隐藏远程字段，并给常见默认值降低填写成本 */
-    syncRemoteFields(k) {
-        const backend = document.getElementById(`${k}-backend`)?.value || (k === 'llm' ? 'extractive' : 'onnx');
-        const box = document.getElementById(`${k}-remote`);
-        if (box) box.hidden = !['ollama', 'openai'].includes(backend);
-
-        const baseEl = document.getElementById(`${k}-base-url`);
-        const modelEl = document.getElementById(`${k}-model`);
-        if (backend === 'ollama') {
-            if (baseEl && !baseEl.value) baseEl.value = 'http://localhost:11434/v1';
-            if (modelEl && !modelEl.value) modelEl.placeholder = k === 'llm' ? 'qwen3:4b-instruct-2507-q4_K_M' : 'nomic-embed-text';
-        } else if (backend === 'openai') {
-            if (baseEl && (!baseEl.value || baseEl.value.includes('localhost'))) {
-                baseEl.value = 'https://api.deepseek.com/v1';
-            }
-            if (modelEl && !modelEl.value) modelEl.placeholder = k === 'llm' ? 'deepseek-chat' : 'text-embedding-3-small';
+    openImport() {
+        if (!this.currentKb) {
+            this.showAlert("请先选择知识库", "error");
+            return;
         }
+        this.openModalElement(this.el["import-modal"]);
+        this.el["import-url-input"].value = "";
+        requestAnimationFrame(() => this.el["import-url-input"].focus());
     }
 
-    /** 收集某一类（llm / emb）的表单值 */
-    collectKind(k) {
-        const backend = document.getElementById(`${k}-backend`)?.value || (k === 'llm' ? 'extractive' : 'onnx');
-        const out = { backend };
-        if (backend === 'ollama' || backend === 'openai') {
-            const sec = {
-                base_url: (document.getElementById(`${k}-base-url`)?.value || '').trim(),
-                model: (document.getElementById(`${k}-model`)?.value || '').trim(),
-            };
-            const key = (document.getElementById(`${k}-api-key`)?.value || '').trim();
-            if (key) sec.api_key = key;   // 留空 = 不修改已保存的 Key
-            out[backend] = sec;
-        }
-        return out;
-    }
-
-    async testModel(k) {
-        const cfg = this.collectKind(k);
-        const backend = cfg.backend;
-        const payload = {
-            kind: k === 'llm' ? 'llm' : 'embedding',
-            backend,
-            ...(cfg[backend] || {}),
-        };
-        this.setSettingsResult('测试中…', 'info');
+    async importUrl(url, kbId = this.currentKb?.id) {
+        if (!url || !kbId) return;
+        const button = this.el["import-url-submit"];
+        button.disabled = true;
+        const oldLabel = button.textContent;
+        button.textContent = "导入中";
         try {
-            const r = await this.api('/settings/model/test', { method: 'POST', body: payload });
-            this.setSettingsResult((r.ok ? '✅ ' : '❌ ') + r.detail, r.ok ? 'ok' : 'err');
-        } catch (e) {
-            this.setSettingsResult('❌ ' + e.message, 'err');
+            let result = await this.api("/ingest/url", {
+                method: "POST",
+                body: { url, kb_id: kbId, background: true },
+            });
+            if (result.job_id) {
+                result = await this.waitForIngestJob(result.job_id, result.title || url);
+            }
+            this.closeAllModals();
+            this.showAlert(`已导入 ${result.title || url}`);
+            await this.loadKnowledgeBases();
+        } catch (error) {
+            this.showAlert(`导入失败：${error.message}`, "error");
+        } finally {
+            button.disabled = false;
+            button.textContent = oldLabel;
+        }
+    }
+
+    async uploadFiles(files) {
+        if (!files?.length) return;
+        if (!this.currentKb) {
+            this.showAlert("请先选择知识库", "error");
+            return;
+        }
+        const controls = [this.el["upload-btn"], ...document.querySelectorAll("[data-upload]")];
+        controls.forEach((button) => { button.disabled = true; });
+        try {
+            const queued = [];
+            const failures = [];
+            for (const file of Array.from(files)) {
+                const form = new FormData();
+                form.append("file", file);
+                form.append("kb_id", this.currentKb.id);
+                form.append("background", "true");
+                try {
+                    const job = await this.api("/ingest", { method: "POST", body: form, raw: true });
+                    queued.push({ file, job });
+                } catch (error) {
+                    failures.push(`${file.name}：${error.message}`);
+                }
+            }
+
+            let docs = 0;
+            let ingested = 0;
+            let changed = 0;
+            let unchanged = 0;
+            for (let index = 0; index < queued.length; index += 1) {
+                const { file, job } = queued[index];
+                try {
+                    const result = await this.waitForIngestJob(job.job_id, file.name, index + 1, queued.length);
+                    docs += Number(result.docs || 0);
+                    ingested += Number(result.ingested ?? result.chunks ?? 0);
+                    changed += Number(result.changed || 0);
+                    unchanged += Number(result.unchanged || 0);
+                } catch (error) {
+                    failures.push(`${file.name}：${error.message}`);
+                }
+            }
+            if (failures.length) {
+                const summary = this.ingestResultText({ docs, ingested, changed, unchanged });
+                const prefix = summary ? `${summary}；` : "";
+                this.showAlert(`${prefix}${failures.length} 个文件失败：${failures[0]}`, "error");
+            } else if (docs || ingested || changed || unchanged) {
+                const summary = this.ingestResultText({ docs, ingested, changed, unchanged });
+                this.showAlert(summary);
+            }
+            await this.loadKnowledgeBases();
+            if (this.el["docs-modal"].classList.contains("active")) await this.loadDocs();
+        } catch (error) {
+            this.showAlert(`添加失败：${error.message}`, "error");
+        } finally {
+            controls.forEach((button) => { button.disabled = false; });
+            this.setIngestStatus("", 0, false);
+        }
+    }
+
+    async waitForIngestJob(jobId, label, index = 1, total = 1) {
+        if (!jobId) throw new Error("缺少入库任务");
+        const stageLabels = { queued: "排队", started: "处理", parse: "解析", chunk: "分块", upsert: "写入", invalidate: "收尾", done: "完成" };
+        while (true) {
+            const job = await this.api(`/ingest/jobs/${encodeURIComponent(jobId)}`);
+            const progress = Math.round(Number(job.progress || 0) * 100);
+            const stage = stageLabels[job.stage] || job.stage || "处理";
+            this.setIngestStatus(`${label} · ${stage}${total > 1 ? ` ${index}/${total}` : ""}`, progress, true);
+            if (job.status === "done") {
+                this.setIngestStatus(`${label} · 完成`, 100, true);
+                return job.result || {};
+            }
+            if (["failed", "interrupted"].includes(job.status)) {
+                throw new Error(job.error || "任务已中断");
+            }
+            await new Promise((resolve) => setTimeout(resolve, 700));
+        }
+    }
+
+    setIngestStatus(text, progress, visible) {
+        if (!this.el["ingest-status"]) return;
+        this.el["ingest-status"].hidden = !visible;
+        this.el["ingest-status-text"].textContent = text;
+        this.el["ingest-progress"].value = progress;
+    }
+
+    ingestResultText(result) {
+        const hasIncremental = result.changed != null || result.unchanged != null;
+        const changed = Number(result.changed || 0);
+        const unchanged = Number(result.unchanged || 0);
+        const written = Number(result.ingested ?? result.chunks ?? 0);
+        if (hasIncremental && !changed && unchanged) {
+            return "资料未变化";
+        }
+        if (hasIncremental && changed) {
+            const skipped = unchanged ? ` · ${unchanged} 个未变化` : "";
+            return `已入库 ${changed} 个来源 · ${written} 个分块${skipped}`;
+        }
+        const docs = Number(result.docs || 0);
+        return docs || written ? `${docs} 篇 · ${written} 个分块` : "";
+    }
+
+    toggleModeMenu() {
+        const open = this.el["mode-menu"].hidden;
+        this.el["mode-menu"].hidden = !open;
+        this.el["mode-btn"].setAttribute("aria-expanded", String(open));
+        if (open) this.el["mode-menu"].querySelector("button")?.focus();
+    }
+
+    closeModeMenu() {
+        if (!this.el["mode-menu"] || this.el["mode-menu"].hidden) return;
+        this.el["mode-menu"].hidden = true;
+        this.el["mode-btn"].setAttribute("aria-expanded", "false");
+    }
+
+    chooseConversationMode(mode) {
+        if (mode === "agent") {
+            if (this.activeAgent && !this.agentMode) this.setConversationMode("agent");
+            else this.openAgents();
+            return;
+        }
+        this.setConversationMode(mode);
+    }
+
+    setConversationMode(mode) {
+        this.directMode = mode === "direct";
+        this.agentMode = mode === "agent" && !!this.activeAgent;
+        this.el["mode-label"].textContent = this.agentMode
+            ? this.activeAgent.name
+            : (this.directMode ? "模型" : "知识库");
+        this.el["mode-menu"].querySelectorAll("[data-mode]").forEach((button) => {
+            button.setAttribute("aria-checked", String(button.dataset.mode === mode));
+        });
+        this.el["mode-btn"].title = this.agentMode ? `${this.activeAgent.name} · ${this.currentKb?.name || ""}` : "";
+    }
+
+    async loadAgents() {
+        try {
+            const data = await this.api("/agents");
+            this.agents = data.agents || [];
+            if (this.activeAgent) {
+                this.activeAgent = this.agents.find((agent) => agent.id === this.activeAgent.id) || null;
+            }
+            if (!this.activeAgent && this.agentMode) this.setConversationMode("knowledge");
+        } catch {
+            this.agents = [];
+        }
+    }
+
+    async openAgents() {
+        this.showAgentsList();
+        await this.loadAgents();
+        this.renderAgents();
+        this.openModalElement(this.el["agents-modal"]);
+    }
+
+    showAgentsList() {
+        this.el["agents-list-view"].hidden = false;
+        this.el["agent-form"].hidden = true;
+        this.renderAgents();
+    }
+
+    renderAgents() {
+        const box = this.el["agents-list"];
+        if (!box) return;
+        if (!this.agents.length) {
+            box.innerHTML = '<div class="command-empty">暂无 Agent</div>';
+            return;
+        }
+        box.innerHTML = this.agents.map((agent) => {
+            const kbName = this.knowledgeBases.find((kb) => kb.id === agent.kb_id)?.name || "知识库";
+            return `<div class="agent-row ${this.activeAgent?.id === agent.id ? "active" : ""}" data-agent-row="${this.esc(agent.id)}">
+                <button class="agent-select" type="button" data-agent-use="${this.esc(agent.id)}">
+                    <span class="agent-name">${this.esc(agent.name)}</span>
+                    <span class="agent-meta">${this.esc(kbName)} · ${agent.allowed_tools.length} 工具</span>
+                </button>
+                <button class="icon-button agent-edit" type="button" data-agent-edit="${this.esc(agent.id)}" aria-label="编辑 ${this.esc(agent.name)}">
+                    <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m12.5 4 3.5 3.5-8 8H4.5V12z"/><path d="m11 5.5 3.5 3.5"/></svg>
+                </button>
+            </div>`;
+        }).join("");
+        box.querySelectorAll("[data-agent-use]").forEach((button) => {
+            button.addEventListener("click", () => {
+                const agent = this.agents.find((item) => item.id === button.dataset.agentUse);
+                if (agent) this.activateAgent(agent);
+            });
+        });
+        box.querySelectorAll("[data-agent-edit]").forEach((button) => {
+            button.addEventListener("click", () => {
+                const agent = this.agents.find((item) => item.id === button.dataset.agentEdit);
+                if (agent) this.startAgentEditor(agent);
+            });
+        });
+    }
+
+    async activateAgent(agent) {
+        this.activeAgent = agent;
+        const kb = this.knowledgeBases.find((item) => item.id === agent.kb_id);
+        if (kb) this.currentKb = kb;
+        this.currentSession = null;
+        this.renderKnowledgeBases();
+        this.renderCurrentKb();
+        this.clearMessages();
+        this.syncUrl();
+        await this.loadSessions();
+        this.setConversationMode("agent");
+        this.closeAllModals();
+        this.setSidebarOpen(false);
+        this.el["chat-input"].focus();
+    }
+
+    async startAgentEditor(agent = null) {
+        this.el["agents-list-view"].hidden = true;
+        this.el["agent-form"].hidden = false;
+        this.el["agent-id"].value = agent?.id || "";
+        this.el["agent-name"].value = agent?.name || "";
+        this.el["agent-kb"].innerHTML = this.knowledgeBases.map((kb) =>
+            `<option value="${this.esc(kb.id)}">${this.esc(kb.name)}</option>`
+        ).join("");
+        this.el["agent-kb"].value = agent?.kb_id || this.currentKb?.id || this.knowledgeBases[0]?.id || "";
+        this.el["agent-instructions"].value = agent?.instructions || "";
+        this.el["agent-delete"].hidden = !agent;
+        this.el["agent-form-result"].textContent = "";
+        this.agentMaxSteps = agent?.max_steps || 5;
+        const defaults = ["search_documents", "list_documents", "get_document_chunks", "calculator", "get_current_time", "text_stats"];
+        this.agentSelectedTools = new Set(agent?.allowed_tools || defaults);
+        this.agentToolsRendered = false;
+        await this.loadAgentToolOptions();
+        requestAnimationFrame(() => this.el["agent-name"].focus());
+    }
+
+    async loadAgentToolOptions() {
+        const selected = this.el["agent-tools"].querySelectorAll("input:checked");
+        if (this.agentToolsRendered) {
+            this.agentSelectedTools = new Set(Array.from(selected).map((input) => input.value));
+        }
+        const selectedTools = this.agentSelectedTools || new Set();
+        const kbId = this.el["agent-kb"].value;
+        this.el["agent-tools"].innerHTML = '<span class="muted small">加载中</span>';
+        let builtinTools = [];
+        try {
+            const params = new URLSearchParams();
+            if (kbId) params.set("kb_id", kbId);
+            const data = await this.api(`/agent/tools?${params}`);
+            builtinTools = data.tools || [];
+        } catch (error) {
+            this.el["agent-form-result"].textContent = error.message;
+        }
+        const mcpTools = await this.loadMcpToolCatalog();
+        const tools = [...builtinTools, ...mcpTools];
+        const known = new Set(tools.map((tool) => tool.name));
+        selectedTools.forEach((name) => {
+            if (!known.has(name)) tools.push({ name, description: "当前不可用" });
+        });
+        const labels = {
+            search_documents: "搜索资料", list_documents: "资料列表",
+            get_document_chunks: "查看原文", calculator: "计算",
+            get_current_time: "时间", text_stats: "文本统计", python_eval: "代码",
+        };
+        this.el["agent-tools"].innerHTML = tools.map((tool) => `
+            <label class="agent-tool" title="${this.esc(tool.description || "")}">
+                <input type="checkbox" value="${this.esc(tool.name)}" ${selectedTools.has(tool.name) ? "checked" : ""}>
+                <span>${this.esc(labels[tool.name] || tool.name)}</span>
+            </label>`).join("");
+        this.agentSelectedTools = selectedTools;
+        this.agentToolsRendered = true;
+    }
+
+    async saveAgent() {
+        const id = this.el["agent-id"].value;
+        const name = this.el["agent-name"].value.trim();
+        const kbId = this.el["agent-kb"].value;
+        if (!name || !kbId) return;
+        const allowedTools = Array.from(this.el["agent-tools"].querySelectorAll("input:checked")).map((input) => input.value);
+        const payload = {
+            name,
+            kb_id: kbId,
+            instructions: this.el["agent-instructions"].value.trim(),
+            allowed_tools: allowedTools,
+            max_steps: this.agentMaxSteps || 5,
+        };
+        const button = this.el["agent-save"];
+        button.disabled = true;
+        this.el["agent-form-result"].textContent = "保存中";
+        try {
+            const saved = await this.api(id ? `/agents/${id}` : "/agents", {
+                method: id ? "PATCH" : "POST",
+                body: payload,
+            });
+            await this.loadAgents();
+            await this.activateAgent(saved);
+        } catch (error) {
+            this.el["agent-form-result"].textContent = error.message;
+        } finally {
+            button.disabled = false;
+        }
+    }
+
+    async deleteAgent() {
+        const id = this.el["agent-id"].value;
+        if (!id || !confirm("删除这个 Agent？")) return;
+        try {
+            await this.api(`/agents/${id}`, { method: "DELETE" });
+            if (this.activeAgent?.id === id) {
+                this.activeAgent = null;
+                this.setConversationMode("knowledge");
+            }
+            await this.loadAgents();
+            this.showAgentsList();
+        } catch (error) {
+            this.el["agent-form-result"].textContent = error.message;
+        }
+    }
+
+    async openMcpServers() {
+        this.el["mcp-form-result"].textContent = "";
+        this.openModalElement(this.el["mcp-modal"]);
+        await this.loadMcpServers();
+    }
+
+    async loadMcpServers() {
+        const box = this.el["mcp-servers-list"];
+        try {
+            const data = await this.api("/mcp/servers");
+            this.mcpServers = data.servers || [];
+        } catch (error) {
+            box.innerHTML = `<div class="command-empty">${this.esc(error.message)}</div>`;
+            return;
+        }
+        if (!this.mcpServers.length) {
+            box.innerHTML = '<div class="command-empty">暂无连接</div>';
+            return;
+        }
+        box.innerHTML = this.mcpServers.map((server) => `
+            <div class="mcp-row" data-mcp-row="${this.esc(server.id)}">
+                <div class="mcp-main">
+                    <span class="mcp-name">${this.esc(server.name)}</span>
+                    <span class="mcp-meta">${server.enabled ? `${server.tool_count} 工具` : "已停用"}${server.last_error ? ` · ${this.esc(server.last_error)}` : ""}</span>
+                    <code class="mcp-command">${this.esc(server.command)}</code>
+                </div>
+                <button class="btn btn-ghost btn-sm" type="button" data-mcp-test="${this.esc(server.id)}">检查</button>
+                <button class="icon-button" type="button" data-mcp-delete="${this.esc(server.id)}" aria-label="删除 ${this.esc(server.name)}">
+                    <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 6h12M8 6V4h4v2M6 6l1 10h6l1-10"/></svg>
+                </button>
+            </div>`).join("");
+        box.querySelectorAll("[data-mcp-test]").forEach((button) => {
+            button.addEventListener("click", () => this.testMcpServer(button.dataset.mcpTest, button));
+        });
+        box.querySelectorAll("[data-mcp-delete]").forEach((button) => {
+            button.addEventListener("click", () => this.deleteMcpServer(button.dataset.mcpDelete));
+        });
+    }
+
+    async createMcpServer() {
+        const argsText = this.el["mcp-args"].value.trim();
+        let args = [];
+        if (argsText) {
+            try {
+                const parsed = JSON.parse(argsText);
+                if (!Array.isArray(parsed)) throw new Error("参数需要 JSON 数组");
+                args = parsed.map(String);
+            } catch {
+                args = argsText.split(/\r?\n/).map((item) => item.trim()).filter(Boolean);
+            }
+        }
+        const submit = this.el["mcp-form"].querySelector("button[type=submit]");
+        submit.disabled = true;
+        this.el["mcp-form-result"].textContent = "添加中";
+        try {
+            await this.api("/mcp/servers", {
+                method: "POST",
+                body: {
+                    name: this.el["mcp-name"].value.trim(),
+                    command: this.el["mcp-command"].value.trim(),
+                    args,
+                },
+            });
+            this.el["mcp-form"].reset();
+            this.el["mcp-form-result"].textContent = "已添加";
+            await this.loadMcpServers();
+        } catch (error) {
+            this.el["mcp-form-result"].textContent = error.message;
+        } finally {
+            submit.disabled = false;
+        }
+    }
+
+    async testMcpServer(serverId, button) {
+        button.disabled = true;
+        button.textContent = "检查中";
+        try {
+            const result = await this.api(`/mcp/servers/${serverId}/test`, { method: "POST" });
+            this.showAlert(`${result.tools.length} 个工具`);
+            await this.loadMcpServers();
+        } catch (error) {
+            this.showAlert(error.message, "error");
+            await this.loadMcpServers();
+        }
+    }
+
+    async deleteMcpServer(serverId) {
+        if (!confirm("删除这个连接？")) return;
+        try {
+            await this.api(`/mcp/servers/${serverId}`, { method: "DELETE" });
+            await this.loadMcpServers();
+        } catch (error) {
+            this.showAlert(error.message, "error");
+        }
+    }
+
+    async loadMcpToolCatalog() {
+        const servers = this.mcpServers.length ? this.mcpServers : (await this.api("/mcp/servers").catch(() => ({ servers: [] }))).servers || [];
+        const enabled = servers.filter((server) => server.enabled);
+        const results = await Promise.all(enabled.map(async (server) => {
+            try {
+                const data = await this.api(`/mcp/servers/${server.id}/tools`);
+                return (data.tools || []).map((tool) => ({
+                    ...tool,
+                    description: `${server.name}：${tool.description || tool.remote_name}`,
+                }));
+            } catch {
+                return [];
+            }
+        }));
+        return results.flat();
+    }
+
+    setSidebarOpen(open) {
+        document.body.classList.toggle("sidebar-open", !!open);
+        this.el["sidebar-open"]?.setAttribute("aria-expanded", String(!!open));
+    }
+
+    async openSettings() {
+        this.setSettingsResult("");
+        try {
+            const settings = await this.api("/settings/model");
+            this.fillSettings(settings);
+            this.openModalElement(this.el["settings-modal"]);
+        } catch (error) {
+            this.showAlert(`读取设置失败：${error.message}`, "error");
+        }
+    }
+
+    fillSettings(settings) {
+        ["llm", "emb"].forEach((kind) => {
+            const section = (kind === "llm" ? settings.llm : settings.embedding) || {};
+            const backend = section.backend || (kind === "llm" ? "extractive" : "onnx");
+            const select = document.getElementById(`${kind}-backend`);
+            if (select) select.value = backend;
+            const config = section[backend] || {};
+            this.setField(`${kind}-base-url`, config.base_url || "");
+            this.setField(`${kind}-model`, config.model || "");
+            this.setField(`${kind}-api-key`, "");
+            const key = document.getElementById(`${kind}-api-key`);
+            if (key) key.placeholder = config.api_key ? "已保存，留空不修改" : "可选";
+            this.syncRemoteFields(kind);
+        });
+    }
+
+    setField(id, value) {
+        const element = document.getElementById(id);
+        if (element) element.value = value;
+    }
+
+    syncRemoteFields(kind) {
+        const backend = document.getElementById(`${kind}-backend`)?.value || (kind === "llm" ? "extractive" : "onnx");
+        const container = document.getElementById(`${kind}-remote`);
+        if (container) container.hidden = !["ollama", "openai"].includes(backend);
+        const base = document.getElementById(`${kind}-base-url`);
+        const model = document.getElementById(`${kind}-model`);
+        if (backend === "ollama") {
+            if (base && !base.value) base.value = "http://localhost:11434/v1";
+            if (model && !model.value) model.placeholder = kind === "llm" ? "qwen3:4b-instruct-2507-q4_K_M" : "nomic-embed-text";
+        } else if (backend === "openai") {
+            if (base && (!base.value || base.value.includes("localhost"))) base.value = "https://api.deepseek.com/v1";
+            if (model && !model.value) model.placeholder = kind === "llm" ? "deepseek-chat" : "text-embedding-3-small";
+        }
+    }
+
+    collectKind(kind) {
+        const backend = document.getElementById(`${kind}-backend`)?.value || (kind === "llm" ? "extractive" : "onnx");
+        const result = { backend };
+        if (["ollama", "openai"].includes(backend)) {
+            const config = {
+                base_url: document.getElementById(`${kind}-base-url`)?.value.trim() || "",
+                model: document.getElementById(`${kind}-model`)?.value.trim() || "",
+            };
+            const apiKey = document.getElementById(`${kind}-api-key`)?.value.trim() || "";
+            if (apiKey) config.api_key = apiKey;
+            result[backend] = config;
+        }
+        return result;
+    }
+
+    async testModel(kind) {
+        const config = this.collectKind(kind);
+        const backend = config.backend;
+        this.setSettingsResult("测试中");
+        try {
+            const result = await this.api("/settings/model/test", {
+                method: "POST",
+                body: {
+                    kind: kind === "llm" ? "llm" : "embedding",
+                    backend,
+                    ...(config[backend] || {}),
+                },
+            });
+            this.setSettingsResult(result.detail, result.ok ? "ok" : "err");
+        } catch (error) {
+            this.setSettingsResult(error.message, "err");
         }
     }
 
     async saveSettings() {
-        const body = { llm: this.collectKind('llm'), embedding: this.collectKind('emb') };
-        const btn = this.el['settings-save'];
-        btn.disabled = true;
-        this.setSettingsResult('保存中…', 'info');
+        const button = this.el["settings-save"];
+        button.disabled = true;
+        this.setSettingsResult("保存中");
         try {
-            const r = await this.api('/settings/model', { method: 'PUT', body });
-            const warns = (r.warnings || []).join('　');
-            this.setSettingsResult('✅ 已保存并生效。' + (warns ? ' ' + warns : ''), 'ok');
-            this.showAlert('模型设置已更新，立即生效', 'success');
-            // 后端单例已重建；Embedding 切换可能换了 collection，刷新一下库
+            const result = await this.api("/settings/model", {
+                method: "PUT",
+                body: { llm: this.collectKind("llm"), embedding: this.collectKind("emb") },
+            });
+            this.setSettingsResult(result.warnings?.join(" ") || "已保存", "ok");
             await this.loadKnowledgeBases();
-        } catch (e) {
-            this.setSettingsResult('❌ ' + e.message, 'err');
+        } catch (error) {
+            this.setSettingsResult(error.message, "err");
         } finally {
-            btn.disabled = false;
+            button.disabled = false;
         }
     }
 
     async resetSettings() {
-        if (!confirm('恢复为 config/config.yaml 中的模型配置？\n会删除界面写入的本地覆盖文件。')) return;
+        if (!confirm("恢复配置文件中的模型设置？")) return;
         try {
-            const r = await this.api('/settings/model', { method: 'DELETE' });
-            this.fillSettings(r);
-            this.setSettingsResult('✅ 已恢复配置文件中的设置', 'ok');
+            const result = await this.api("/settings/model", { method: "DELETE" });
+            this.fillSettings(result);
+            this.setSettingsResult("已恢复", "ok");
             await this.loadKnowledgeBases();
-        } catch (e) {
-            this.setSettingsResult('❌ ' + e.message, 'err');
+        } catch (error) {
+            this.setSettingsResult(error.message, "err");
         }
     }
 
-    setSettingsResult(text, kind) {
-        const el = this.el['settings-result'];
-        if (!el) return;
-        el.textContent = text;
-        el.className = 'settings-result' + (kind ? ` settings-${kind}` : '');
+    setSettingsResult(text, kind = "") {
+        if (!this.el["settings-result"]) return;
+        this.el["settings-result"].textContent = text;
+        this.el["settings-result"].className = `settings-result${kind ? ` settings-${kind}` : ""}`;
     }
 
-    // ================= 文档管理（预览 / 分块编辑） =================
+    async openTasks() {
+        this.openModalElement(this.el["tasks-modal"]);
+        await this.loadIngestJobs();
+    }
+
+    async loadIngestJobs() {
+        clearTimeout(this.tasksTimer);
+        try {
+            const data = await this.api("/ingest/jobs?limit=50");
+            this.ingestJobs = data.jobs || [];
+            this.renderIngestJobs();
+            const busy = this.ingestJobs.some((job) => ["queued", "running"].includes(job.status));
+            if (busy && this.el["tasks-modal"].classList.contains("active")) {
+                this.tasksTimer = setTimeout(() => this.loadIngestJobs(), 1800);
+            }
+        } catch (error) {
+            this.el["tasks-content"].innerHTML = `<div class="command-empty">${this.esc(error.message)}</div>`;
+        }
+    }
+
+    renderIngestJobs() {
+        const box = this.el["tasks-content"];
+        if (!this.ingestJobs.length) {
+            box.innerHTML = '<div class="command-empty">暂无任务</div>';
+            return;
+        }
+        const labels = {
+            queued: "排队", running: "处理中", done: "成功",
+            failed: "失败", interrupted: "已中断",
+        };
+        box.innerHTML = this.ingestJobs.map((job, index) => {
+            const status = labels[job.status] || job.status;
+            const canRetry = ["failed", "interrupted"].includes(job.status) && ["file", "url", "dir"].includes(job.kind);
+            const result = job.status === "done" && job.result
+                ? this.ingestResultText(job.result)
+                : "";
+            const detail = job.error || result;
+            return `<article class="task-row" data-task="${index}">
+                <span class="task-state task-${this.esc(job.status)}"><span class="task-status"></span>${this.esc(status)}</span>
+                <div class="task-main">
+                    <div class="task-title">${this.esc(job.label || job.kind)}</div>
+                    ${detail ? `<div class="task-detail">${this.esc(detail)}</div>` : ""}
+                </div>
+                <span class="task-time">${this.esc(this.jobTime(job.created_at))}</span>
+                ${canRetry ? `<button class="btn btn-ghost btn-sm task-retry" type="button" data-retry="${index}">${job.kind === "file" ? "重新上传" : "重新导入"}</button>` : ""}
+            </article>`;
+        }).join("");
+        box.querySelectorAll("[data-retry]").forEach((button) => {
+            button.addEventListener("click", () => this.retryIngestJob(this.ingestJobs[Number(button.dataset.retry)]));
+        });
+    }
+
+    jobTime(value) {
+        const date = new Date(Number(value || 0) * 1000);
+        if (Number.isNaN(date.getTime())) return "";
+        return new Intl.DateTimeFormat("zh-CN", {
+            month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit",
+        }).format(date);
+    }
+
+    async retryIngestJob(job) {
+        if (!job) return;
+        if (job.kind === "file") {
+            this.closeAllModals();
+            this.el["file-input"].click();
+            return;
+        }
+        const kbId = job.meta?.kb_id || this.currentKb?.id;
+        if (job.kind === "url") {
+            const url = job.meta?.url || job.label;
+            this.closeAllModals();
+            await this.importUrl(url, kbId);
+            return;
+        }
+        if (job.kind === "dir") {
+            const directory = job.meta?.dir || job.label;
+            if (!directory || !kbId) return;
+            this.closeAllModals();
+            try {
+                let result = await this.api("/ingest/dir", {
+                    method: "POST",
+                    body: { dir_path: directory, kb_id: kbId, background: true },
+                });
+                if (result.job_id) result = await this.waitForIngestJob(result.job_id, directory);
+                this.showAlert(`已导入 ${Number(result.docs || 0)} 篇`);
+                await this.loadKnowledgeBases();
+            } catch (error) {
+                this.showAlert(`导入失败：${error.message}`, "error");
+            }
+        }
+    }
 
     async openDocs() {
-        this.el['docs-modal'].classList.add('active');
-        this.el['docs-back'].hidden = true;
-        this.el['docs-kb-name'].textContent = this.currentKb
-            ? ('当前知识库：' + this.currentKb.name) : '全部知识库';
+        this.el["docs-kb-name"].textContent = this.currentKb?.name || "全部知识库";
+        this.el["docs-filter"].value = "";
+        this.el["docs-source-filter"].value = "";
+        this.el["docs-back"].hidden = true;
+        this.el["docs-filter"].hidden = false;
+        this.openModalElement(this.el["docs-modal"]);
         await this.loadDocs();
     }
 
     async loadDocs() {
-        const box = this.el['docs-content'];
-        box.innerHTML = '<p class="muted small">加载中…</p>';
+        const box = this.el["docs-content"];
+        box.innerHTML = '<div class="command-empty">加载中</div>';
         try {
-            const data = await this.api('/documents');
-            this.renderDocs(data.documents || []);
-        } catch (e) {
-            box.innerHTML = '<p class="warn">加载失败：' + this.esc(e.message) + '</p>';
+            const params = new URLSearchParams({ sort: "recent" });
+            if (this.currentKb?.id) params.set("kb_id", this.currentKb.id);
+            const data = await this.api(`/documents?${params}`);
+            this.documents = data.documents || [];
+            this.el["docs-back"].hidden = true;
+            this.el["docs-filter"].hidden = false;
+            this.renderDocs(this.documents);
+        } catch (error) {
+            box.innerHTML = `<div class="command-empty">${this.esc(error.message)}</div>`;
         }
     }
 
-    renderDocs(docs) {
-        const box = this.el['docs-content'];
-        if (!docs.length) {
-            box.innerHTML = '<p class="muted small">还没有文档。先「上传文档」或「导入网页」。</p>';
-            return;
-        }
-        // 列表接口返回全部知识库的文档，这里按当前知识库过滤
-        const kbId = this.currentKb ? this.currentKb.id : null;
-        const list = kbId ? docs.filter((d) => d.kb_id === kbId) : docs;
+    renderDocs(documents) {
+        const box = this.el["docs-content"];
+        const keyword = this.el["docs-filter"].value.trim().toLowerCase();
+        const sourceType = this.el["docs-source-filter"].value;
+        const list = documents.filter((document) => {
+            if (this.currentKb?.id && document.kb_id !== this.currentKb.id) return false;
+            if (sourceType && document.source_type !== sourceType) return false;
+            const text = `${document.title || ""} ${document.source || ""}`.toLowerCase();
+            return !keyword || text.includes(keyword);
+        });
         if (!list.length) {
-            box.innerHTML = '<p class="muted small">当前知识库还没有文档。</p>';
+            box.innerHTML = '<div class="command-empty">没有资料</div>';
             return;
         }
-        box.innerHTML = '<ul class="docs-list">' + list.map((d) => {
-            const title = this.esc(d.title || d.source);
-            const src = this.esc(d.source);
-            const meta = d.chunks + ' 分块 · ' + this.esc(d.doc_status || 'active');
-            return '<li class="docs-item" data-source="' + src + '">'
-                + '<span class="item-main" title="' + src + '">📄 ' + title + '</span>'
-                + '<span class="item-meta">' + meta + '</span>'
-                + '</li>';
-        }).join('') + '</ul>';
-        box.querySelectorAll('.docs-item').forEach((li) => {
-            li.addEventListener('click', () => this.openDocChunks(li.dataset.source));
+        box.innerHTML = `<ul class="docs-list">${list.map((document) => `
+            <li>
+                <button class="docs-item" type="button" data-source="${this.esc(document.source)}">
+                    <span class="item-main">${this.esc(document.title || document.source)}</span>
+                    <span class="item-meta">${Number(document.chunks || 0)} 分块</span>
+                </button>
+            </li>
+        `).join("")}</ul>`;
+        box.querySelectorAll(".docs-item").forEach((item) => {
+            item.addEventListener("click", () => this.openDocChunks(item.dataset.source));
         });
     }
 
     async openDocChunks(source) {
-        const box = this.el['docs-content'];
-        box.innerHTML = '<p class="muted small">加载分块…</p>';
+        const box = this.el["docs-content"];
+        box.innerHTML = '<div class="command-empty">加载中</div>';
         const params = new URLSearchParams();
-        if (this.currentKb) params.set('kb_id', this.currentKb.id);
-        params.set('limit', '200');
-        const q = params.toString() ? ('?' + params.toString()) : '';
+        if (this.currentKb?.id) params.set("kb_id", this.currentKb.id);
+        params.set("limit", "200");
         try {
-            const data = await this.api('/documents/' + encodeURIComponent(source) + '/chunks' + q);
+            const data = await this.api(`/documents/${encodeURIComponent(source)}/chunks?${params}`);
+            this.el["docs-back"].hidden = false;
+            this.el["docs-filter"].hidden = true;
             this.renderChunks(source, data.chunks || []);
-            this.el['docs-back'].hidden = false;
-        } catch (e) {
-            box.innerHTML = '<p class="warn">加载分块失败：' + this.esc(e.message) + '</p>';
+        } catch (error) {
+            box.innerHTML = `<div class="command-empty">${this.esc(error.message)}</div>`;
         }
     }
 
     renderChunks(source, chunks) {
-        const box = this.el['docs-content'];
+        const box = this.el["docs-content"];
         if (!chunks.length) {
-            box.innerHTML = '<p class="muted small">该文档没有分块。</p>';
+            box.innerHTML = '<div class="command-empty">暂无分块</div>';
             return;
         }
-        // 按 chunk_index 排序，保持原文顺序（Chroma 返回顺序不保证）
-        const sorted = chunks.slice().sort((a, b) => {
-            const ai = parseInt((a.metadata && a.metadata.chunk_index) ?? 0);
-            const bi = parseInt((b.metadata && b.metadata.chunk_index) ?? 0);
-            return ai - bi;
-        });
-        box.innerHTML = '<h4 class="docs-doc-title">📄 ' + this.esc(source) + '</h4>'
-            + sorted.map((c, i) => {
-                const head = this.esc((c.metadata && (c.metadata.chunk_prefix || c.metadata.breadcrumb)) || '—');
-                return '<div class="chunk-card" data-chunk="' + this.esc(c.id) + '">'
-                    + '<div class="chunk-head">'
-                    + '<span class="muted small">#' + (i + 1) + ' · ' + head + '</span>'
-                    + '<button class="btn btn-primary btn-sm chunk-save" type="button">保存</button>'
-                    + '</div>'
-                    + '<textarea class="chunk-text" rows="4">' + this.esc(c.text || '') + '</textarea>'
-                    + '</div>';
-            }).join('');
-        box.querySelectorAll('.chunk-card').forEach((card) => {
-            const id = card.dataset.chunk;
-            card.querySelector('.chunk-save').addEventListener('click', () => this.saveChunk(id, card));
+        const sorted = chunks.slice().sort((a, b) => Number(a.metadata?.chunk_index || 0) - Number(b.metadata?.chunk_index || 0));
+        box.innerHTML = `<h3 class="docs-doc-title">${this.esc(source)}</h3>${sorted.map((chunk, index) => {
+            const heading = chunk.metadata?.chunk_prefix || chunk.metadata?.breadcrumb || "";
+            return `<article class="chunk-card" data-chunk="${this.esc(chunk.id)}">
+                <div class="chunk-head">
+                    <span class="muted small">${index + 1}${heading ? ` · ${this.esc(heading)}` : ""}</span>
+                    <button class="btn btn-secondary btn-sm chunk-save" type="button">保存</button>
+                </div>
+                <textarea class="chunk-text" rows="4" aria-label="分块 ${index + 1}">${this.esc(chunk.text || "")}</textarea>
+            </article>`;
+        }).join("")}`;
+        box.querySelectorAll(".chunk-card").forEach((card) => {
+            card.querySelector(".chunk-save").addEventListener("click", () => this.saveChunk(card.dataset.chunk, card));
         });
     }
 
     async saveChunk(chunkId, card) {
-        const textarea = card.querySelector('.chunk-text');
-        const text = textarea.value.trim();
-        if (!text) { this.showAlert('分块内容不能为空', 'error'); return; }
+        const text = card.querySelector(".chunk-text").value.trim();
+        if (!text) {
+            this.showAlert("内容不能为空", "error");
+            return;
+        }
         const params = new URLSearchParams();
-        if (this.currentKb) params.set('kb_id', this.currentKb.id);
-        const q = params.toString() ? ('?' + params.toString()) : '';
-        const btn = card.querySelector('.chunk-save');
-        btn.disabled = true;
-        btn.textContent = '保存中…';
+        if (this.currentKb?.id) params.set("kb_id", this.currentKb.id);
+        const button = card.querySelector(".chunk-save");
+        button.disabled = true;
         try {
-            await this.api('/documents/chunks/' + encodeURIComponent(chunkId) + q, {
-                method: 'PATCH', body: { text },
-            });
-            this.showAlert('分块已更新并重新向量化', 'success');
-        } catch (e) {
-            this.showAlert('保存失败：' + e.message, 'error');
+            await this.api(`/documents/chunks/${encodeURIComponent(chunkId)}?${params}`, { method: "PATCH", body: { text } });
+            this.showAlert("已保存");
+        } catch (error) {
+            this.showAlert(`保存失败：${error.message}`, "error");
         } finally {
-            btn.disabled = false;
-            btn.textContent = '保存';
+            button.disabled = false;
         }
     }
 
-    // ================= 弹窗 / 提示 =================
-
-    showGuide() {
-        const content = `
-            <div class="guide-content">
-                <h4>快速开始</h4>
-                <ol>
-                    <li><strong>上传文档</strong> - 点击左侧「上传文档」按钮，选择 PDF、Word、Markdown 或 TXT 文件</li>
-                    <li><strong>导入网页</strong> - 点击「导入网页」，粘贴网址即可自动抓取内容</li>
-                    <li><strong>开始问答</strong> - 在下方输入框中输入问题，系统会基于已上传的文档给出答案</li>
-                </ol>
-                
-                <h4>模型配置</h4>
-                <p>点击「模型设置」可以切换不同的模型后端：</p>
-                <ul>
-                    <li><strong>extractive（当前）</strong> - 无 LLM，直接返回带引用的知识库原文</li>
-                    <li><strong>ONNX 向量</strong> - 本地 CPU 运行中文 BGE 向量模型</li>
-                    <li><strong>可选后端</strong> - 需要时再配置 Ollama、云端 API 或本机生成权重</li>
-                </ul>
-                
-                <h4>数据安全</h4>
-                <p>所有数据都保存在本地电脑上，不会上传到任何服务器。</p>
-            </div>
-        `;
-        this.openModal('使用指南', content);
-    }
-
     openModal(title, content, mono = false) {
-        this.el['modal-title'].textContent = title;
-        this.el['modal-body'].textContent = content;
-        this.el['modal-body'].style.whiteSpace = 'pre-wrap';
-        this.el['modal-body'].style.fontFamily = mono ? 'ui-monospace, Consolas, monospace' : '';
-        this.el.modal.classList.add('active');
+        this.el["modal-title"].textContent = title;
+        this.el["modal-body"].textContent = content;
+        this.el["modal-body"].style.fontFamily = mono ? 'ui-monospace, "SFMono-Regular", Consolas, monospace' : "";
+        this.openModalElement(this.el.modal);
     }
 
-    closeModal() {
-        document.querySelectorAll('.modal').forEach((m) => m.classList.remove('active'));
+    openModalElement(element) {
+        if (!element) return;
+        this.lastFocus = document.activeElement;
+        document.querySelectorAll(".modal.active").forEach((modal) => modal.classList.remove("active"));
+        this.el["app-layout"].inert = true;
+        element.classList.add("active");
+        const focusable = element.querySelector("input, textarea, select, button:not(.modal-close)");
+        requestAnimationFrame(() => focusable?.focus());
     }
 
-    showAlert(message, type = 'success') {
-        const container = document.getElementById('alert-container');
+    closeAllModals() {
+        clearTimeout(this.tasksTimer);
+        const active = document.querySelectorAll(".modal.active");
+        if (!active.length) return;
+        active.forEach((modal) => modal.classList.remove("active"));
+        this.el["app-layout"].inert = false;
+        if (this.lastFocus && document.contains(this.lastFocus)) this.lastFocus.focus();
+    }
+
+    setRichText(element, value) {
+        if (!element) return;
+        element.innerHTML = this.renderMarkdown(String(value ?? ""));
+    }
+
+    renderMarkdown(value) {
+        const codeBlocks = [];
+        let source = String(value ?? "").replace(/```([^\n]*)\n([\s\S]*?)```/g, (_, language, code) => {
+            const index = codeBlocks.length;
+            codeBlocks.push(`<pre><code${language ? ` data-language="${this.esc(language.trim())}"` : ""}>${this.esc(code.replace(/\n$/, ""))}</code></pre>`);
+            return `\u0001CODE${index}\u0002`;
+        });
+        source = this.esc(source);
+        const blocks = source.split(/\n{2,}/).map((block) => block.trim()).filter(Boolean).map((block) => {
+            const heading = block.match(/^(#{1,6})\s+(.+)$/);
+            if (heading) return `<h3>${this.inlineMarkdown(heading[2])}</h3>`;
+            const lines = block.split("\n");
+            if (lines.length && lines.every((line) => /^(?:[-*]|\d+\.)\s+/.test(line))) {
+                const ordered = /^\d+\.\s+/.test(lines[0]);
+                const items = lines.map((line) => `<li>${this.inlineMarkdown(line.replace(/^(?:[-*]|\d+\.)\s+/, ""))}</li>`).join("");
+                return ordered ? `<ol>${items}</ol>` : `<ul>${items}</ul>`;
+            }
+            return `<p>${lines.map((line) => this.inlineMarkdown(line)).join("<br>")}</p>`;
+        });
+        return blocks.join("").replace(/\u0001CODE(\d+)\u0002/g, (_, index) => codeBlocks[Number(index)] || "");
+    }
+
+    inlineMarkdown(value) {
+        return String(value)
+            .replace(/`([^`]+)`/g, "<code>$1</code>")
+            .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+    }
+
+    showAlert(message, type = "success") {
+        const container = document.getElementById("alert-container");
         if (!container) return;
-        const el = document.createElement('div');
-        el.className = `alert alert-${type}`;
-        el.textContent = message;
-        container.innerHTML = '';
-        container.appendChild(el);
-        setTimeout(() => el.remove(), 5000);
+        const alert = document.createElement("div");
+        alert.className = `alert alert-${type}`;
+        alert.textContent = message;
+        container.replaceChildren(alert);
+        setTimeout(() => alert.remove(), 4200);
     }
 
-    /** HTML 转义，防 XSS（知识库名/文档名来自用户输入） */
-    esc(text) {
-        return String(text ?? '').replace(/[&<>"']/g, (c) => ({
-            '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
-        }[c]));
+    icon(name) {
+        const icons = {
+            upload: '<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 13V3m0 0L6.5 6.5M10 3l3.5 3.5M4 12v4h12v-4"/></svg>',
+            link: '<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M8.2 11.8a3.2 3.2 0 0 0 4.5 0l2-2a3.2 3.2 0 0 0-4.5-4.5l-1 1M11.8 8.2a3.2 3.2 0 0 0-4.5 0l-2 2a3.2 3.2 0 0 0 4.5 4.5l1-1"/></svg>',
+            search: '<svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="9" cy="9" r="5.5"/><path d="m13 13 4 4"/></svg>',
+            copy: '<svg viewBox="0 0 20 20" aria-hidden="true"><rect x="6" y="6" width="9" height="9" rx="2"/><path d="M12 6V5a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v4a2 2 0 0 0 2 2h1"/></svg>',
+            edit: '<svg viewBox="0 0 20 20" aria-hidden="true"><path d="m12.5 4 3.5 3.5-8 8H4.5V12z"/><path d="m11 5.5 3.5 3.5"/></svg>',
+            refresh: '<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M16 10a6 6 0 1 1-1.8-4.2M16 3v4h-4"/></svg>',
+            up: '<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M6 9v7H3V9h3Zm0 6 2.5 1h4.2l2.1-5.2A1.7 1.7 0 0 0 13.2 8H10l.5-3.4A1.6 1.6 0 0 0 8.9 3L6 9Z"/></svg>',
+            down: '<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M6 11V4H3v7h3Zm0-6 2.5-1h4.2l2.1 5.2A1.7 1.7 0 0 1 13.2 12H10l.5 3.4A1.6 1.6 0 0 1 8.9 17L6 11Z"/></svg>',
+        };
+        return icons[name] || "";
+    }
+
+    esc(value) {
+        return String(value ?? "").replace(/[&<>"']/g, (character) => ({
+            "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+        }[character]));
     }
 }
 
-let app;
-document.addEventListener('DOMContentLoaded', () => {
-    app = new ChatApp();
+document.addEventListener("DOMContentLoaded", () => {
+    window.zhigeApp = new ChatApp();
 });
