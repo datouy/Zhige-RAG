@@ -14,9 +14,13 @@ from scripts.evaluate import (
     INDEX_LIMIT,
     archive_report,
     dcg_at_k,
+    expected_source_coverage,
     keyword_coverage,
+    load_eval_config,
     mrr,
     ndcg_at_k,
+    recall_at_k,
+    resolve_eval_collection,
 )
 
 
@@ -98,6 +102,68 @@ def test_mrr_no_expected_sources_returns_none():
     """expected_sources 缺失 → 返回 None。"""
     assert mrr(["a.md"], []) is None
     assert mrr(["a.md"], None) is None  # type: ignore[arg-type]
+
+
+def test_recall_at_10_counts_unique_expected_sources():
+    sources = ["员工手册.md", "员工手册.md", "其他.md"]
+    expected = ["员工手册.md", "扫描件测试.pdf"]
+    assert recall_at_k(sources, expected, k=10) == pytest.approx(0.5)
+    assert recall_at_k(sources + ["扫描件测试.pdf"], expected, k=10) == pytest.approx(1.0)
+
+
+def test_resolve_eval_collection_uses_local_default_kb(tmp_path, monkeypatch):
+    import sqlite3
+
+    db_path = tmp_path / "users.db"
+    con = sqlite3.connect(db_path)
+    con.execute(
+        "CREATE TABLE knowledge_bases "
+        "(id TEXT, user_id TEXT, collection_name TEXT, is_default INTEGER, created_at TEXT)"
+    )
+    con.execute(
+        "INSERT INTO knowledge_bases VALUES (?, ?, ?, ?, ?)",
+        (
+            "kb-default",
+            "00000000-0000-0000-0000-000000000001",
+            "tenant_chinese_rag_kb",
+            1,
+            "2026-01-01",
+        ),
+    )
+    con.commit()
+    con.close()
+    monkeypatch.setenv("DB_PATH", str(db_path))
+    assert resolve_eval_collection() == "tenant_chinese_rag_kb"
+    assert resolve_eval_collection("explicit") == "explicit"
+
+
+def test_expected_source_coverage_exposes_stale_eval_set():
+    items = [
+        {"expected_sources": ["员工手册.md", "扫描件测试.pdf"]},
+        {"expected_sources": ["员工手册.md", "不存在.pdf"]},
+    ]
+    report = expected_source_coverage(items, ["员工手册.md"])
+    assert report["expected"] == 3
+    assert report["present"] == 1
+    assert report["missing"] == 2
+    assert report["coverage"] == pytest.approx(1 / 3)
+    assert report["missing_sources"] == ["不存在.pdf", "扫描件测试.pdf"]
+
+
+def test_eval_config_uses_same_local_overrides_as_api(monkeypatch):
+    from api import deps
+    import src.settings_service as settings_service
+
+    deps._reset_cached_config()
+    monkeypatch.setattr(
+        settings_service,
+        "load_overrides",
+        lambda: {"reranker": {"enabled": True, "backend": "bge"}},
+    )
+    try:
+        assert load_eval_config("config/config.yaml")["reranker"]["enabled"] is True
+    finally:
+        deps._reset_cached_config()
 
 
 # ======================================================================

@@ -19,7 +19,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
+import sqlite3
 import sys
 import time
 from dataclasses import dataclass
@@ -31,9 +33,16 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from src.rag_pipeline import RAGPipeline
-from src.utils import apply_env_overrides, ensure_dir, get_logger, load_config, resolve_path
+from src.utils import ensure_dir, get_logger, resolve_path
 
 logger = get_logger("evaluate")
+
+
+def load_eval_config(path: str = "config/config.yaml") -> Dict[str, Any]:
+    """按 API 相同优先级加载配置（base → local_overrides → 环境变量）。"""
+    from api.deps import get_cached_config
+
+    return get_cached_config(str(resolve_path(path)))
 
 
 # ======================================================================
@@ -214,6 +223,26 @@ def mrr(sources: Sequence[str], expected_sources: Sequence[str]) -> Optional[flo
     return 0.0
 
 
+def recall_at_k(
+    sources: Sequence[str], expected_sources: Sequence[str], k: int = 10
+) -> Optional[float]:
+    """Recall@k：前 k 个结果覆盖了多少个唯一期望来源。
+
+    文件级评测无法判断同一文档内多块之间的增益，因此按唯一来源计数。
+    重复命中同一文档不会虚增分母；``expected_sources`` 为空时返回 None。
+    """
+    expected = {str(item) for item in (expected_sources or []) if str(item)}
+    if not expected:
+        return None
+    returned = {str(item or "") for item in list(sources or [])[: max(0, int(k))]}
+    matched = sum(
+        1
+        for exp in expected
+        if any(exp in source for source in returned)
+    )
+    return matched / len(expected)
+
+
 def percentile(values: Sequence[float], p: float) -> Optional[float]:
     """线性插值百分位数；空序列返回 None。"""
     if not values:
@@ -226,6 +255,106 @@ def percentile(values: Sequence[float], p: float) -> Optional[float]:
     high = min(low + 1, len(ordered) - 1)
     fraction = index - low
     return ordered[low] * (1.0 - fraction) + ordered[high] * fraction
+
+
+def resolve_eval_collection(explicit: str = "", kb_id: str = "") -> str:
+    """解析评测使用的真实知识库 collection。
+
+    ``RAGPipeline.from_config`` 默认打开裸 collection（例如
+    ``chinese_rag_kb``）；Web 写入的数据实际位于租户/知识库 collection。
+    评测若继续使用裸名称，只会得到空库上的假零分。
+    """
+    if explicit:
+        return explicit.strip()
+
+    db_path = Path(os.getenv("DB_PATH") or "data/users.db")
+    if not db_path.is_absolute():
+        db_path = resolve_path(db_path)
+    if not db_path.exists():
+        return ""
+
+    local_user_id = "00000000-0000-0000-0000-000000000001"
+    try:
+        con = sqlite3.connect(str(db_path))
+        try:
+            if kb_id:
+                row = con.execute(
+                    "SELECT collection_name FROM knowledge_bases WHERE id = ?",
+                    (kb_id,),
+                ).fetchone()
+            else:
+                row = con.execute(
+                    """
+                    SELECT collection_name
+                    FROM knowledge_bases
+                    WHERE is_default = 1
+                    ORDER BY CASE WHEN user_id = ? THEN 0 ELSE 1 END, created_at ASC
+                    LIMIT 1
+                    """,
+                    (local_user_id,),
+                ).fetchone()
+        finally:
+            con.close()
+        return str(row[0]) if row and row[0] else ""
+    except (sqlite3.Error, OSError) as exc:
+        logger.warning("无法从 %s 解析默认知识库：%s", db_path, exc)
+        return ""
+
+
+def expected_source_coverage(
+    items: Sequence[Dict[str, Any]], available_sources: Sequence[str]
+) -> Dict[str, Any]:
+    """检查评估集期望文件是否真的存在于当前知识库。
+
+    期望文件缺失时，低命中率只能说明数据集与索引不匹配，不能归因到
+    分词、召回或重排。
+    """
+    expected = {
+        str(source)
+        for item in items
+        for source in (item.get("expected_sources") or [])
+        if source
+    }
+    available = {str(source) for source in available_sources if source}
+    present = sorted(
+        source
+        for source in expected
+        if any(source in candidate for candidate in available)
+    )
+    missing = sorted(expected - set(present))
+    return {
+        "expected": len(expected),
+        "present": len(present),
+        "missing": len(missing),
+        "coverage": (len(present) / len(expected)) if expected else None,
+        "missing_sources": missing,
+    }
+
+
+def attach_source_coverage(
+    pipeline: RAGPipeline,
+    items: Sequence[Dict[str, Any]],
+    summary: Dict[str, Any],
+) -> Dict[str, Any]:
+    """把当前 collection 的期望源覆盖率附加到报告。"""
+    try:
+        rows = pipeline.vector_store.list_sources()
+        sources = [str(row.get("source") or "") for row in rows]
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("无法检查评估集来源覆盖：%s", exc)
+        summary["dataset_source_coverage"] = {"error": str(exc)}
+        return summary
+
+    coverage = expected_source_coverage(items, sources)
+    summary["dataset_source_coverage"] = coverage
+    if coverage["missing_sources"]:
+        logger.warning(
+            "评估集有 %d/%d 个期望来源不在当前 collection：%s",
+            coverage["missing"],
+            coverage["expected"],
+            ", ".join(coverage["missing_sources"][:10]),
+        )
+    return summary
 
 
 # ======================================================================
@@ -257,6 +386,7 @@ def evaluate(pipeline: RAGPipeline, items: List[Dict[str, Any]], llm_self_eval: 
     tokens_per_sec_values: List[float] = []
     ndcgs: List[float] = []
     mrrs: List[float] = []
+    recalls: List[float] = []
     # 可验证性聚合（核心指标：答案必须可回溯到上下文）
     verifications: List[Dict[str, Any]] = []
     details: List[Dict[str, Any]] = []
@@ -277,7 +407,15 @@ def evaluate(pipeline: RAGPipeline, items: List[Dict[str, Any]], llm_self_eval: 
         latencies.append(latency)
 
         # 检索命中 + NDCG/MRR
-        retrieved_sources = [str(s.get("source") or "") for s in (result.sources or [])]
+        retrieval_items = list(getattr(result, "raw_hits", None) or result.sources or [])
+        retrieved_sources = []
+        for item in retrieval_items:
+            if isinstance(item, dict):
+                retrieved_sources.append(str(item.get("source") or ""))
+            else:
+                retrieved_sources.append(
+                    str((getattr(item, "metadata", None) or {}).get("source") or "")
+                )
         hit = 0
         if expected_sources:
             for src in retrieved_sources:
@@ -290,10 +428,13 @@ def evaluate(pipeline: RAGPipeline, items: List[Dict[str, Any]], llm_self_eval: 
 
         ndcg = ndcg_at_k(retrieved_sources, expected_sources, k=5)
         mrr_val = mrr(retrieved_sources, expected_sources)
+        recall_val = recall_at_k(retrieved_sources, expected_sources, k=10)
         if ndcg is not None:
             ndcgs.append(ndcg)
         if mrr_val is not None:
             mrrs.append(mrr_val)
+        if recall_val is not None:
+            recalls.append(recall_val)
 
         # 关键词覆盖率 + RAGAS 轻量语义指标（无外部依赖）
         kw_cov = keyword_coverage(result.answer, keywords) if keywords else None
@@ -337,6 +478,7 @@ def evaluate(pipeline: RAGPipeline, items: List[Dict[str, Any]], llm_self_eval: 
                 "faithfulness": round(_faith, 4) if _faith is not None else None,
                 "ndcg_at_5": ndcg,
                 "mrr": mrr_val,
+                "recall_at_10": recall_val,
                 "verification": verification,
             }
         )
@@ -368,6 +510,7 @@ def evaluate(pipeline: RAGPipeline, items: List[Dict[str, Any]], llm_self_eval: 
         "p95_latency_ms": percentile(latencies, 0.95),
         "ndcg_at_5": sum(ndcgs) / len(ndcgs) if ndcgs else None,
         "mrr": sum(mrrs) / len(mrrs) if mrrs else None,
+        "recall_at_10": sum(recalls) / len(recalls) if recalls else None,
         "avg_ttft_ms": sum(ttfts) / len(ttfts) if ttfts else None,
         "p95_ttft_ms": percentile(ttfts, 0.95),
         "avg_tokens_per_sec": (
@@ -446,6 +589,7 @@ def archive_report(summary: Dict[str, Any], report_path: Path) -> Dict[str, Any]
         "avg_latency_ms": summary.get("avg_latency_ms"),
         "ndcg_at_5": summary.get("ndcg_at_5"),
         "mrr": summary.get("mrr"),
+        "recall_at_10": summary.get("recall_at_10"),
         "avg_ttft_ms": summary.get("avg_ttft_ms"),
         "avg_tokens_per_sec": summary.get("avg_tokens_per_sec"),
         "verified_rate": ((summary.get("verifiability") or {}).get("verified_rate")),
@@ -463,7 +607,11 @@ def archive_report(summary: Dict[str, Any], report_path: Path) -> Dict[str, Any]
 # ======================================================================
 #  CLI
 # ======================================================================
-def evaluate_retrieval(pipeline: RAGPipeline, items: List[Dict[str, Any]]) -> Dict[str, Any]:
+def evaluate_retrieval(
+    pipeline: RAGPipeline,
+    items: List[Dict[str, Any]],
+    top_k: int = 10,
+) -> Dict[str, Any]:
     """检索回归评估：只跑"召回 + 重排"，不加载 LLM、不生成答案。
 
     用途：UI 占用 GPU 时也能做检索质量回归（CPU 即可），改动分词/分块/
@@ -476,6 +624,7 @@ def evaluate_retrieval(pipeline: RAGPipeline, items: List[Dict[str, Any]]) -> Di
     hits_total = 0
     ndcgs: List[float] = []
     mrrs: List[float] = []
+    recalls: List[float] = []
     latencies: List[float] = []
     details: List[Dict[str, Any]] = []
     for i, item in enumerate(items, 1):
@@ -483,7 +632,7 @@ def evaluate_retrieval(pipeline: RAGPipeline, items: List[Dict[str, Any]]) -> Di
         expected_sources = item.get("expected_sources", []) or []
         t0 = time.perf_counter()
         try:
-            hits = pipeline.retrieve(q)
+            hits = pipeline.retrieve(q, top_k=top_k)
         except Exception as exc:
             logger.error("第 %d 条检索失败: %s", i, exc)
             details.append({"index": i, "question": q, "error": str(exc)})
@@ -502,10 +651,13 @@ def evaluate_retrieval(pipeline: RAGPipeline, items: List[Dict[str, Any]]) -> Di
         hits_total += hit
         ndcg = ndcg_at_k(sources, expected_sources, k=5)
         mrr_val = mrr(sources, expected_sources)
+        recall_val = recall_at_k(sources, expected_sources, k=10)
         if ndcg is not None:
             ndcgs.append(ndcg)
         if mrr_val is not None:
             mrrs.append(mrr_val)
+        if recall_val is not None:
+            recalls.append(recall_val)
         details.append(
             {
                 "index": i,
@@ -513,8 +665,9 @@ def evaluate_retrieval(pipeline: RAGPipeline, items: List[Dict[str, Any]]) -> Di
                 "retrieval_hit": bool(hit),
                 "ndcg_at_5": ndcg,
                 "mrr": mrr_val,
+                "recall_at_10": recall_val,
                 "latency_ms": round(latency, 2),
-                "retrieved_sources": sources[:5],
+                "retrieved_sources": sources[:10],
             }
         )
         logger.info(
@@ -530,6 +683,7 @@ def evaluate_retrieval(pipeline: RAGPipeline, items: List[Dict[str, Any]]) -> Di
         "retrieval_hit_rate": hits_total / n if n else 0.0,
         "ndcg_at_5": sum(ndcgs) / len(ndcgs) if ndcgs else None,
         "mrr": sum(mrrs) / len(mrrs) if mrrs else None,
+        "recall_at_10": sum(recalls) / len(recalls) if recalls else None,
         "avg_retrieval_latency_ms": sum(latencies) / len(latencies) if latencies else None,
         "p95_retrieval_latency_ms": percentile(latencies, 0.95),
         "details": details,
@@ -552,6 +706,23 @@ def check_thresholds(summary: Dict[str, Any], args: argparse.Namespace) -> List[
         actual = float(ndcg_value or 0.0)
         if actual < args.min_ndcg:
             failures.append(f"ndcg_at_5 {actual:.3f} < {args.min_ndcg:.3f}")
+
+    recall_value = summary.get("recall_at_10")
+    min_recall = getattr(args, "min_recall", None)
+    if min_recall is not None:
+        actual = float(recall_value or 0.0)
+        if actual < min_recall:
+            failures.append(f"recall_at_10 {actual:.3f} < {min_recall:.3f}")
+
+    source_coverage = summary.get("dataset_source_coverage") or {}
+    source_coverage_value = source_coverage.get("coverage")
+    min_source_coverage = getattr(args, "min_source_coverage", None)
+    if min_source_coverage is not None:
+        actual = float(source_coverage_value or 0.0)
+        if actual < min_source_coverage:
+            failures.append(
+                f"dataset_source_coverage {actual:.3f} < {min_source_coverage:.3f}"
+            )
 
     verified_rate = (summary.get("verifiability") or {}).get("verified_rate")
     if args.min_verified_rate is not None:
@@ -581,6 +752,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--llm-self-eval", action="store_true", help="启用 LLM 自评")
     p.add_argument("--retrieval-only", action="store_true", help="只评估检索（不加载 LLM/GPU，CPU 可跑）")
     p.add_argument("--top-k", type=int, default=None, help="覆盖 retrieval.top_k")
+    p.add_argument("--collection", default="", help="评测 collection；默认取本地用户的默认知识库")
+    p.add_argument("--kb-id", default="", help="按知识库 ID 选择评测 collection")
     p.add_argument(
         "--synthesize-demo",
         action="store_true",
@@ -600,6 +773,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--min-samples", type=int, default=0, help="CI：最少样本数")
     p.add_argument("--min-hit-rate", type=float, default=None, help="CI：最低检索命中率")
     p.add_argument("--min-ndcg", type=float, default=None, help="CI：最低 NDCG@5")
+    p.add_argument("--min-recall", type=float, default=None, help="CI：最低 Recall@10")
+    p.add_argument(
+        "--min-source-coverage",
+        type=float,
+        default=None,
+        help="CI：评估集期望文件在当前知识库中的最低覆盖率",
+    )
     p.add_argument("--min-verified-rate", type=float, default=None, help="CI：最低可验证率")
     p.add_argument("--max-p95-latency-ms", type=float, default=None, help="CI：P95 延迟上限")
     return p
@@ -608,8 +788,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 def main():
     args = _build_arg_parser().parse_args()
 
-    cfg = load_config(args.config)
-    cfg = apply_env_overrides(cfg)
+    cfg = load_eval_config(args.config)
     if args.top_k:
         # 只写 retrieval.top_k —— top_k 的唯一真值来源。
         # 此前还会写 rag.top_k，而该字段既从未被读取、也已从 config.yaml 删除
@@ -644,10 +823,44 @@ def main():
     if args.retrieval_only:
         # 检索回归模式：lazy_llm 不加载生成模型（CPU 可跑，可与 UI 并存）
         pipeline = RAGPipeline.from_config(args.config, overrides=cfg, lazy_llm=True)
-        summary = evaluate_retrieval(pipeline, items)
+        collection = resolve_eval_collection(args.collection, args.kb_id)
+        if collection:
+            from src.factories import TenantAwareFactory
+
+            pipeline.vector_store = TenantAwareFactory.get_chroma_store_by_name(collection, cfg)
+            logger.info(
+                "检索评测 collection=%s（%d chunks）",
+                collection,
+                pipeline.vector_store.count(),
+            )
+        else:
+            logger.warning("未找到默认知识库或显式 collection，将使用配置中的基础 collection")
+        summary = evaluate_retrieval(pipeline, items, top_k=args.top_k or 10)
+        summary = attach_source_coverage(pipeline, items, summary)
+        summary["effective_config"] = {
+            "collection": collection or pipeline.vector_store.collection_name,
+            "reranker_enabled": getattr(pipeline, "reranker", None) is not None,
+            "hybrid_enabled": bool(
+                (cfg.get("vector_store", {}).get("hybrid", {}) or {}).get(
+                    "enabled", False
+                )
+            ),
+            "top_k": args.top_k or 10,
+        }
     else:
         pipeline = RAGPipeline.from_config(args.config, overrides=cfg)
+        collection = resolve_eval_collection(args.collection, args.kb_id)
+        if collection:
+            from src.factories import TenantAwareFactory
+
+            pipeline.vector_store = TenantAwareFactory.get_chroma_store_by_name(collection, cfg)
         summary = evaluate(pipeline, items, llm_self_eval=args.llm_self_eval)
+        summary = attach_source_coverage(pipeline, items, summary)
+        summary["effective_config"] = {
+            "collection": collection or pipeline.vector_store.collection_name,
+            "reranker_enabled": getattr(pipeline, "reranker", None) is not None,
+            "hybrid_enabled": bool((cfg.get("vector_store", {}).get("hybrid", {}) or {}).get("enabled", False)),
+        }
 
     out = resolve_path(args.output)
     ensure_dir(out.parent)
@@ -667,6 +880,12 @@ def main():
 
     print("\n========== 评估报告 ==========")
     print(f"样本数            : {summary['samples']}")
+    source_coverage = (summary.get("dataset_source_coverage") or {}).get("coverage")
+    print(
+        f"评测源覆盖率      : {source_coverage:.2%}"
+        if source_coverage is not None
+        else "评测源覆盖率      : —"
+    )
     print(f"检索命中率        : {summary['retrieval_hit_rate']:.2%}")
     if summary.get("mode") == "retrieval_only":
         print("(retrieval-only 模式：不含生成侧指标)")
@@ -674,6 +893,8 @@ def main():
         print(f"NDCG@5            : {n5:.3f}" if n5 is not None else "NDCG@5            : —")
         mr = summary.get("mrr")
         print(f"MRR               : {mr:.3f}" if mr is not None else "MRR               : —")
+        recall = summary.get("recall_at_10")
+        print(f"Recall@10         : {recall:.2%}" if recall is not None else "Recall@10         : —")
         rl = summary.get("avg_retrieval_latency_ms")
         print(f"平均检索延迟      : {rl:.0f}ms" if rl is not None else "平均检索延迟      : —")
         p95 = summary.get("p95_retrieval_latency_ms")
@@ -701,6 +922,8 @@ def main():
     print(f"NDCG@5            : {ndcg:.4f}" if ndcg is not None else "NDCG@5            : —")
     mrr_val = summary.get("mrr")
     print(f"MRR               : {mrr_val:.4f}" if mrr_val is not None else "MRR               : —")
+    recall = summary.get("recall_at_10")
+    print(f"Recall@10         : {recall:.2%}" if recall is not None else "Recall@10         : —")
     ttft = summary.get("avg_ttft_ms")
     print(f"平均 TTFT         : {ttft:.0f} ms" if ttft is not None else "平均 TTFT         : —")
     tps = summary.get("avg_tokens_per_sec")
