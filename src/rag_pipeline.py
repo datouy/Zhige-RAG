@@ -1778,7 +1778,10 @@ class RAGPipeline:
             if limit <= 0:
                 continue
             content = h.text or ""
-            meta = h.metadata or {}
+            # 引用侧栏要靠稳定块 ID 回到原文。这里复制 metadata，避免把仅用于
+            # 一次回答的引用定位字段写回缓存中的命中对象。
+            meta = dict(h.metadata or {})
+            meta.setdefault("chunk_id", h.id)
             # 标题优先用章节名（breadcrumb/chunk_prefix 末级）：文档标题在
             # 每块重复出现会诱导小模型把它当成"文献列表"复读；章节名才
             # 携带块的真实身份（如"参考文献"）。
@@ -1831,7 +1834,7 @@ class RAGPipeline:
                     "index": len(chunks) + 1,
                     "title": title,
                     "content": content,
-                    "metadata": h.metadata,
+                    "metadata": meta,
                     "score": score,
                     "score_kind": score_kind,
                 }
@@ -1858,6 +1861,8 @@ class RAGPipeline:
                     "title": c["title"],
                     "source": meta.get("source"),
                     "page": meta.get("page"),
+                    "chunk_id": meta.get("chunk_id"),
+                    "chunk_index": meta.get("chunk_index"),
                     # 之前只取 _rerank_score：没开重排器时恒为 None，界面上
                     # 四条来源全是"相似度 —"。现在带上真实分数与类型。
                     "score": c.get("score", meta.get("_rerank_score")),

@@ -142,6 +142,37 @@ def test_visible_citations_only_include_referenced_sources():
     assert [item["index"] for item in visible] == [1, 3]
 
 
+def test_citations_keep_stable_chunk_location():
+    """引用侧栏必须能凭稳定块 ID 回到原文，而不是只拿一段快照。"""
+    from src.rag_pipeline import RAGPipeline
+    from src.vector_store import Hit
+
+    pipeline = object.__new__(RAGPipeline)
+    pipeline._order_hits_by_position = lambda hits: hits
+    pipeline._allocate_budget = lambda lengths, max_chars: lengths
+
+    class _Prompts:
+        @staticmethod
+        def format_citation(**kwargs):
+            return "[{index}] {title}".format(**kwargs)
+
+    pipeline.prompts = _Prompts()
+    hits = [
+        Hit(
+            id="chunk-stable-id",
+            text="原文正文",
+            score=0.9,
+            metadata={"source": "guide.md", "chunk_index": 7},
+        )
+    ]
+    chunks, _ = pipeline._build_context(hits, max_chars=100)
+    citations = pipeline._format_citations(chunks)
+
+    assert citations[0]["chunk_id"] == "chunk-stable-id"
+    assert citations[0]["chunk_index"] == 7
+    assert "chunk_id" not in hits[0].metadata
+
+
 def test_refusal_hides_retrieved_sources():
     from src.rag_pipeline import RAGPipeline
     from src.verifier import verify_answer
