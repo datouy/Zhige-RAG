@@ -322,6 +322,8 @@ from api.routes import (
     feedback_router,
     kb_router,
     kg_router,
+    mcp_router,
+    saved_agents_router,
     settings_router,
     system_router,
 )
@@ -334,6 +336,8 @@ app.include_router(kb_router)
 app.include_router(chat_router)
 app.include_router(kg_router)
 app.include_router(agent_router)
+app.include_router(saved_agents_router)
+app.include_router(mcp_router)
 app.include_router(eval_router)
 app.include_router(feedback_router)
 

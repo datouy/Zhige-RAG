@@ -10,6 +10,8 @@
 - DocumentRecord  ：数据层文档登记表（来源/状态/权限/更新时间/内容哈希）
 - FeedbackRecord  ：反馈层用户反馈（好评/差评 + 纠错文本，驱动持续迭代）
 - LongTermMemory  ：长期记忆（用户级键值事实，与即时/检索上下文区分）
+- SavedAgent      ：可复用的检索范围、说明与工具权限
+- MCPServer       ：本机 stdio MCP 工具的连接配置
 """
 from __future__ import annotations
 import uuid
@@ -215,4 +217,57 @@ class ChatMessage(Base):
 
     __table_args__ = (
         Index("ix_msg_session_created", "session_id", "created_at"),
+    )
+
+
+# ======================== 可复用 Agent ========================
+
+class SavedAgent(Base):
+    """保存一个知识原型：检索范围、行为说明与工具权限。
+
+    不复制知识库或建立新的检索存储，只保存引用和一组允许工具名。
+    """
+
+    __tablename__ = "saved_agents"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(String(36), nullable=False, index=True)
+    kb_id = Column(String(36), nullable=False, index=True)
+    name = Column(String(80), nullable=False)
+    instructions = Column(Text, default="", nullable=False)
+    allowed_tools_json = Column(Text, nullable=True)
+    max_steps = Column(Integer, default=5, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "name", name="uq_saved_agent_user_name"),
+    )
+
+
+# ======================== MCP stdio 连接 ========================
+
+class MCPServer(Base):
+    """本机 MCP stdio 服务配置。
+
+    只保存启动命令和参数，不保存进程环境、令牌或工具输出。命令始终以参数
+    数组启动，不经过 shell；引用的命令由运行时白名单再次校验。
+    """
+
+    __tablename__ = "mcp_servers"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(String(36), nullable=False, index=True)
+    name = Column(String(80), nullable=False)
+    command = Column(String(512), nullable=False)
+    args_json = Column(Text, default="[]", nullable=False)
+    enabled = Column(Boolean, default=True, nullable=False)
+    tool_count = Column(Integer, default=0, nullable=False)
+    last_error = Column(Text, nullable=True)
+    last_checked_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "name", name="uq_mcp_server_user_name"),
     )

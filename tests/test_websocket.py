@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import time
 from pathlib import Path
 
 import pytest
@@ -139,6 +140,32 @@ def test_websocket_agent_streams(client, monkeypatch):
         types = [e.get("event") for e in events]
         assert "error" not in types, f"不应出现 error 事件：{events}"
         assert "done" in types
+
+
+def test_websocket_agent_cancels_same_request(client, monkeypatch):
+    import api.routes.agent as agent_module
+
+    class _SlowAgent(_FakeAgent):
+        def run(self, query, stream=True):
+            yield {"event": "token", "data": "开始"}
+            time.sleep(0.08)
+            yield {"event": "token", "data": "不应出现"}
+            yield {"event": "done", "data": []}
+
+    monkeypatch.setattr(agent_module, "_get_agent", lambda user_id=None: _SlowAgent())
+    with client.websocket_connect("/api/v1/ws/agent") as ws:
+        ws.send_json({"query": "慢问题", "request_id": "agent-cancel"})
+        first = ws.receive_json()
+        assert first["request_id"] == "agent-cancel"
+        ws.send_json({"event": "cancel", "request_id": "agent-cancel"})
+        events = []
+        while True:
+            event = ws.receive_json()
+            events.append(event)
+            if event.get("event") == "cancelled":
+                break
+        assert all(item.get("data") != "不应出现" for item in events)
+        assert events[-1]["request_id"] == "agent-cancel"
 
 
 # ----------------------------------------------------------------------

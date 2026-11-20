@@ -20,7 +20,14 @@ from typing import Any, Dict, List, Optional
 
 from sqlalchemy.orm import Session
 
-from src.db.models import ChatMessage, ChatSession, DocumentRecord, KnowledgeBase, User
+from src.db.models import (
+    ChatMessage,
+    ChatSession,
+    DocumentRecord,
+    KnowledgeBase,
+    SavedAgent,
+    User,
+)
 from src.factories import _sanitize_user_id
 from src.utils import get_logger, resolve_path
 
@@ -242,15 +249,21 @@ def delete_kb(db: Session, user_id: str, kb_id: str, cfg: Dict[str, Any]) -> Dic
         db.query(ChatSession).filter(ChatSession.id.in_(session_ids)).delete(
             synchronize_session=False
         )
+    removed_agents = (
+        db.query(SavedAgent)
+        .filter(SavedAgent.user_id == user_id, SavedAgent.kb_id == kb_id)
+        .delete(synchronize_session=False)
+    )
     db.delete(kb)
     db.commit()
 
     collection_removed = _drop_collection(kb.collection_name, cfg)
     logger.info(
-        "删除知识库 %s：文档 %d 条、会话 %d 个、collection=%s(%s)",
+        "删除知识库 %s：文档 %d 条、会话 %d 个、Agent %d 个、collection=%s(%s)",
         kb.name,
         removed_docs,
         len(session_ids),
+        removed_agents,
         kb.collection_name,
         "已删除" if collection_removed else "本就不存在",
     )
@@ -258,6 +271,7 @@ def delete_kb(db: Session, user_id: str, kb_id: str, cfg: Dict[str, Any]) -> Dic
         "deleted": kb.name,
         "documents": int(removed_docs),
         "sessions": len(session_ids),
+        "agents": int(removed_agents),
         "collection_dropped": collection_removed,
     }
 

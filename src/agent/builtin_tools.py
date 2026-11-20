@@ -611,7 +611,8 @@ class BuiltinTools:
             "python_eval": PythonEvalTool(),
         }
         registry = ToolRegistry()
-        names = include if include else sorted(all_tools.keys())
+        # ``[]`` 是明确的“不允许任何内置工具”，不能被当成未传白名单。
+        names = sorted(all_tools.keys()) if include is None else include
         for n in names:
             t = all_tools.get(n)
             if t is None:

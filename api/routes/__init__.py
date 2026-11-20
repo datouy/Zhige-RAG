@@ -10,6 +10,8 @@
 - ``chat``         : 检索 / 同步问答 / 入库 / WebSocket 流式问答
 - ``kg``           : 知识图谱 / GraphRAG（含 cypher 注入防护）
 - ``agent``        : ReAct Agent 路由
+- ``saved_agents`` : 保存 Agent（知识范围 / 说明 / 工具权限）
+- ``mcp``          : 本机 MCP stdio 服务配置与工具发现
 - ``eval``         : 评估端点
 - ``feedback``     : 反馈层（用户反馈 / 统计 / 差评导出评估集 / 长期记忆管理）
 - ``kb``           : 知识库（多库管理）与会话（列表 / 重命名 / 历史消息）
@@ -21,6 +23,8 @@ from .eval import router as eval_router
 from .feedback import router as feedback_router
 from .kb import router as kb_router
 from .kg import router as kg_router
+from .mcp import router as mcp_router
+from .saved_agents import router as saved_agents_router
 from .settings import router as settings_router
 from .system import router as system_router
 
@@ -31,6 +35,8 @@ __all__ = [
     "feedback_router",
     "kb_router",
     "kg_router",
+    "mcp_router",
+    "saved_agents_router",
     "settings_router",
     "system_router",
 ]

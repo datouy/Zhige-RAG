@@ -259,7 +259,11 @@ async def api_delete_kb(
     """删除知识库（连带其向量 collection、文档台账与会话）。默认库不可删。"""
     user: User = current_user
     try:
-        return delete_kb(db, user.id, kb_id, get_runtime_config())
+        result = delete_kb(db, user.id, kb_id, get_runtime_config())
+        from api.routes.agent import reset_agent_cache
+
+        reset_agent_cache(user.id)
+        return result
     except KBError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:

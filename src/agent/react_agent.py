@@ -219,6 +219,7 @@ class ReActAgent:
         max_steps: int = 5,
         decision_provider: Optional[Any] = None,
         tool_select_min_confidence: float = 0.5,
+        system_prompt: Optional[str] = None,
     ) -> None:
         if llm is None:
             raise ValueError("llm 不能为空")
@@ -230,6 +231,7 @@ class ReActAgent:
         # 可选 d1 决策 provider：用于工具预选（None → 行为同改造前）
         self.decision_provider = decision_provider
         self.tool_select_min_confidence = float(tool_select_min_confidence)
+        self.system_prompt = (system_prompt or "").strip() or None
         self.history: List[Dict[str, Any]] = []
 
     # ------------------------------------------------------------------
@@ -281,18 +283,24 @@ class ReActAgent:
         names = self.tools.list_names()
         from datetime import datetime
 
-        return REACT_SYSTEM_PROMPT.format(
+        prompt = REACT_SYSTEM_PROMPT.format(
             tools=_format_tools_block(tool_list),
             tool_names=", ".join(names),
             current_date=datetime.now().strftime("%Y年%m月%d日"),
         )
+        if self.system_prompt:
+            prompt += f"\n\n当前 Agent 的额外工作说明：\n{self.system_prompt}"
+        return prompt
 
     def _build_fc_system_prompt(self) -> str:
         from datetime import datetime
 
-        return FC_SYSTEM_PROMPT.format(
+        prompt = FC_SYSTEM_PROMPT.format(
             current_date=datetime.now().strftime("%Y年%m月%d日"),
         )
+        if self.system_prompt:
+            prompt += f"\n\n当前 Agent 的额外工作说明：\n{self.system_prompt}"
+        return prompt
 
     def _supports_function_calling(self) -> bool:
         return callable(getattr(self.llm, "chat_with_tools", None))
