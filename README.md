@@ -53,6 +53,10 @@
 | **多模型后端** | `local` / `ollama` / `openai`，LLM 与 Embedding 各自独立配置 |
 | **双界面** | Web 前端（`ui/web`）+ Streamlit 控制台（`ui/`），共用同一套 REST API |
 | **生产配套** | 限流、审计日志、配额、Prometheus 指标、k8s 清单 |
+| **企业身份** | 服务端会话、scrypt 密码、账号停用、admin / kb_admin / member / auditor 职责分离 |
+| **对象级权限** | 私有、部门、全员知识库共享；显式成员 read/write；检索与文档 API 统一 ACL |
+| **集中式扩容** | pgvector + Neo4j + Redis，多副本 K8s 清单；默认 Chroma/SQLite 仍可单机运行 |
+| **完整备份** | PostgreSQL/SQLite、向量、原始文档、知识图谱和脱敏配置；带校验和恢复演练 |
 
 ---
 
@@ -221,18 +225,31 @@ python scripts/start_all.py      # Windows 也可双击 start.bat
 
 ---
 
-## 界面
+## 界面与认证模式
 
-**无需登录** —— 拉起来就能用。知阁是本地工具，不该拿注册登录挡人。
+知阁支持两种明确分离的模式：
+
+- **local**：单机零登录，只允许从回环地址访问，适合个人本机；
+- **enterprise**：默认模式，必须登录，支持 HttpOnly Cookie / Bearer Token、账号停用、角色与对象级授权。
 
 - **地址**：http://localhost:8000
 - **能力**：多知识库切换 · 会话列表与历史回看 · 文件上传 · 网页导入 ·
   **界面上切换模型** · 流式问答与引用溯源（点引用看原文分块）
-- 数据默认归属一个固定的「本地用户」，并给予不限额度 —— 这是你自己的机器。
+- 本地 `start.bat` / `quickstart.py` 会自动启用 local 模式并绑定 `127.0.0.1`；
+  Docker 与 K8s 默认启用 enterprise 模式。
 
-> **本服务不提供登录与注册**：所有请求自动归属固定的「本地用户」，
-> 不需要账号，也不做多用户隔离。要"一台服务器多人共用"得另行接入认证，
-> 本项目刻意不带这些，见 `src/middleware/identity.py`。
+> **企业模式首次启动必须提供初始管理员**：
+> `BOOTSTRAP_ADMIN_USERNAME` 与 `BOOTSTRAP_ADMIN_PASSWORD`。系统拒绝默认弱口令；
+> 首次登录后应立即修改密码并移除初始密码环境变量。
+
+企业角色：
+
+| 角色 | 权限 |
+|---|---|
+| `member` | 使用自己的知识库和被授权知识库 |
+| `kb_admin` | 管理自己创建的知识库 |
+| `admin` | 用户、角色、系统配置和全局资源管理 |
+| `auditor` | 只读审计和指标 |
 
 ### 在界面上换模型
 
@@ -345,6 +362,7 @@ EMBEDDING_BACKEND=onnx             # 本地 CPU 向量
 cp .env.example .env
 # 必填一项：
 #   POSTGRES_PASSWORD=<强口令>
+#   BOOTSTRAP_ADMIN_PASSWORD=<初始管理员强口令>
 
 docker compose up -d
 ```
@@ -355,7 +373,13 @@ compose 默认配置为 `LLM_BACKEND=extractive` + `EMBEDDING_BACKEND=onnx`，
 数据库口令通过 `POSTGRES_PASSWORD` 注入：未设置时 compose 会直接报错退出，
 而不是静默用弱口令启动。
 
-Kubernetes 清单见 `k8s/`。
+Kubernetes 清单见 `k8s/`。单副本本地文件存储仍使用原清单；企业多副本请使用
+[`k8s/enterprise/`](k8s/enterprise/README.md)：
+
+- PostgreSQL + pgvector；
+- Neo4j 共享知识图谱（按 tenant_id 隔离）；
+- Redis 跨 Pod 限流；
+- API 3～6 副本、PDB、Cookie 亲和 Ingress。
 
 ---
 
@@ -427,8 +451,8 @@ Zhige-RAG/
 效果显著优于小参数量本地推理。
 
 **Q：上传 PDF 没反应**
-需要 Streamlit、重排器等可选能力：`pip install -r requirements-optional.txt`。
-扫描件（图片型 PDF）目前不支持 OCR，见下方「已知限制」。
+先安装文档解析依赖：`pip install -r requirements-optional.txt`。扫描件还需要
+`pip install -r requirements-ocr.txt`；未安装 OCR 时图片型 PDF 提不出文本。
 
 **Q：切换了 Embedding 模型后检索结果不对**
 向量维度变了。非 `local` 后端会自动使用带指纹的 collection 名（如
@@ -437,21 +461,53 @@ Zhige-RAG/
 
 ---
 
+## 备份、恢复与质量门禁
+
+完整备份：
+
+```bash
+python scripts/backup_restore.py backup --allow-live
+```
+
+恢复必须显式确认，PostgreSQL 还需显式传入连接串：
+
+```bash
+python scripts/backup_restore.py restore data/backups/<archive>.tar.gz \
+  --force --database-url "<postgres-dsn>"
+```
+
+CI 使用固定语料、真实 ONNX Embedding 与 BM25/RRF 做硬门禁：
+
+```bash
+python scripts/ci_eval.py \
+  --min-samples 10 --min-hit-rate 0.8 \
+  --min-ndcg 0.7 --max-p95-latency-ms 3000
+```
+
+真实 HTTP 并发压测：
+
+```bash
+python scripts/load_test.py \
+  --base-url https://zhige.example.com \
+  --username admin --password-file /run/secrets/loadtest_password \
+  --requests 500 --concurrency 30
+```
+
 ## 已知限制
 
 - **OCR 需额外安装**：扫描件能力依赖 `requirements-ocr.txt`（约 100~150 MB）。
   未安装时图片型 PDF 提不出文本，其它格式不受影响。
 - **网页导入只覆盖静态 HTML**：纯前端渲染（SPA）的页面抓不到正文。
-- **向量库仅 ChromaDB**：单机 / 中小规模够用，未接入 pgvector、Milvus 等。
-  索引检查、备份、隔离与恢复见 [docs/OPERATIONS.md](docs/OPERATIONS.md)。
+- **默认仍是单节点存储**：Chroma/SQLite 适合个人和单节点；企业多副本必须切换
+  pgvector + Neo4j + Redis，否则保持单副本。索引检查、备份、隔离与恢复见
+  [docs/OPERATIONS.md](docs/OPERATIONS.md)。
 - **内部标识仍为 `ChineseRAGKB`**：日志前缀与 Python 包路径沿用原名，
   不影响使用；品牌展示名已统一为「知阁 Zhige」。
 
 ## 规划
 
 - 图片理解（VLM 生成图片描述，让图文混排的文档也能被检索到）
-- 知识库级别的共享权限（当前隔离粒度到用户）
-- 文档在线预览与分块编辑
+- 更细粒度的文档级审批流
 
 ---
 
