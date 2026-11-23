@@ -1,0 +1,12 @@
+{"question":"连续输错几次密码会锁定账号？","reference_answer":"连续五次输入错误密码会锁定账号十五分钟。","expected_sources":["security.md"],"expected_keywords":["五次","十五分钟"]}
+{"question":"停用账号后已有登录会话是否失效？","reference_answer":"停用账号后全部登录会话立即失效。","expected_sources":["security.md"],"expected_keywords":["停用","失效"]}
+{"question":"部门共享知识库允许什么权限？","reference_answer":"部门共享只允许同一部门成员只读访问，写权限需要显式成员授权。","expected_sources":["permissions.md"],"expected_keywords":["部门","只读","显式"]}
+{"question":"审计员能执行哪些操作？","reference_answer":"审计员只能查看审计信息。","expected_sources":["permissions.md"],"expected_keywords":["审计员","审计"]}
+{"question":"关键词召回和向量召回如何融合？","reference_answer":"使用 RRF 融合 BM25 和向量召回。","expected_sources":["retrieval.md"],"expected_keywords":["BM25","向量","RRF"]}
+{"question":"哪些检索路径必须应用 ACL？","reference_answer":"向量、关键词、邻居扩展和图谱增强都必须应用 ACL。","expected_sources":["retrieval.md"],"expected_keywords":["ACL","关键词","图谱"]}
+{"question":"完整备份包括哪些数据？","reference_answer":"包括关系数据库、向量数据、原始文档、知识图谱和必要配置。","expected_sources":["backup.md"],"expected_keywords":["关系数据库","向量","原始文档","知识图谱"]}
+{"question":"SQLite 恢复前会保留什么文件？","reference_answer":"SQLite 恢复会先生成 pre-restore 文件。","expected_sources":["backup.md"],"expected_keywords":["pre-restore"]}
+{"question":"多副本部署使用哪些共享组件？","reference_answer":"使用 PostgreSQL、pgvector、Neo4j 和 Redis。","expected_sources":["deployment.md"],"expected_keywords":["PostgreSQL","Neo4j","Redis"]}
+{"question":"请求日志不能记录哪些内容？","reference_answer":"不得记录完整文档、密码或 API Key。","expected_sources":["observability.md"],"expected_keywords":["完整文档","密码","API Key"]}
+{"question":"模型 API Key 可以从哪里获取？","reference_answer":"环境变量、Kubernetes Secret 或加密凭据文件。","expected_sources":["secrets.md"],"expected_keywords":["环境变量","Kubernetes Secret","加密"]}
+{"question":"质量门禁未达标时构建如何处理？","reference_answer":"未达到阈值的构建必须失败。","expected_sources":["quality.md"],"expected_keywords":["阈值","失败","告警"]}
