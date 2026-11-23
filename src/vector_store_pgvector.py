@@ -231,6 +231,17 @@ class PgVectorStore(BaseVectorStore):
             cur.execute(f"DELETE FROM {self.table} WHERE {where_sql}", tuple(where_params))
             return int(cur.rowcount or 0)
 
+    def update_metadata_for_source(self, source: str, patch: Dict[str, Any]) -> int:
+        if not source or not patch:
+            raise ValueError("source 与 patch 不能为空")
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                f"UPDATE {self.table} SET metadata = metadata || %s::jsonb "
+                "WHERE metadata->>'source' = %s",
+                (json.dumps(patch, ensure_ascii=False), source),
+            )
+            return int(cur.rowcount or 0)
+
     def count(self) -> int:
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute(f"SELECT COUNT(*) FROM {self.table}")

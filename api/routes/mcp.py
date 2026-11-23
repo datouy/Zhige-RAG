@@ -16,6 +16,7 @@ from src.db.database import get_db
 from src.db.models import MCPServer, User
 from src.mcp_stdio import MCPError, discover_mcp_tools, mcp_tool_name, resolve_mcp_command
 from src.middleware.identity import get_current_user
+from src.team_auth import has_role
 from src.utils import get_logger
 
 logger = get_logger("api.routes.mcp")
@@ -51,6 +52,9 @@ def _server_dict(server: MCPServer) -> Dict[str, Any]:
         "command": server.command,
         "args": _server_args(server),
         "enabled": bool(server.enabled),
+        "approval_status": server.approval_status or "pending",
+        "approved_by": server.approved_by,
+        "approved_at": server.approved_at.isoformat() if server.approved_at else None,
         "tool_count": int(server.tool_count or 0),
         "last_error": server.last_error or "",
         "last_checked_at": server.last_checked_at.isoformat()
@@ -135,6 +139,9 @@ def create_mcp_server(
         command=body.command.strip(),
         args_json=json.dumps(_normalize_args(body.args), ensure_ascii=False),
         enabled=body.enabled,
+        approval_status="approved" if has_role(current_user, "admin") else "pending",
+        approved_by=current_user.id if has_role(current_user, "admin") else None,
+        approved_at=datetime.utcnow() if has_role(current_user, "admin") else None,
     )
     db.add(server)
     try:
@@ -157,14 +164,17 @@ def update_mcp_server(
     db: Session = Depends(get_db),
 ):
     server = _owned_server(db, current_user.id, server_id)
+    connection_changed = False
     if body.command is not None:
         try:
             resolve_mcp_command(body.command)
         except MCPError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         server.command = body.command.strip()
+        connection_changed = True
     if body.args is not None:
         server.args_json = json.dumps(_normalize_args(body.args), ensure_ascii=False)
+        connection_changed = True
     if body.name is not None:
         name = body.name.strip()
         if not name:
@@ -172,6 +182,10 @@ def update_mcp_server(
         server.name = name
     if body.enabled is not None:
         server.enabled = body.enabled
+    if connection_changed:
+        server.approval_status = "pending"
+        server.approved_by = None
+        server.approved_at = None
     try:
         db.commit()
     except IntegrityError as exc:
@@ -191,6 +205,8 @@ def delete_mcp_server(
     db: Session = Depends(get_db),
 ):
     server = _owned_server(db, current_user.id, server_id)
+    if server.approval_status != "approved" and not has_role(current_user, "admin"):
+        raise HTTPException(status_code=403, detail="该 MCP 连接仍在等待管理员审批")
     db.delete(server)
     db.commit()
     from api.routes.agent import reset_agent_cache
@@ -206,6 +222,8 @@ async def get_mcp_server_tools(
     db: Session = Depends(get_db),
 ):
     server = _owned_server(db, current_user.id, server_id)
+    if server.approval_status != "approved" and not has_role(current_user, "admin"):
+        raise HTTPException(status_code=403, detail="该 MCP 连接仍在等待管理员审批")
     try:
         tools = await run_in_threadpool(_discover, server)
     except Exception as exc:  # noqa: BLE001
@@ -220,6 +238,8 @@ async def test_mcp_server(
     db: Session = Depends(get_db),
 ):
     server = _owned_server(db, current_user.id, server_id)
+    if server.approval_status != "approved" and not has_role(current_user, "admin"):
+        raise HTTPException(status_code=403, detail="该 MCP 连接仍在等待管理员审批")
     server.last_checked_at = datetime.utcnow()
     try:
         tools = await run_in_threadpool(_discover, server)

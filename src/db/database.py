@@ -30,8 +30,11 @@ _log = logging.getLogger(__name__)
 # （chroma_db / raw / kg_*.db）分家。这里修正为真正的项目根。
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 
-# 数据库 URL 配置
-DB_PATH = os.getenv("DB_PATH", "data/users.db")
+# 数据库 URL 配置；未显式指定 DB_PATH 时，RAG_DATA_DIR 也应覆盖默认库位置。
+DB_PATH = os.getenv("DB_PATH", "").strip()
+if not DB_PATH:
+    _runtime_root = os.getenv("RAG_DATA_DIR", "").strip()
+    DB_PATH = str(Path(_runtime_root) / "users.db") if _runtime_root else "data/users.db"
 # 相对路径锚定项目根，避免从其它工作目录启动时新建空库、用户"突然全部登录失败"
 if not Path(DB_PATH).is_absolute():
     DB_PATH = str(_PROJECT_ROOT / DB_PATH)
@@ -64,10 +67,34 @@ _LIGHT_COLUMN_MIGRATIONS = {
     "users": [
         # 数据层 ACL 分组依据
         ("department", "VARCHAR(100) NOT NULL DEFAULT ''"),
+        # 可选团队模式；本地用户仍由 is_admin 与固定身份判定。
+        ("role", "VARCHAR(20) NOT NULL DEFAULT 'viewer'"),
+        ("password_hash", "VARCHAR(255)"),
     ],
     "document_records": [
         # 知识库概念层：文档归属到具体知识库；老数据留空 = 默认库
         ("kb_id", "VARCHAR(36)"),
+        ("index_status", "VARCHAR(20) NOT NULL DEFAULT 'indexed'"),
+        ("last_indexed_at", "TIMESTAMP"),
+        ("last_index_error", "TEXT"),
+    ],
+    "chat_messages": [
+        ("verification_json", "TEXT"),
+        ("timings_json", "TEXT"),
+    ],
+    "feedback_records": [
+        ("citation_issue", "BOOLEAN NOT NULL DEFAULT FALSE"),
+        ("missing_source", "BOOLEAN NOT NULL DEFAULT FALSE"),
+    ],
+    "usage_logs": [
+        ("resource", "VARCHAR(512)"),
+        ("details_json", "TEXT"),
+    ],
+    "mcp_servers": [
+        # 已有本机连接自动视为已批准，避免升级后 Agent 工具全部消失。
+        ("approval_status", "VARCHAR(20) NOT NULL DEFAULT 'approved'"),
+        ("approved_by", "VARCHAR(36)"),
+        ("approved_at", "TIMESTAMP"),
     ],
 }
 
@@ -86,6 +113,22 @@ def _migrate_document_record_key() -> None:
     columns = {column["name"] for column in insp.get_columns("document_records")}
     if "kb_id" not in columns:
         return
+
+    # 该函数也可能被升级脚本或测试直接调用。若调用方还没执行通用轻量迁移，
+    # 旧表就没有索引状态列；先把新列补齐，避免重建表时 SELECT 引用不存在的列。
+    missing_columns = [
+        (column, ddl)
+        for column, ddl in _LIGHT_COLUMN_MIGRATIONS["document_records"]
+        if column not in columns
+    ]
+    if missing_columns:
+        with engine.begin() as conn:
+            for column, ddl in missing_columns:
+                conn.exec_driver_sql(
+                    f"ALTER TABLE document_records ADD COLUMN {column} {ddl}"
+                )
+                _log.info("文档台账迁移：新增列 %s", column)
+        insp = inspect(engine)
 
     constraints = insp.get_unique_constraints("document_records")
     old = next(
@@ -125,6 +168,9 @@ def _migrate_document_record_key() -> None:
                     chunk_count INTEGER DEFAULT 0,
                     file_ext VARCHAR(16),
                     updated_at_source DATETIME,
+                    index_status VARCHAR(20) NOT NULL DEFAULT 'indexed',
+                    last_indexed_at TIMESTAMP,
+                    last_index_error TEXT,
                     created_at DATETIME,
                     updated_at DATETIME,
                     CONSTRAINT uq_docrecord_user_kb_source
@@ -137,12 +183,15 @@ def _migrate_document_record_key() -> None:
                 INSERT INTO document_records (
                     id, user_id, kb_id, source, title, doc_status, acl,
                     department, content_hash, chunk_count, file_ext,
-                    updated_at_source, created_at, updated_at
+                    updated_at_source, index_status, last_indexed_at,
+                    last_index_error, created_at, updated_at
                 )
                 SELECT
                     id, user_id, kb_id, source, title, doc_status, acl,
                     department, content_hash, chunk_count, file_ext,
-                    updated_at_source, created_at, updated_at
+                    updated_at_source,
+                    COALESCE(index_status, 'indexed'), last_indexed_at,
+                    last_index_error, created_at, updated_at
                 FROM document_records_legacy_key
                 """
             )
@@ -173,14 +222,12 @@ def _migrate_document_record_key() -> None:
                 )
     _log.info("文档台账唯一键已升级为 (user_id, kb_id, source)")
 
-# 登录/注册时代的遗留结构清理：{表名: [列名]} 与 (表名, ...)
-#
-# 老版本支持注册登录，库里因此有 ``users.password_hash``（NOT NULL）和
-# ``refresh_tokens`` 表。服务现在不需要登录：password_hash 留着不仅无用，
-# 还会让"自动创建本地用户"撞上 NOT NULL 约束直接报错；refresh_tokens
-# 只是一堆死数据。启动时按存在性删除，重复执行安全。
-_LEGACY_COLUMN_CLEANUP = {"users": ["password_hash", "subscription_tier", "max_chunks", "max_queries_per_day"]}
-_LEGACY_TABLE_CLEANUP = ("refresh_tokens",)
+# 旧计费字段可以安全清理；``password_hash`` 已由可选团队模式重新启用，
+# 绝不能在启动时删除。旧 refresh_tokens 也保留为只读历史，不再主动删表。
+_LEGACY_COLUMN_CLEANUP = {
+    "users": ["subscription_tier", "max_chunks", "max_queries_per_day"]
+}
+_LEGACY_TABLE_CLEANUP: tuple[str, ...] = ()
 
 # 检测是否为 PostgreSQL
 DATABASE_URL = os.getenv("DATABASE_URL", "")
@@ -269,6 +316,13 @@ def init_db() -> None:
             _log.warning("%s 列迁移跳过（可能已存在）", table, exc_info=True)
 
     _migrate_document_record_key()
+    try:
+        with engine.begin() as conn:
+            conn.exec_driver_sql(
+                "UPDATE users SET role='admin' WHERE is_admin = 1"
+            )
+    except Exception:  # noqa: BLE001
+        _log.warning("用户角色回填跳过", exc_info=True)
     _cleanup_legacy_auth_schema()
 
 

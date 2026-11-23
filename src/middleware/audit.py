@@ -11,6 +11,7 @@ import json
 import os
 from datetime import datetime, timezone
 from enum import Enum
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from sqlalchemy.orm import Session
@@ -41,6 +42,16 @@ class AuditAction(str, Enum):
     CONFIG_CHANGE = "config_change"
     USER_DISABLE = "user_disable"
     USER_ENABLE = "user_enable"
+    DOCUMENT_DELETE = "document_delete"
+    DOCUMENT_STATUS = "document_status"
+    DOCUMENT_REINDEX = "document_reindex"
+    KB_SHARE = "kb_share"
+    FEEDBACK_RESOLVE = "feedback_resolve"
+    KNOWLEDGE_GAP_UPDATE = "knowledge_gap_update"
+    BACKUP_EXPORT = "backup_export"
+    BACKUP_RESTORE = "backup_restore"
+    MCP_APPROVE = "mcp_approve"
+    EVALUATION_RUN = "evaluation_run"
 
 
 class AuditLogger:
@@ -115,6 +126,7 @@ class AuditLogger:
         action: AuditAction,
         success: bool,
         details: Optional[Dict[str, Any]] = None,
+        resource: Optional[str] = None,
         error_message: Optional[str] = None,
     ) -> None:
         """写入审计日志到数据库。"""
@@ -128,6 +140,7 @@ class AuditLogger:
                 action=action,
                 success=success,
                 details=details,
+                resource=resource,
                 error_message=error_message,
             )
             
@@ -136,6 +149,15 @@ class AuditLogger:
                 endpoint=entry["action"],
                 method="AUDIT",
                 status_code=200 if success else 401,
+                resource=(entry.get("resource") or "")[:512] or None,
+                details_json=json.dumps(
+                    {
+                        "details": entry.get("details") or {},
+                        "ip": entry.get("ip"),
+                        "timestamp": entry.get("timestamp"),
+                    },
+                    ensure_ascii=False,
+                ),
                 error_message=error_message,
                 latency_ms=0,
             )
@@ -183,7 +205,15 @@ class AuditLogger:
         
         # 写入数据库
         if self.use_db and db is not None:
-            self._write_to_db(db, user_id, action, success, details, error_message)
+            self._write_to_db(
+                db,
+                user_id,
+                action,
+                success,
+                details,
+                resource=resource,
+                error_message=error_message,
+            )
         
         # 输出到应用日志
         log_level = logger.info if success else logger.warning
@@ -306,8 +336,16 @@ def get_audit_logger() -> AuditLogger:
     """获取全局审计日志记录器实例。"""
     global _audit_logger
     if _audit_logger is None:
+        audit_file = os.getenv("AUDIT_LOG_FILE", "").strip()
+        if not audit_file:
+            runtime_root = os.getenv("RAG_DATA_DIR", "").strip()
+            audit_file = (
+                str(Path(runtime_root) / "logs" / "audit.jsonl")
+                if runtime_root
+                else "logs/audit.jsonl"
+            )
         _audit_logger = AuditLogger(
-            audit_file=os.getenv("AUDIT_LOG_FILE", "logs/audit.jsonl"),
+            audit_file=audit_file,
             use_db=os.getenv("AUDIT_USE_DB", "true").lower() == "true",
             use_file=os.getenv("AUDIT_USE_FILE", "true").lower() == "true",
         )

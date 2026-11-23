@@ -102,6 +102,9 @@ class BaseVectorStore:
     def delete_by_metadata(self, where) -> int:  # pragma: no cover
         raise NotImplementedError
 
+    def update_metadata_for_source(self, source: str, patch: Dict[str, Any]) -> int:  # pragma: no cover
+        raise NotImplementedError
+
     def count(self) -> int:  # pragma: no cover
         raise NotImplementedError
 
@@ -1404,6 +1407,25 @@ class ChromaStore(BaseVectorStore):
         self._bump_mutation()
         logger.info("按 %s 删除 %d 条", where, deleted)
         return deleted
+
+    def update_metadata_for_source(self, source: str, patch: Dict[str, Any]) -> int:
+        """更新同一来源的全部分块元数据，供状态切换等生命周期操作使用。"""
+        if not source or not patch:
+            raise ValueError("source 与 patch 不能为空")
+        data = self.collection.get(
+            where={"source": {"$eq": source}}, include=["metadatas"]
+        )
+        ids = data.get("ids") or []
+        if not ids:
+            return 0
+        metadatas = []
+        for metadata in data.get("metadatas") or []:
+            metadatas.append({**dict(metadata or {}), **patch})
+        self.collection.update(ids=ids, metadatas=metadatas)
+        # BM25 缓存携带旧状态；丢弃磁盘缓存，下一次查询按新 metadata 重建。
+        self._invalidate_bm25(discard_disk=True)
+        self._bump_mutation()
+        return len(ids)
 
     def delete_by_ids(self, ids: Sequence[str]) -> int:
         if not ids:

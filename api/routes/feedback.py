@@ -23,7 +23,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from src.db.database import get_db
-from src.db.models import FeedbackRecord, User
+from src.db.models import FeedbackRecord, KnowledgeGap, User
 from src.middleware.identity import get_current_user
 from src.utils import get_logger, resolve_path
 
@@ -70,6 +70,10 @@ class FeedbackBody(BaseModel):
     rating: str = Field(..., description="helpful / not_helpful")
     correction: str = Field("", description="纠正/期望的答案（差评时强烈建议填写）")
     question_type: str = Field("", description="问题分类标签（可选，便于归因）")
+    citation_issue: bool = Field(False, description="引用编号或原文是否不匹配")
+    missing_source: bool = Field(False, description="知识库是否缺少回答所需资料")
+    kb_id: Optional[str] = Field(None, max_length=36)
+    session_id: Optional[str] = Field(None, max_length=36)
 
 
 @router.post("/api/v1/feedback", tags=["反馈"])
@@ -98,20 +102,60 @@ def submit_feedback(
             question_type = route.category[:50]
             auto_route = route.to_dict()
 
+    correction = (body.correction or "").strip()[:8000] or None
     rec = FeedbackRecord(
         user_id=user.id,
         query=body.query.strip()[:4000],
         answer=(body.answer or "")[:8000],
         sources_json=(body.sources_json or "")[:8000],
         rating=rating,
-        correction=(body.correction or "").strip()[:8000] or None,
+        correction=correction,
         question_type=question_type,
+        citation_issue=bool(body.citation_issue),
+        missing_source=bool(body.missing_source),
     )
     db.add(rec)
+    db.flush()
+
+    gap: Optional[KnowledgeGap] = None
+    if rating == "not_helpful" and (
+        body.missing_source or body.citation_issue or correction or auto_route is not None
+    ):
+        gap = (
+            db.query(KnowledgeGap)
+            .filter(
+                KnowledgeGap.user_id == user.id,
+                KnowledgeGap.query == body.query.strip()[:4000],
+                KnowledgeGap.status == "open",
+            )
+            .first()
+        )
+        if gap is None:
+            gap = KnowledgeGap(
+                user_id=user.id,
+                kb_id=body.kb_id,
+                session_id=body.session_id,
+                feedback_id=rec.id,
+                query=body.query.strip()[:4000],
+                answer=(body.answer or "")[:8000],
+                reason="missing_source" if body.missing_source else "feedback",
+                detail=(correction or (body.question_type or ""))[:2000] or None,
+                status="open",
+            )
+            db.add(gap)
+        elif gap.feedback_id is None:
+            gap.feedback_id = rec.id
+            if body.kb_id:
+                gap.kb_id = body.kb_id
     db.commit()
     db.refresh(rec)
     logger.info("反馈已记录 user=%s rating=%s id=%s type=%s", user.id, rating, rec.id, question_type)
-    resp: Dict[str, Any] = {"id": rec.id, "status": "ok", "question_type": question_type}
+    resp: Dict[str, Any] = {
+        "id": rec.id,
+        "status": "ok",
+        "question_type": question_type,
+        "knowledge_gap_id": gap.id if gap is not None else None,
+    }
     if auto_route is not None:
         resp["auto_route"] = auto_route
     return resp
@@ -128,7 +172,9 @@ def list_feedback(
     user: User = current_user
     limit = max(1, min(int(limit), 200))
     q = db.query(FeedbackRecord)
-    if not user.is_admin:
+    from src.team_auth import has_role
+
+    if not has_role(user, "admin"):
         q = q.filter(FeedbackRecord.user_id == user.id)
     if rating:
         q = q.filter(FeedbackRecord.rating == rating.strip().lower())
@@ -142,6 +188,8 @@ def list_feedback(
                 "rating": r.rating,
                 "correction": r.correction,
                 "question_type": r.question_type,
+                "citation_issue": bool(r.citation_issue),
+                "missing_source": bool(r.missing_source),
                 "resolved": bool(r.resolved),
                 "created_at": r.created_at.strftime("%Y-%m-%d %H:%M:%S") if r.created_at else None,
             }
@@ -159,7 +207,9 @@ def feedback_stats(
     """反馈统计：好评/差评数、差评率、未处理差评、按问题类型归因。需要认证。"""
     user: User = current_user
     q = db.query(FeedbackRecord)
-    if not user.is_admin:
+    from src.team_auth import has_role
+
+    if not has_role(user, "admin"):
         q = q.filter(FeedbackRecord.user_id == user.id)
     rows = q.all()
     total = len(rows)
@@ -201,7 +251,9 @@ def export_feedback_evalset(
         FeedbackRecord.rating == "not_helpful",
         FeedbackRecord.resolved.is_(False),  # type: ignore[union-attr]
     )
-    if not user.is_admin:
+    from src.team_auth import has_role
+
+    if not has_role(user, "admin"):
         q = q.filter(FeedbackRecord.user_id == user.id)
     if only_with_correction:
         q = q.filter(FeedbackRecord.correction.isnot(None), FeedbackRecord.correction != "")  # type: ignore[union-attr]

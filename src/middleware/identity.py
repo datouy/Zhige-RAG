@@ -1,20 +1,12 @@
-"""本地身份依赖：所有请求都归属唯一的本地用户。
+"""身份依赖。
 
-知阁定位是**本地开源知识库工具**，不提供注册与登录 —— 拉起来就能用，
-"先注册一个账号再能提问" 纯属多余的门槛。
-
-那为什么还需要这个模块？因为数据表（文档、知识库、会话、反馈、长期记忆）
-都用 ``user_id`` 标记归属。这里给所有请求固定一个本地用户身份，
-**保持归属关系明确**，同时用户完全不需要任何账号。
-
-设计要点
---------
-- ``LOCAL_USER_ID`` 写死，保证换机器/重启后历史数据仍落在同一个身份下；
-- 首次访问时自动建行，之后直接复用。
+默认本地模式沿用固定用户、零登录门槛；设置 ``ZHIGE_AUTH_MODE=team`` 后，
+同一个依赖改为校验 HttpOnly Cookie 或不透明 Bearer 令牌。业务路由无需
+感知模式差异。
 """
 from __future__ import annotations
 
-from fastapi import Depends
+from fastapi import Depends, HTTPException, Request
 from sqlalchemy.orm import Session
 
 from src.db.database import get_db
@@ -41,6 +33,8 @@ def get_local_user(db: Session) -> User:
         email=LOCAL_USER_EMAIL,
         is_active=True,
         is_admin=True,
+        role="admin",
+        password_hash="",  # 兼容历史 NOT NULL 约束；本地模式不用于登录
     )
     db.add(user)
     db.commit()
@@ -49,10 +43,17 @@ def get_local_user(db: Session) -> User:
     return user
 
 
-async def get_current_user(db: Session = Depends(get_db)) -> User:
-    """当前用户 —— 即本地用户。
+async def get_current_user(
+    request: Request,
+    db: Session = Depends(get_db),
+) -> User:
+    """返回当前用户；团队模式缺少或过期凭证时返回 401。"""
+    from src.team_auth import request_token, team_mode, user_from_token
 
-    路由统一用 ``Depends(get_current_user)`` 拿身份，因此这里没有任何
-    token / 会话 / 密码相关的判断：请求进来就是本地用户。
-    """
-    return get_local_user(db)
+    if not team_mode():
+        return get_local_user(db)
+
+    user = user_from_token(db, request_token(request))
+    if user is None:
+        raise HTTPException(status_code=401, detail="请先登录")
+    return user

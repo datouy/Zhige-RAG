@@ -45,7 +45,9 @@ from src.kb_service import (
     delete_kb,
     delete_session,
     ensure_default_kb,
+    get_accessible_kb,
     get_session,
+    list_accessible_kbs,
     list_kbs,
     list_messages,
     list_sessions,
@@ -54,6 +56,7 @@ from src.kb_service import (
     update_session,
 )
 from src.middleware.identity import get_current_user
+from src.team_auth import require_editor
 from src.utils import get_logger
 
 logger = get_logger("api.routes.kb")
@@ -88,12 +91,14 @@ class MessageCreateBody(BaseModel):
     role: str = Field("assistant", pattern="^(user|assistant)$")
     content: str = Field(..., min_length=1)
     sources: Optional[List[Dict[str, Any]]] = None
+    verification: Optional[Dict[str, Any]] = None
+    timings: Optional[Dict[str, Any]] = None
 
 
 # ======================================================================
 #  序列化
 # ======================================================================
-def _kb_dict(kb) -> Dict[str, Any]:
+def _kb_dict(kb, access_role: str = "owner", current_user_id: Optional[str] = None) -> Dict[str, Any]:
     return {
         "id": kb.id,
         "name": kb.name,
@@ -102,6 +107,9 @@ def _kb_dict(kb) -> Dict[str, Any]:
         "doc_count": kb.doc_count or 0,
         "chunk_count": kb.chunk_count or 0,
         "is_default": bool(kb.is_default),
+        "owner_id": kb.user_id,
+        "is_owned": current_user_id is None or kb.user_id == current_user_id,
+        "access_role": access_role,
         "created_at": kb.created_at.isoformat() if kb.created_at else None,
         "updated_at": kb.updated_at.isoformat() if kb.updated_at else None,
     }
@@ -187,13 +195,16 @@ async def api_list_kb(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
-    """列出当前用户的知识库（保证至少有一个默认库）。"""
+    """列出本人与共享知识库（保证当前用户至少有一个自己的默认库）。"""
     user: User = current_user
     try:
         ensure_default_kb(db, user.id, get_runtime_config())
-        items = list_kbs(db, user.id)
+        list_kbs(db, user.id)
+        items = list_accessible_kbs(db, user)
         return {
-            "knowledge_bases": [_kb_dict(kb) for kb in items],
+            "knowledge_bases": [
+                _kb_dict(kb, access, user.id) for kb, access in items
+            ],
             "total": len(items),
         }
     except Exception as exc:
@@ -204,14 +215,14 @@ async def api_list_kb(
 @router.post("/api/v1/kb", status_code=201, tags=["知识库"])
 async def api_create_kb(
     body: KBCreateBody,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_editor),
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
     """新建知识库。"""
     user: User = current_user
     try:
         kb = create_kb(db, user, body.name, body.description, get_runtime_config())
-        return _kb_dict(kb)
+        return _kb_dict(kb, "owner", user.id)
     except KBError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
@@ -228,8 +239,9 @@ async def api_get_kb(
     """知识库详情（统计会实时重算）。"""
     user: User = current_user
     try:
-        kb = refresh_kb_stats(db, user.id, kb_id)
-        return _kb_dict(kb)
+        kb, access = get_accessible_kb(db, user, kb_id)
+        kb = refresh_kb_stats(db, kb.user_id, kb_id)
+        return _kb_dict(kb, access, user.id)
     except KBError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -241,11 +253,14 @@ async def api_update_kb(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
-    """改名 / 改描述。"""
+    """改名 / 改描述（所有者或团队管理员）。"""
     user: User = current_user
     try:
-        kb = update_kb(db, user.id, kb_id, body.name, body.description)
-        return _kb_dict(kb)
+        target, access = get_accessible_kb(db, user, kb_id)
+        if access not in {"owner", "admin"}:
+            raise KBError("只有知识库所有者或团队管理员可以修改信息")
+        kb = update_kb(db, target.user_id, kb_id, body.name, body.description)
+        return _kb_dict(kb, access, user.id)
     except KBError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -256,13 +271,17 @@ async def api_delete_kb(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
-    """删除知识库（连带其向量 collection、文档台账与会话）。默认库不可删。"""
+    """删除知识库（所有者或团队管理员；默认库不可删）。"""
     user: User = current_user
     try:
-        result = delete_kb(db, user.id, kb_id, get_runtime_config())
+        target, access = get_accessible_kb(db, user, kb_id)
+        if access not in {"owner", "admin"}:
+            raise KBError("只有知识库所有者或团队管理员可以删除知识库")
+        owner_id = target.user_id
+        result = delete_kb(db, owner_id, kb_id, get_runtime_config())
         from api.routes.agent import reset_agent_cache
 
-        reset_agent_cache(user.id)
+        reset_agent_cache(owner_id)
         return result
     except KBError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -284,6 +303,8 @@ async def api_list_sessions(
     """会话列表，最近活跃的在前，并带最后一条消息预览。"""
     user: User = current_user
     try:
+        if kb_id:
+            get_accessible_kb(db, user, kb_id)
         sessions = list_sessions(db, user.id, kb_id=kb_id, limit=limit)
         session_ids = [session.id for session in sessions]
         previews: Dict[str, str] = {}
@@ -329,6 +350,8 @@ async def api_create_session(
         kb_id = body.kb_id
         if not kb_id:
             kb_id = ensure_default_kb(db, user.id, get_runtime_config()).id
+        else:
+            get_accessible_kb(db, user, kb_id)
         session = create_session(db, user.id, body.title, kb_id)
         return _session_dict(session)
     except Exception as exc:
@@ -397,6 +420,8 @@ async def api_list_messages(
                 "role": m.role,
                 "content": m.content,
                 "sources": json.loads(m.sources_json) if m.sources_json else [],
+                "verification": json.loads(m.verification_json) if m.verification_json else None,
+                "timings": json.loads(m.timings_json) if m.timings_json else None,
                 "created_at": m.created_at.isoformat() if m.created_at else None,
             }
             for m in rows
@@ -447,7 +472,16 @@ async def api_append_message(
     user: User = current_user
     try:
         get_session(db, user.id, session_id)  # 越权校验
-        msg = append_message(db, user.id, session_id, body.role, body.content, body.sources)
+        msg = append_message(
+            db,
+            user.id,
+            session_id,
+            body.role,
+            body.content,
+            body.sources,
+            verification=body.verification,
+            timings=body.timings,
+        )
     except KBError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     return {"id": msg.id, "role": msg.role, "created_at": msg.created_at.isoformat()}

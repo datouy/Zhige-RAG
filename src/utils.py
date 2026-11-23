@@ -405,4 +405,19 @@ def apply_env_overrides(cfg: dict) -> dict:
             cur[key] = v_lower == "true"
         else:
             cur[key] = val
+
+    # ``RAG_DATA_DIR`` 是工作区级隔离根目录。除显式覆盖的具体路径外，
+    # 原始资料、向量库、评估集和审计日志都应与数据库、备份处于同一根目录，
+    # 避免测试、预发实例误写回项目内的生产数据目录。
+    runtime_root = os.getenv("RAG_DATA_DIR", "").strip()
+    if runtime_root:
+        root = Path(runtime_root).expanduser().resolve()
+        paths = cfg.setdefault("paths", {})
+        vector_store = cfg.setdefault("vector_store", {})
+        if not os.getenv("RAW_DOCS_DIR"):
+            paths["raw_docs"] = str(root / "raw")
+        if not os.getenv("VECTOR_STORE_PERSIST_DIR"):
+            vector_store["persist_directory"] = str(root / "chroma_db")
+        paths["eval"] = str(root / "eval")
+        paths["logs"] = str(root / "logs")
     return cfg

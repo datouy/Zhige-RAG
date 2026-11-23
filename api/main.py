@@ -133,7 +133,8 @@ def _warm_up_models() -> None:
 def _log_orphan_summary() -> None:
     """启动时记录孤儿资源数量，提示可清理（不阻塞启动）。"""
     try:
-        data_dir = ROOT / "data"
+        configured = os.getenv("RAG_DATA_DIR", "").strip()
+        data_dir = Path(configured).expanduser().resolve() if configured else ROOT / "data"
         kg_count = len(list(data_dir.glob("kg_*.db"))) if data_dir.exists() else 0
         if kg_count > 0:
             logger.warning(
@@ -167,6 +168,19 @@ async def lifespan(app: FastAPI):
     logger.info("=" * 50)
 
     try:
+        try:
+            from src.backup_service import apply_pending_restore
+
+            restored = apply_pending_restore()
+            if restored is not None:
+                logger.warning(
+                    "已应用待恢复工作区 %s；恢复前备份：%s",
+                    restored.get("original_name"),
+                    restored.get("safety_backup"),
+                )
+        except Exception as restore_err:
+            logger.error("待恢复工作区应用失败，继续使用当前数据：%s", restore_err)
+
         init_db()
         logger.info("数据库初始化完成")
         _log_orphan_summary()
@@ -309,13 +323,14 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=_allowed_origins,
     allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type", "X-Request-ID"],
 )
 
 
 # =========================== 路由挂载 ===========================
 from api.routes import (
+    admin_router,
     agent_router,
     chat_router,
     eval_router,
@@ -323,9 +338,11 @@ from api.routes import (
     kb_router,
     kg_router,
     mcp_router,
+    onboarding_router,
     saved_agents_router,
     settings_router,
     system_router,
+    team_router,
 )
 
 # 直接使用子路由里写明的 ``Depends(get_current_user)``：每个端点都要拿
@@ -340,6 +357,9 @@ app.include_router(saved_agents_router)
 app.include_router(mcp_router)
 app.include_router(eval_router)
 app.include_router(feedback_router)
+app.include_router(team_router)
+app.include_router(onboarding_router)
+app.include_router(admin_router)
 
 
 # =========================== 异常处理器 ===========================

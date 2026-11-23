@@ -7,8 +7,8 @@ from typing import Any, Dict, List, Optional
 
 from sqlalchemy.orm import Session
 
-from src.db.models import SavedAgent
-from src.kb_service import get_kb
+from src.db.models import SavedAgent, User
+from src.kb_service import get_accessible_kb
 
 
 class SavedAgentError(ValueError):
@@ -64,11 +64,19 @@ def get_saved_agent(db: Session, user_id: str, agent_id: str) -> SavedAgent:
 def saved_agent_runtime(db: Session, user_id: str, agent_id: str) -> Dict[str, Any]:
     """返回经过所有权校验、可安全跨线程传递的 Agent 配置。"""
     agent = get_saved_agent(db, user_id, agent_id)
-    kb = get_kb(db, user_id, agent.kb_id)
+    user = db.query(User).filter(User.id == user_id, User.is_active.is_(True)).first()
+    if user is None:
+        raise SavedAgentError("用户不存在或已停用")
+    kb, access_role = get_accessible_kb(db, user, agent.kb_id)
     return {
         "id": agent.id,
         "name": agent.name,
-        "kb": {"id": kb.id, "collection_name": kb.collection_name},
+        "kb": {
+            "id": kb.id,
+            "collection_name": kb.collection_name,
+            "owner_id": kb.user_id,
+            "access_role": access_role,
+        },
         "instructions": agent.instructions or "",
         "allowed_tools": agent_allowed_tools(agent),
         "max_steps": int(agent.max_steps or 5),

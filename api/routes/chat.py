@@ -18,6 +18,7 @@ import asyncio
 import hashlib
 import time
 import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -46,7 +47,7 @@ from api.deps import (
 )
 from src.data_quality import run_data_pipeline
 from src.db.database import SessionLocal, get_db
-from src.db.models import DocumentRecord, User
+from src.db.models import DocumentRecord, KnowledgeGap, User
 from src.document_loader import load_document, load_directory
 from src.document_meta import enrich_directory, enrich_file
 from src.factories import TenantAwareFactory
@@ -56,6 +57,7 @@ from src.middleware.identity import get_current_user
 from src.monitoring.metrics import metrics_collector
 from src.rag_pipeline import RAGPipeline
 from src.rate_limit import limiter
+from src.team_auth import require_editor
 from src.utils import SUPPORTED_EXTENSIONS, ensure_dir, get_logger, resolve_path
 
 logger = get_logger("api.routes.chat")
@@ -93,6 +95,47 @@ def _allowed_groups(user: User) -> Optional[List[str]]:
     if dept:
         groups.add(dept)
     return sorted(groups)
+
+
+def _record_knowledge_gap(
+    db: Session,
+    user: User,
+    *,
+    query: str,
+    answer: str = "",
+    kb_id: Optional[str] = None,
+    session_id: Optional[str] = None,
+    reason: str = "refused",
+    detail: str = "",
+) -> None:
+    """把拒答沉淀成可处理的知识缺口，避免拒答后无人跟进。"""
+    try:
+        duplicate = (
+            db.query(KnowledgeGap)
+            .filter(
+                KnowledgeGap.user_id == user.id,
+                KnowledgeGap.query == query[:4000],
+                KnowledgeGap.status == "open",
+            )
+            .first()
+        )
+        if duplicate is None:
+            db.add(
+                KnowledgeGap(
+                    user_id=user.id,
+                    kb_id=kb_id,
+                    session_id=session_id,
+                    query=query[:4000],
+                    answer=(answer or "")[:8000],
+                    reason=reason[:50],
+                    detail=(detail or "")[:2000] or None,
+                    status="open",
+                )
+            )
+            db.commit()
+    except Exception as exc:  # noqa: BLE001 - 缺口记录失败不得影响问答
+        db.rollback()
+        logger.warning("知识缺口记录失败（已忽略）: %s", exc)
 
 
 def _safe_filename(filename: Optional[str]) -> str:
@@ -210,6 +253,9 @@ def _register_documents(db: Session, user_id: str, chunks: List[Any], report: Di
             "file_ext": metadata.get("ext"),
             "content_hash": content_hash,
             "updated_at_source": _parse_datetime_safe(metadata.get("updated_at")),
+            "index_status": "indexed",
+            "last_indexed_at": datetime.utcnow(),
+            "last_index_error": None,
         }
         query = db.query(DocumentRecord).filter(
             DocumentRecord.user_id == user_id,
@@ -350,10 +396,24 @@ async def list_documents(
     """列出已入库文档（按 source 聚合，合并数据层台账的状态/权限/更新时间）。需要认证。"""
     user: User = current_user
     try:
-        query = db.query(DocumentRecord).filter(DocumentRecord.user_id == user.id)
-        if kb_id:
-            query = query.filter(DocumentRecord.kb_id == kb_id)
-        records = query.all()
+        from src.kb_service import ensure_default_kb, list_accessible_kbs
+
+        cfg = get_runtime_config()
+        ensure_default_kb(db, user.id, cfg)
+        accessible = list_accessible_kbs(db, user)
+        access_by_kb = {kb.id: (kb, role) for kb, role in accessible}
+        if kb_id and kb_id not in access_by_kb:
+            raise HTTPException(status_code=403, detail="无权访问该知识库")
+        allowed_kb_ids = {kb_id} if kb_id else set(access_by_kb)
+        owner_ids = {kb.user_id for kb, _ in accessible}
+        records = (
+            db.query(DocumentRecord)
+            .filter(
+                DocumentRecord.user_id.in_(owner_ids),
+                DocumentRecord.kb_id.in_(allowed_kb_ids),
+            )
+            .all()
+        )
 
         def _document_type(record: DocumentRecord) -> str:
             ext = str(record.file_ext or "").lower()
@@ -380,6 +440,7 @@ async def list_documents(
 
         documents = [
             {
+                "id": record.id,
                 "source": record.source,
                 "title": record.title,
                 "kb_id": record.kb_id,
@@ -394,6 +455,12 @@ async def list_documents(
                 "created_at": record.created_at.isoformat() if record.created_at else None,
                 "updated_at": record.updated_at.isoformat() if record.updated_at else None,
                 "content_hash": record.content_hash,
+                "index_status": record.index_status,
+                "last_indexed_at": record.last_indexed_at.isoformat()
+                if record.last_indexed_at
+                else None,
+                "last_index_error": record.last_index_error,
+                "access_role": access_by_kb.get(record.kb_id, (None, ""))[1],
             }
             for record in records
         ]
@@ -465,7 +532,7 @@ async def update_document_chunk(
     chunk_id: str,
     body: ChunkUpdateBody,
     kb_id: Optional[str] = None,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_editor),
 ) -> Dict[str, Any]:
     """更新单个分块文本并重嵌向量 + 同步 BM25。需要认证。
 
@@ -475,7 +542,7 @@ async def update_document_chunk(
     user: User = current_user
     try:
         cfg = get_runtime_config()
-        kb = _resolve_kb(user, cfg, kb_id)
+        kb = _resolve_kb(user, cfg, kb_id, required_role="editor")
         store = TenantAwareFactory.get_chroma_store_by_name(kb["collection_name"], cfg)
 
         def _patch() -> Dict[str, Any]:
@@ -497,6 +564,254 @@ async def update_document_chunk(
     except Exception as exc:
         logger.error("更新分块失败: %s", exc)
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+class DocumentStatusBody(BaseModel):
+    status: str = Field(..., pattern="^(active|draft|expired)$")
+
+
+def _editable_document(db: Session, user: User, record_id: str) -> tuple[DocumentRecord, Dict[str, Any]]:
+    from src.kb_service import ensure_default_kb, get_accessible_kb
+
+    record = db.query(DocumentRecord).filter(DocumentRecord.id == record_id).first()
+    if record is None:
+        raise HTTPException(status_code=404, detail="文档不存在")
+    kb_id = record.kb_id
+    if not kb_id:
+        kb_id = ensure_default_kb(db, record.user_id, get_runtime_config()).id
+        record.kb_id = kb_id
+        db.commit()
+    kb, _ = get_accessible_kb(db, user, kb_id, "editor")
+    if kb.user_id != record.user_id:
+        raise HTTPException(status_code=409, detail="文档归属与知识库所有者不一致")
+    return record, {
+        "id": kb.id,
+        "name": kb.name,
+        "collection_name": kb.collection_name,
+        "owner_id": kb.user_id,
+        "access_role": "editor",
+    }
+
+
+def _invalidate_document_runtime(kb: Dict[str, Any]) -> None:
+    try:
+        get_runtime_pipeline(user_id=kb["owner_id"], kb=kb).invalidate_answer_cache()
+    except Exception:
+        logger.debug("文档变更后缓存失效失败", exc_info=True)
+    try:
+        from api.routes.agent import reset_agent_cache
+
+        reset_agent_cache(kb["owner_id"])
+    except Exception:
+        pass
+
+
+@router.patch("/api/v1/documents/{record_id}/status", tags=["文档"])
+async def set_document_status(
+    record_id: str,
+    body: DocumentStatusBody,
+    current_user: User = Depends(require_editor),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """切换 active/draft/expired；状态同步到向量 metadata，检索立即生效。"""
+    record, kb = _editable_document(db, current_user, record_id)
+    cfg = get_runtime_config()
+    store = TenantAwareFactory.get_chroma_store_by_name(kb["collection_name"], cfg)
+    updated = await run_in_threadpool(
+        store.update_metadata_for_source,
+        record.source,
+        {"doc_status": body.status},
+    )
+    record.doc_status = body.status
+    db.commit()
+    _invalidate_document_runtime(kb)
+    try:
+        get_audit_logger().log(
+            AuditAction.DOCUMENT_STATUS,
+            user_id=current_user.id,
+            resource=record.id,
+            details={"source": record.source, "status": body.status},
+            db=db,
+        )
+    except Exception:
+        pass
+    return {
+        "id": record.id,
+        "source": record.source,
+        "doc_status": record.doc_status,
+        "updated_chunks": updated,
+    }
+
+
+@router.delete("/api/v1/documents/{record_id}", tags=["文档"])
+async def delete_document(
+    record_id: str,
+    purge_raw: bool = Query(False, description="同时删除上传目录中的原始文件"),
+    current_user: User = Depends(require_editor),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """按台账 id 删除索引与记录；可选清理原始文件，审计结果可追溯。"""
+    from src.kb_service import refresh_kb_stats
+
+    record, kb = _editable_document(db, current_user, record_id)
+    cfg = get_runtime_config()
+    store = TenantAwareFactory.get_chroma_store_by_name(kb["collection_name"], cfg)
+    deleted_chunks = await run_in_threadpool(
+        store.delete_by_metadata, {"source": record.source}
+    )
+    source_name = record.source
+    owner_id = record.user_id
+    removed_raw = False
+    if purge_raw and not source_name.startswith(("http://", "https://")):
+        raw_base = (
+            resolve_path(cfg.get("paths", {}).get("raw_docs", "data/raw"))
+            / owner_id[:8]
+        ).resolve()
+        candidate = (raw_base / Path(source_name)).resolve()
+        try:
+            candidate.relative_to(raw_base)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="原始文件路径不合法") from None
+        if candidate.is_file():
+            candidate.unlink()
+            removed_raw = True
+    db.delete(record)
+    db.commit()
+    refresh_kb_stats(db, owner_id, kb["id"])
+    _invalidate_document_runtime(kb)
+    try:
+        get_audit_logger().log(
+            AuditAction.DOCUMENT_DELETE,
+            user_id=current_user.id,
+            resource=record_id,
+            details={
+                "source": source_name,
+                "kb_id": kb["id"],
+                "chunks": deleted_chunks,
+                "raw_removed": removed_raw,
+            },
+            db=db,
+        )
+    except Exception:
+        pass
+    return {
+        "deleted": record_id,
+        "source": source_name,
+        "chunks": int(deleted_chunks),
+        "raw_removed": removed_raw,
+    }
+
+
+@router.post("/api/v1/documents/{record_id}/reindex", tags=["文档"])
+async def reindex_document(
+    record_id: str,
+    current_user: User = Depends(require_editor),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """从保留的原始文件重建该文档索引；网页或原始文件缺失时明确拒绝。"""
+    from src.kb_service import refresh_kb_stats
+
+    record, kb = _editable_document(db, current_user, record_id)
+    cfg = get_runtime_config()
+    if record.source.startswith(("http://", "https://")) or str(record.file_ext).lower() == ".url":
+        raise HTTPException(status_code=409, detail="网页资料没有本地原文，请重新导入网址")
+    raw_base = (
+        resolve_path(cfg.get("paths", {}).get("raw_docs", "data/raw"))
+        / record.user_id[:8]
+    ).resolve()
+    raw_path = (raw_base / Path(record.source)).resolve()
+    try:
+        raw_path.relative_to(raw_base)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="原始文件路径不合法") from None
+    if not raw_path.is_file():
+        raise HTTPException(status_code=409, detail="原始文件已不存在，请重新上传后再索引")
+
+    record.index_status = "reindexing"
+    record.last_index_error = None
+    db.commit()
+    try:
+        docs = await run_in_threadpool(
+            enrich_file,
+            raw_path,
+            default_acl=cfg.get("data_quality", {}).get("default_acl", "*"),
+            ocr_cfg=cfg.get("document_loader", {}).get("ocr") or {},
+            xiaomi_cfg=cfg.get("document_loader", {}).get("xiaomi") or {},
+        )
+        if not docs:
+            docs = await run_in_threadpool(
+                load_document,
+                raw_path,
+                pdf_engine=cfg.get("document_loader", {}).get("pdf_engine", "pdfplumber"),
+                encoding=cfg.get("document_loader", {}).get("encoding", "utf-8"),
+                ocr_cfg=cfg.get("document_loader", {}).get("ocr") or {},
+                xiaomi_cfg=cfg.get("document_loader", {}).get("xiaomi") or {},
+            )
+        for doc in docs:
+            doc.metadata["source"] = record.source
+            doc.metadata["title"] = record.title or doc.metadata.get("title") or record.source
+            # 数据准入门只接受 active。重索引草稿/失效资料时先以 active 通过
+            # 解析与切分，生成分块后再恢复台账中的真实业务状态，避免状态
+            # 管理与重建索引互相阻断。
+            doc.metadata["doc_status"] = "active"
+            doc.metadata["acl"] = record.acl or "*"
+            doc.metadata["kb_id"] = kb["id"]
+        chunks, report = await run_in_threadpool(
+            run_data_pipeline,
+            docs,
+            cfg,
+            get_splitter(cfg),
+            _ingest_guard_provider(cfg),
+        )
+        if not chunks:
+            raise RuntimeError(f"原始文件解析后没有可索引内容: {report.get('gate', {})}")
+        for chunk in chunks:
+            chunk.metadata["kb_id"] = kb["id"]
+            chunk.metadata["doc_status"] = record.doc_status
+        store = TenantAwareFactory.get_chroma_store_by_name(kb["collection_name"], cfg)
+        inserted = await run_in_threadpool(
+            store.replace_chunks_for_sources,
+            chunks,
+            [record.source],
+            lambda: _commit_ingestion_metadata(
+                record.user_id, chunks, report, kb["id"]
+            ),
+        )
+        current = db.query(DocumentRecord).filter(DocumentRecord.id == record_id).first()
+        if current is None:
+            raise RuntimeError("索引提交后台账记录丢失")
+        current.index_status = "indexed"
+        current.last_indexed_at = datetime.utcnow()
+        current.last_index_error = None
+        db.commit()
+        refresh_kb_stats(db, record.user_id, kb["id"])
+        _invalidate_document_runtime(kb)
+        try:
+            get_audit_logger().log(
+                AuditAction.DOCUMENT_REINDEX,
+                user_id=current_user.id,
+                resource=record_id,
+                details={"source": record.source, "chunks": inserted},
+                db=db,
+            )
+        except Exception:
+            logger.debug("重新索引审计写入失败", exc_info=True)
+        return {
+            "id": record_id,
+            "status": "indexed",
+            "ingested": int(inserted),
+            "chunks": len(chunks),
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        current = db.query(DocumentRecord).filter(DocumentRecord.id == record_id).first()
+        if current is not None:
+            current.index_status = "failed"
+            current.last_index_error = str(exc)[:2000]
+            db.commit()
+        logger.error("重新索引文档失败: %s", exc)
+        raise HTTPException(status_code=500, detail=f"重新索引失败：{exc}") from exc
 
 
 # =========================== Search ===========================
@@ -606,7 +921,9 @@ def chat_sync(
     try:
         # 指定知识库时在该库内检索，否则用默认库（行为与之前一致）
         kb = _resolve_kb(user, get_runtime_config(), body.kb_id) if body.kb_id else None
-        pipeline = get_runtime_pipeline(user_id=user.id, kb=kb)
+        pipeline = get_runtime_pipeline(
+            user_id=(kb or {}).get("owner_id") or user.id, kb=kb
+        )
         session_id = (body.session_id or "").strip() or "default"
 
         # 长期记忆：显式"记住"指令先行落库（替身 pipeline / 存储缺失时静默跳过）
@@ -640,12 +957,32 @@ def chat_sync(
 
                 append_message(db, user.id, session_id, "user", body.query)
                 append_message(
-                    db, user.id, session_id, "assistant", result.answer or "", result.sources
+                    db,
+                    user.id,
+                    session_id,
+                    "assistant",
+                    result.answer or "",
+                    result.sources,
+                    verification=result.verification,
+                    timings=result.timings,
                 )
             except KBError:
                 pass
             except Exception as exc:  # noqa: BLE001
                 logger.warning("会话消息落库失败（已忽略）: %s", exc)
+
+        verification = result.verification or {}
+        if isinstance(verification, dict) and verification.get("refused"):
+            _record_knowledge_gap(
+                db,
+                user,
+                query=body.query,
+                answer=result.answer or "",
+                kb_id=(kb or {}).get("id"),
+                session_id=session_id if session_id != "default" else None,
+                reason="refused",
+                detail=str(verification.get("status") or ""),
+            )
 
         # 审计 + 指标：问答成功（审计失败不得影响问答本身）
         try:
@@ -692,7 +1029,12 @@ def chat_sync(
 
 
 # =========================== Ingest ===========================
-def _resolve_kb(user: User, cfg: Dict[str, Any], kb_id: Optional[str]) -> Dict[str, str]:
+def _resolve_kb(
+    user: User,
+    cfg: Dict[str, Any],
+    kb_id: Optional[str],
+    required_role: str = "viewer",
+) -> Dict[str, Any]:
     """解析本次写入的目标知识库。
 
     返回**脱离 ORM 会话的普通 dict**（id / name / collection_name）——
@@ -702,18 +1044,25 @@ def _resolve_kb(user: User, cfg: Dict[str, Any], kb_id: Optional[str]) -> Dict[s
     ``kb_id`` 为空时落到默认知识库（保证老客户端行为不变）。
     """
     from src.db.database import SessionLocal
-    from src.kb_service import KBError, ensure_default_kb, get_kb
+    from src.kb_service import KBError, ensure_default_kb, get_accessible_kb
 
     db = SessionLocal()
     try:
         if kb_id:
             try:
-                kb = get_kb(db, user.id, kb_id)
+                kb, access_role = get_accessible_kb(db, user, kb_id, required_role)
             except KBError as exc:
-                raise HTTPException(status_code=404, detail=str(exc)) from exc
+                raise HTTPException(status_code=403, detail=str(exc)) from exc
         else:
             kb = ensure_default_kb(db, user.id, cfg)
-        return {"id": kb.id, "name": kb.name, "collection_name": kb.collection_name}
+            access_role = "owner"
+        return {
+            "id": kb.id,
+            "name": kb.name,
+            "collection_name": kb.collection_name,
+            "owner_id": kb.user_id,
+            "access_role": access_role,
+        }
     finally:
         db.close()
 
@@ -771,7 +1120,7 @@ async def ingest_file(
     version: bool = False,
     kb_id: Optional[str] = Form(None),
     background: bool = Form(False, description="true=异步入库，立即返回job_id，后台解析+upsert"),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_editor),
 ) -> Dict[str, Any]:
     """上传文件并入库。需要认证。
 
@@ -806,8 +1155,8 @@ async def ingest_file(
         if background:
             from src.ingest_jobs import create_job, submit as _submit_job
 
-            _kb_early = _resolve_kb(user, cfg, kb_id)
-            _uid, _kbid, _cfg_snapshot = user.id, _kb_early["id"], dict(cfg)
+            _kb_early = _resolve_kb(user, cfg, kb_id, required_role="editor")
+            _uid, _kbid, _cfg_snapshot = _kb_early["owner_id"], _kb_early["id"], dict(cfg)
             _orig_name = file.filename
             _tmp = str(temp_path)
             job_id = create_job("file", _orig_name or safe_name,
@@ -857,7 +1206,7 @@ async def ingest_file(
                 reporter(0.95, "invalidate")
                 try:
                     from api.deps import get_runtime_pipeline as _grp
-                    _grp(user_id=_uid).invalidate_answer_cache()
+                    _grp(user_id=_uid, kb=_kb_early).invalidate_answer_cache()
                 except Exception:
                     pass
                 _maybe_trigger_kg_build(_uid, _cfg_snapshot)
@@ -914,7 +1263,7 @@ async def ingest_file(
             raise HTTPException(status_code=400, detail="文件解析后没有可用内容")
 
         # 知识库隔离：写入目标知识库专属的 collection
-        kb = _resolve_kb(user, cfg, kb_id)
+        kb = _resolve_kb(user, cfg, kb_id, required_role="editor")
         for c in all_chunks:
             c.metadata["kb_id"] = kb["id"]
         store = TenantAwareFactory.get_chroma_store_by_name(kb["collection_name"], cfg)
@@ -922,7 +1271,7 @@ async def ingest_file(
         def _replace() -> tuple[int, Dict[str, int]]:
             return _replace_changed_sources(
                 store=store,
-                user_id=user.id,
+                user_id=kb["owner_id"],
                 kb_id=kb["id"],
                 chunks=all_chunks,
                 report=report,
@@ -933,11 +1282,11 @@ async def ingest_file(
         # P1：入库成功后失效答案/检索缓存，避免旧答案残留
         try:
             from api.deps import get_runtime_pipeline as _grp_sync
-            _grp_sync(user_id=user.id).invalidate_answer_cache()
+            _grp_sync(user_id=kb["owner_id"], kb=kb).invalidate_answer_cache()
         except Exception:
             pass
 
-        _maybe_trigger_kg_build(user.id, cfg)
+        _maybe_trigger_kg_build(kb["owner_id"], cfg)
 
         return {
             "filename": file.filename,
@@ -1006,7 +1355,7 @@ class IngestURLBody(BaseModel):
 @router.post("/api/v1/ingest/url", tags=["文档"])
 async def ingest_url(
     body: IngestURLBody,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_editor),
 ) -> Dict[str, Any]:
     """抓取网页正文并入库。需要认证。
 
@@ -1028,8 +1377,8 @@ async def ingest_url(
         if body.background:
             from src.ingest_jobs import create_job, submit as _submit_job
 
-            _kb_early = _resolve_kb(user, cfg, body.kb_id)
-            _uid, _kbid = user.id, _kb_early["id"]
+            _kb_early = _resolve_kb(user, cfg, body.kb_id, required_role="editor")
+            _uid, _kbid = _kb_early["owner_id"], _kb_early["id"]
             _cfg_snapshot = dict(cfg)
             _body_url, _body_title = body.url, body.title
             _body_timeout = body.timeout
@@ -1078,7 +1427,7 @@ async def ingest_url(
                 )
                 try:
                     from api.deps import get_runtime_pipeline as _grp
-                    _grp(user_id=_uid).invalidate_answer_cache()
+                    _grp(user_id=_uid, kb=_kb_early).invalidate_answer_cache()
                 except Exception:
                     pass
                 _maybe_trigger_kg_build(_uid, _cfg_snapshot)
@@ -1147,7 +1496,7 @@ async def ingest_url(
             raise HTTPException(status_code=400, detail="网页正文为空，无法入库")
 
         # 知识库隔离：写入目标知识库专属的 collection
-        kb = _resolve_kb(user, cfg, body.kb_id)
+        kb = _resolve_kb(user, cfg, body.kb_id, required_role="editor")
         for c in chunks:
             c.metadata["kb_id"] = kb["id"]
         store = TenantAwareFactory.get_chroma_store_by_name(kb["collection_name"], cfg)
@@ -1155,7 +1504,7 @@ async def ingest_url(
         def _replace() -> tuple[int, Dict[str, int]]:
             return _replace_changed_sources(
                 store=store,
-                user_id=user.id,
+                user_id=kb["owner_id"],
                 kb_id=kb["id"],
                 chunks=chunks,
                 report=report,
@@ -1166,11 +1515,11 @@ async def ingest_url(
         # P1：入库成功后失效答案/检索缓存，避免旧答案残留
         try:
             from api.deps import get_runtime_pipeline as _grp_url
-            _grp_url(user_id=user.id).invalidate_answer_cache()
+            _grp_url(user_id=kb["owner_id"], kb=kb).invalidate_answer_cache()
         except Exception:
             pass
 
-        _maybe_trigger_kg_build(user.id, cfg)
+        _maybe_trigger_kg_build(kb["owner_id"], cfg)
 
         return {
             "url": page["url"],
@@ -1197,7 +1546,7 @@ async def ingest_directory(
     recursive: bool = Form(True),
     kb_id: Optional[str] = Form(None),
     background: bool = Form(False, description="true=异步入库，立即返回job_id"),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_editor),
 ) -> Dict[str, Any]:
     """批量入库指定目录。需要认证。
 
@@ -1208,7 +1557,7 @@ async def ingest_directory(
     user: User = current_user
     try:
         cfg = get_runtime_config()
-        kb = _resolve_kb(user, cfg, kb_id)
+        kb = _resolve_kb(user, cfg, kb_id, required_role="editor")
 
         raw_root = resolve_path(cfg.get("paths", {}).get("raw_docs", "data/raw"))
         user_scope = raw_root / user.id[:8]
@@ -1221,7 +1570,7 @@ async def ingest_directory(
         if background:
             from src.ingest_jobs import create_job, submit as _submit_job
 
-            _kb_e, _uid, _cfg_s = kb, user.id, dict(cfg)
+            _kb_e, _uid, _cfg_s = kb, kb["owner_id"], dict(cfg)
             _tgt, _rec = str(target), bool(recursive)
             job_id = create_job(
                 "dir",
@@ -1268,7 +1617,7 @@ async def ingest_directory(
                 )
                 try:
                     from api.deps import get_runtime_pipeline as _grp2
-                    _grp2(user_id=_uid).invalidate_answer_cache()
+                    _grp2(user_id=_uid, kb=_kb_e).invalidate_answer_cache()
                 except Exception:
                     pass
                 _maybe_trigger_kg_build(_uid, _cfg_s)
@@ -1323,7 +1672,7 @@ async def ingest_directory(
         def _replace() -> tuple[int, Dict[str, int]]:
             return _replace_changed_sources(
                 store=store,
-                user_id=user.id,
+                user_id=kb["owner_id"],
                 kb_id=kb["id"],
                 chunks=all_chunks,
                 report=report,
@@ -1334,11 +1683,11 @@ async def ingest_directory(
         # P1：入库成功后失效答案/检索缓存，避免旧答案残留
         try:
             from api.deps import get_runtime_pipeline as _grp_dir
-            _grp_dir(user_id=user.id).invalidate_answer_cache()
+            _grp_dir(user_id=kb["owner_id"], kb=kb).invalidate_answer_cache()
         except Exception:
             pass
 
-        _maybe_trigger_kg_build(user.id, cfg)
+        _maybe_trigger_kg_build(kb["owner_id"], cfg)
 
         return {
             "dir": str(target),
@@ -1367,11 +1716,15 @@ async def websocket_chat(websocket: WebSocket):
     P1.3：通过 ``LLMConcurrencyGate.semaphore`` 限制并发 LLM 调用，避免
     单实例下被并发 WS 流量击穿。
     """
-    from src.middleware.identity import get_local_user
-
     db = SessionLocal()
     try:
-        ws_user = get_local_user(db)
+        from src.team_auth import websocket_user
+
+        try:
+            ws_user = websocket_user(websocket, db)
+        except PermissionError as auth_exc:
+            await websocket.close(code=1008, reason=str(auth_exc))
+            return
         user_id = ws_user.id
         await websocket.accept()
         while True:
@@ -1415,7 +1768,9 @@ async def websocket_chat(websocket: WebSocket):
 
             # 长期记忆：显式"记住"指令先行落库（失败/替身缺失均不影响问答）
             try:
-                pipeline_probe: RAGPipeline = get_runtime_pipeline(user_id=user_id, kb=kb)
+                pipeline_probe: RAGPipeline = get_runtime_pipeline(
+                    user_id=(kb or {}).get("owner_id") or user_id, kb=kb
+                )
                 lt_probe = getattr(pipeline_probe, "long_term_store", None)
                 if lt_probe is not None:
                     lt_probe.maybe_remember_from_message(user_id, query)
@@ -1450,7 +1805,9 @@ async def websocket_chat(websocket: WebSocket):
             # P1.3：semaphore 保护，避免并发 WS 流量击穿 LLM
             async def _run() -> bool:
                 nonlocal ttft_ms, first_token_time
-                pipeline: RAGPipeline = get_runtime_pipeline(user_id=user_id, kb=kb)
+                pipeline: RAGPipeline = get_runtime_pipeline(
+                    user_id=(kb or {}).get("owner_id") or user_id, kb=kb
+                )
                 watcher = asyncio.create_task(_watch_cancel())
                 try:
                     async for event in pipeline.astream_answer(
@@ -1533,12 +1890,31 @@ async def websocket_chat(websocket: WebSocket):
 
                         append_message(db, user_id, session_id, "user", query)
                         append_message(
-                            db, user_id, session_id, "assistant", answer_buf["text"]
+                            db,
+                            user_id,
+                            session_id,
+                            "assistant",
+                            answer_buf["text"],
+                            metadata_buf["sources"],
+                            verification=metadata_buf["verification"],
+                            timings=metadata_buf["timings"],
                         )
                     except KBError:
                         pass
                     except Exception as exc:  # noqa: BLE001
                         logger.warning("WS 会话消息落库失败（已忽略）: %s", exc)
+                verification = metadata_buf.get("verification") or {}
+                if isinstance(verification, dict) and verification.get("refused"):
+                    _record_knowledge_gap(
+                        db,
+                        ws_user,
+                        query=query,
+                        answer=answer_buf["text"],
+                        kb_id=(kb or {}).get("id"),
+                        session_id=session_id if session_id != "default" else None,
+                        reason="refused",
+                        detail=str(verification.get("status") or ""),
+                    )
                 if was_cancelled:
                     await websocket.send_json(
                         _with_request_id({

@@ -33,14 +33,59 @@ python scripts/chroma_admin.py quarantine --confirm --create-empty
 
 Chroma 依赖已固定到 `1.5.0`。升级前必须先备份并检查，不能直接替换版本。
 
+## 工作区备份与恢复
+
+管理员可在“管理后台 → 备份恢复”执行完整工作区备份。命令行或自动化也可以使用：
+
+```bash
+curl -b cookies.txt -X POST http://localhost:8000/api/v1/admin/backup
+curl -b cookies.txt http://localhost:8000/api/v1/admin/backup/<filename> -o backup.zip
+```
+
+备份包包含：
+
+- SQLite 一致性快照，或 PostgreSQL `pg_dump` 生成的自定义格式转储；
+- `data/chroma_db/` 向量索引；
+- `data/raw/` 原始资料；
+- `data/eval/` 评估集与报告；
+- `data/kg_*.db*` 知识图谱文件；
+- `data/ingest_jobs.json` 入库任务状态；
+- 审计日志和去掉秘密字段的 `config/local_overrides.yaml`。
+
+备份不单独打包 `.env`、模型 API Key、Cookie 或浏览器数据。数据库中的账号
+口令摘要会随工作区保留，以便恢复后继续使用原团队账号；因此备份包应按敏感
+数据保管，并建议存放在加密磁盘或加密对象存储中。
+本地配置覆盖也会移除模型密钥或仅含凭证的配置项。PostgreSQL 环境必须把
+`pg_dump` 与 `pg_restore` 加入 `PATH`。
+
+恢复流程：
+
+1. 管理员在后台选择 ZIP，并输入大写 `RESTORE` 二次确认；
+2. 服务检查清单、SHA-256、路径穿越、软链接、文件数量和解压后总大小；
+3. 校验通过后只在 `data/.restore_staging/` 隔离暂存，当前工作区不变；
+4. 重启知阁。恢复器会在数据库初始化前自动再生成一份当前数据安全备份，然后应用恢复包；
+5. 升级或迁移完成后检查登录、知识库、检索、MCP 审批和入库任务。
+
+恢复结果写入 `data/.restore_status.json`。成功时 `status=applied`，并记录
+`safety_backup`；失败时 `status=failed`，待恢复包会保留，管理员可以修复环境后
+重启重试，或在后台取消。恢复前安全备份位于 `data/.restore_safety/`。
+
+恢复包尚未应用时，可通过以下方式取消：
+
+```bash
+curl -b cookies.txt -X DELETE http://localhost:8000/api/v1/admin/restore
+```
+
 ## 部署边界
 
 当前 K8s 清单固定为单副本，因为 Chroma 与用户知识图谱使用本地文件库，
 多个 Pod 并发写同一 PVC 会损坏索引。需要横向扩容时，应先迁移到集中式向量
 数据库，并为知识图谱、限流和任务状态提供共享存储。
 
-本项目默认无登录，Ingress 只提供集群内部域名。接入公网前必须增加认证代理
-和多用户隔离。
+默认 `ZHIGE_AUTH_MODE=local`，适合单机或个人工作区，不应直接公开到公网。
+多人使用时切换为 `team`，完成管理员初始化并配置 `ZHIGE_BOOTSTRAP_TOKEN`、
+`ZHIGE_COOKIE_SECURE=1`。公网部署仍建议在反向代理层配置 HTTPS、来源限制和
+请求体大小限制，并只授予必要角色。
 
 ## 测试隔离
 
@@ -72,7 +117,9 @@ python scripts/evaluate.py --retrieval-only \
 
 ## 本地数据与部署边界
 
-服务无需登录，所有数据归属固定本地用户 `00000000-0000-0000-0000-000000000001`。
+本地模式无需登录，所有数据归属固定用户
+`00000000-0000-0000-0000-000000000001`。团队模式使用 `/api/v1/team/*`
+登录入口，知识库仍按 owner 隔离，通过成员表授予只读或可编辑共享。
 
 数据位置：
 
@@ -81,6 +128,6 @@ python scripts/evaluate.py --retrieval-only \
 - 原始文档：`data/raw/`
 - 知识图谱：`data/kg.db`
 
-因为默认无认证，**不要直接把服务暴露到公网**；需要公网访问时，请在前面加一层
-自己的认证网关或反向代理。生产部署参考 `docker-compose.yml` 与 `k8s/`。
+单副本 K8s 清单固定沿用本地文件存储，工作区恢复也应按单实例停机窗口执行。
+生产部署参考 `docker-compose.yml` 与 `k8s/`。
 

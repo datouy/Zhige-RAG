@@ -54,7 +54,11 @@ def _load_mcp_tools(user_id: str, allowed_tools: List[str]):
     with SessionLocal() as db:
         servers = (
             db.query(MCPServer)
-            .filter(MCPServer.user_id == user_id, MCPServer.enabled.is_(True))
+            .filter(
+                MCPServer.user_id == user_id,
+                MCPServer.enabled.is_(True),
+                MCPServer.approval_status == "approved",
+            )
             .all()
         )
     timeout = float(os.getenv("MCP_TIMEOUT_SECONDS", "20"))
@@ -247,8 +251,15 @@ async def list_agent_tools(
     try:
         kb = None
         if kb_id:
-            row = get_kb(db, current_user.id, kb_id)
-            kb = {"id": row.id, "collection_name": row.collection_name}
+            from src.kb_service import get_accessible_kb
+
+            row, access_role = get_accessible_kb(db, current_user, kb_id)
+            kb = {
+                "id": row.id,
+                "collection_name": row.collection_name,
+                "owner_id": row.user_id,
+                "access_role": access_role,
+            }
         tools = await run_in_threadpool(_get_agent_tools, current_user.id, kb, None)
         items = [
             {"name": tool.name, "description": tool.description, "parameters": tool.parameters}
@@ -320,10 +331,14 @@ def agent_chat_sync(
 async def websocket_agent(websocket: WebSocket):
     """Agent WebSocket：支持 request_id 隔离和同连接取消。"""
     from src.db.database import SessionLocal
-    from src.middleware.identity import get_local_user
+    from src.team_auth import websocket_user
 
     with SessionLocal() as db:
-        user_id = get_local_user(db).id
+        try:
+            user_id = websocket_user(websocket, db).id
+        except PermissionError as exc:
+            await websocket.close(code=1008, reason=str(exc))
+            return
     await websocket.accept()
 
     tasks: set[asyncio.Task] = set()

@@ -25,6 +25,7 @@ from src.db.models import (
     ChatSession,
     DocumentRecord,
     KnowledgeBase,
+    KnowledgeBaseMember,
     SavedAgent,
     User,
 )
@@ -95,6 +96,71 @@ def get_kb(db: Session, user_id: str, kb_id: str) -> KnowledgeBase:
     if kb is None:
         raise KBError("知识库不存在或无权访问")
     return kb
+
+
+def get_accessible_kb(
+    db: Session,
+    user: User,
+    kb_id: str,
+    required_role: str = "viewer",
+) -> tuple[KnowledgeBase, str]:
+    """按所有者/共享成员/团队管理员解析知识库访问角色。"""
+    from src.team_auth import effective_role, team_mode
+
+    kb = db.query(KnowledgeBase).filter(KnowledgeBase.id == kb_id).first()
+    if kb is None:
+        raise KBError("知识库不存在或无权访问")
+    if kb.user_id == user.id:
+        access = "owner"
+    elif team_mode() and effective_role(user) == "admin":
+        access = "admin"
+    elif team_mode():
+        member = (
+            db.query(KnowledgeBaseMember)
+            .filter(
+                KnowledgeBaseMember.kb_id == kb_id,
+                KnowledgeBaseMember.user_id == user.id,
+            )
+            .first()
+        )
+        access = member.role if member is not None else ""
+    else:
+        access = ""
+    rank = {"": 0, "viewer": 1, "editor": 2, "owner": 3, "admin": 3}
+    if rank.get(access, 0) < rank.get(required_role, 1):
+        raise KBError("无权访问该知识库")
+    return kb, access
+
+
+def list_accessible_kbs(db: Session, user: User) -> List[tuple[KnowledgeBase, str]]:
+    """列出本人知识库与团队共享库，并附带访问角色。"""
+    from src.team_auth import effective_role, team_mode
+
+    owned = {
+        kb.id: (kb, "owner")
+        for kb in db.query(KnowledgeBase).filter(KnowledgeBase.user_id == user.id).all()
+    }
+    if team_mode():
+        if effective_role(user) == "admin":
+            for kb in db.query(KnowledgeBase).all():
+                owned.setdefault(kb.id, (kb, "admin"))
+        else:
+            shared = (
+                db.query(KnowledgeBase, KnowledgeBaseMember.role)
+                .join(KnowledgeBaseMember, KnowledgeBaseMember.kb_id == KnowledgeBase.id)
+                .filter(KnowledgeBaseMember.user_id == user.id)
+                .all()
+            )
+            for kb, role in shared:
+                owned.setdefault(kb.id, (kb, role))
+    return sorted(
+        owned.values(),
+        key=lambda item: (
+            not item[0].is_default,
+            item[0].user_id != user.id,
+            item[0].created_at or datetime.min,
+        ),
+    )
 
 
 def ensure_default_kb(
@@ -450,6 +516,8 @@ def append_message(
     role: str,
     content: str,
     sources: Optional[List[Any]] = None,
+    verification: Optional[Dict[str, Any]] = None,
+    timings: Optional[Dict[str, Any]] = None,
 ) -> ChatMessage:
     """追加一条消息，并更新会话的统计与首条标题。"""
     import json
@@ -460,6 +528,8 @@ def append_message(
         role=role,
         content=content or "",
         sources_json=json.dumps(sources, ensure_ascii=False) if sources else None,
+        verification_json=json.dumps(verification, ensure_ascii=False) if verification else None,
+        timings_json=json.dumps(timings, ensure_ascii=False) if timings else None,
     )
     db.add(message)
 

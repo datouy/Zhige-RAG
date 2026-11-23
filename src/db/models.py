@@ -1,17 +1,17 @@
 """数据库模型。
 
-包含 User、UsageLog 等数据库模型。
+默认仍以固定本地用户运行；设置 ``ZHIGE_AUTH_MODE=team`` 后启用可选的
+团队账号、角色与知识库共享。两种模式共用同一套数据归属字段，因此从本地
+单用户切换到团队模式不会搬库或复制知识。
 
-说明：本服务不需要登录，因此 ``User`` 表里没有口令相关字段，
-也不存在 refresh token 表 —— 全服务只有一个固定的"本地用户"
-（见 :mod:`src.middleware.identity`），它的作用是标记数据归属。
-
-四层架构补充表：
-- DocumentRecord  ：数据层文档登记表（来源/状态/权限/更新时间/内容哈希）
-- FeedbackRecord  ：反馈层用户反馈（好评/差评 + 纠错文本，驱动持续迭代）
-- LongTermMemory  ：长期记忆（用户级键值事实，与即时/检索上下文区分）
-- SavedAgent      ：可复用的检索范围、说明与工具权限
-- MCPServer       ：本机 stdio MCP 工具的连接配置
+治理相关表：
+- DocumentRecord       ：文档台账与索引生命周期
+- FeedbackRecord       ：问答质量反馈
+- KnowledgeGap         ：拒答/缺资料形成的待补知识清单
+- KnowledgeBaseMember  ：知识库共享成员
+- AuthSession          ：不透明会话令牌（只保存哈希）
+- Audit/UsageLog       ：操作与用量审计
+- MCPServer            ：本机 MCP 工具连接及审批状态
 """
 from __future__ import annotations
 import uuid
@@ -26,11 +26,7 @@ Base = declarative_base()
 class User(Base):
     """用户模型。
 
-    服务不提供注册 / 登录，这个表实际只有一行：固定的本地用户。
-    保留它是因为文档、知识库、会话等数据都要记录 ``user_id``。
-
-    历史库里的 ``password_hash`` 列会在启动时被 ``init_db`` 自动删除
-    （见 :mod:`src.db.database` 的 ``_LEGACY_COLUMN_CLEANUP``）。
+    默认模式只有固定的本地管理员；团队模式才使用口令与会话认证。
     """
     __tablename__ = "users"
 
@@ -42,6 +38,9 @@ class User(Base):
     department = Column(String(100), default="", nullable=False)
     is_active = Column(Boolean, default=True)
     is_admin = Column(Boolean, default=False)
+    # team 模式下为 admin/editor/viewer；本地模式固定按 admin 处理。
+    role = Column(String(20), default="viewer", nullable=False)
+    password_hash = Column(String(255), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -58,6 +57,8 @@ class UsageLog(Base):
     tokens_used = Column(Integer, default=0)
     latency_ms = Column(Integer, default=0)
     chunks_accessed = Column(Integer, default=0)
+    resource = Column(String(512), nullable=True)
+    details_json = Column(Text, nullable=True)
     error_message = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
 
@@ -89,6 +90,11 @@ class DocumentRecord(Base):
     chunk_count = Column(Integer, default=0)
     file_ext = Column(String(16), nullable=True)
     updated_at_source = Column(DateTime, nullable=True)  # 源文件的最后修改时间
+    # indexed / reindexing / failed；与业务状态 doc_status 分离，故障重试
+    # 不应把一篇 active 文档伪装成 draft。
+    index_status = Column(String(20), default="indexed", nullable=False)
+    last_indexed_at = Column(DateTime, nullable=True)
+    last_index_error = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -118,6 +124,8 @@ class FeedbackRecord(Base):
     correction = Column(Text, nullable=True)  # 用户给出的纠正/期望答案
     question_type = Column(String(50), nullable=True)  # 可选分类标签
     resolved = Column(Boolean, default=False, index=True)  # 差评是否已处理
+    citation_issue = Column(Boolean, default=False, nullable=False)
+    missing_source = Column(Boolean, default=False, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
 
 
@@ -213,6 +221,8 @@ class ChatMessage(Base):
     role = Column(String(20), nullable=False)  # user / assistant
     content = Column(Text, nullable=False)
     sources_json = Column(Text, nullable=True)
+    verification_json = Column(Text, nullable=True)
+    timings_json = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
 
     __table_args__ = (
@@ -262,6 +272,10 @@ class MCPServer(Base):
     command = Column(String(512), nullable=False)
     args_json = Column(Text, default="[]", nullable=False)
     enabled = Column(Boolean, default=True, nullable=False)
+    # pending / approved / rejected；加载给 Agent 时只读取 approved+enabled
+    approval_status = Column(String(20), default="pending", nullable=False, index=True)
+    approved_by = Column(String(36), nullable=True)
+    approved_at = Column(DateTime, nullable=True)
     tool_count = Column(Integer, default=0, nullable=False)
     last_error = Column(Text, nullable=True)
     last_checked_at = Column(DateTime, nullable=True)
@@ -270,4 +284,62 @@ class MCPServer(Base):
 
     __table_args__ = (
         UniqueConstraint("user_id", "name", name="uq_mcp_server_user_name"),
+    )
+
+
+# ======================== 团队会话与共享 ========================
+
+class AuthSession(Base):
+    """团队登录会话。数据库中只保存令牌哈希，原文令牌仅下发一次。"""
+
+    __tablename__ = "auth_sessions"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(String(36), nullable=False, index=True)
+    token_hash = Column(String(64), nullable=False, unique=True, index=True)
+    user_agent = Column(String(255), nullable=True)
+    expires_at = Column(DateTime, nullable=False, index=True)
+    revoked_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    last_seen_at = Column(DateTime, default=datetime.utcnow)
+
+
+class KnowledgeBaseMember(Base):
+    """知识库共享成员；owner 关系仍保留在 KnowledgeBase.user_id。"""
+
+    __tablename__ = "knowledge_base_members"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    kb_id = Column(String(36), nullable=False, index=True)
+    user_id = Column(String(36), nullable=False, index=True)
+    role = Column(String(20), default="viewer", nullable=False)  # viewer/editor
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("kb_id", "user_id", name="uq_kb_member_user"),
+    )
+
+
+class KnowledgeGap(Base):
+    """未解决知识缺口：由拒答、缺资料反馈或管理员手工登记形成。"""
+
+    __tablename__ = "knowledge_gaps"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(String(36), nullable=False, index=True)
+    kb_id = Column(String(36), nullable=True, index=True)
+    session_id = Column(String(36), nullable=True, index=True)
+    feedback_id = Column(String(36), nullable=True, index=True)
+    query = Column(Text, nullable=False)
+    answer = Column(Text, nullable=True)
+    reason = Column(String(50), default="refused", nullable=False)
+    detail = Column(Text, nullable=True)
+    status = Column(String(20), default="open", nullable=False, index=True)
+    resolution = Column(Text, nullable=True)
+    assigned_to = Column(String(36), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        Index("ix_gap_status_updated", "status", "updated_at"),
     )

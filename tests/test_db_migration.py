@@ -44,4 +44,8 @@ def test_old_document_record_unique_key_is_migrated(tmp_path, monkeypatch):
     assert ("user_id", "kb_id", "source") in unique_columns
     assert ("user_id", "source") not in unique_columns
     with engine.connect() as conn:
-        assert conn.exec_driver_sql("SELECT source FROM document_records").scalar() == "a.md"
+        row = conn.exec_driver_sql(
+            "SELECT source, index_status, last_indexed_at, last_index_error "
+            "FROM document_records"
+        ).one()
+        assert row == ("a.md", "indexed", None, None)

@@ -320,6 +320,33 @@ def get_runtime_pipeline(
     return tenant_pipeline
 
 
+def invalidate_runtime_cache_without_loading(
+    kb: Optional[Dict[str, str]] = None,
+) -> None:
+    """使指定知识库缓存失效，但绝不为此初始化 Pipeline / 模型。
+
+    示例库载入等轻量写入只关心缓存是否过期。此时若调用
+    ``get_runtime_pipeline``，会连带加载 embedding、reranker 和 KG store，
+    首屏体验被无关模型初始化拖慢。
+    """
+    pipeline = _pipeline
+    if pipeline is not None:
+        pipeline.invalidate_answer_cache()
+        shared = getattr(pipeline, "_shared_cache", None)
+    else:
+        from src.cache import build_shared_cache
+
+        shared = build_shared_cache()
+
+    collection_name = str((kb or {}).get("collection_name") or "").strip()
+    if shared is None or not collection_name:
+        return
+    import hashlib
+
+    scope = hashlib.sha1(collection_name.encode("utf-8")).hexdigest()[:16]
+    shared.clear_scope(scope)
+
+
 # =====================================================================
 #  拆分器工厂
 # =====================================================================

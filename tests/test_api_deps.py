@@ -53,6 +53,21 @@ class TestConfigCache:
         assert info.currsize == 0
 
 
+def test_runtime_cache_invalidation_does_not_build_pipeline(monkeypatch):
+    """示例载入等轻量写入不应为了清缓存而初始化完整问答流水线。"""
+    from api import deps
+
+    monkeypatch.setattr(deps, "_pipeline", None)
+    monkeypatch.setattr(
+        deps,
+        "get_pipeline",
+        lambda: (_ for _ in ()).throw(AssertionError("pipeline must stay lazy")),
+    )
+    deps.invalidate_runtime_cache_without_loading(
+        {"collection_name": "demo_collection"}
+    )
+
+
 # =========================== P2.2: Health cache ===========================
 class TestHealthCache:
     """``/api/health`` TTL 缓存：相同 TTL 窗口内重复请求只计算一次。"""
