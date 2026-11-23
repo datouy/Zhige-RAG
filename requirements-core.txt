@@ -46,5 +46,10 @@ tokenizers>=0.15.0,<1.0.0
 
 # ---------- 限流 / 健康检查 / 指标 ----------
 slowapi>=0.1.9
+redis>=5.0.0
+neo4j>=5.20.0            # 企业多副本图谱后端
 psutil>=5.9.0             # /api/health 依赖；缺失会导致 k8s 探针全部失败
 prometheus-client>=0.19.0
+
+# ---------- 企业凭据加密（file 后端可选；env/K8s Secret 可不启用）----------
+cryptography>=42.0.0

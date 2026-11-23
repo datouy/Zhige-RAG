@@ -20,7 +20,7 @@ from fastapi import HTTPException
 from pydantic import BaseModel, Field
 
 from src.db.models import User
-from src.middleware.identity import get_current_user
+from src.middleware.identity import require_admin
 from src.settings_service import (
     SettingsError,
     clear_overrides,
@@ -64,7 +64,7 @@ class TestBody(BaseModel):
 
 @router.get("/api/v1/settings/model", tags=["设置"])
 async def api_get_model_settings(
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_admin),
 ) -> Dict[str, Any]:
     """读取当前模型配置（api_key 已脱敏）。"""
     try:
@@ -77,7 +77,7 @@ async def api_get_model_settings(
 @router.put("/api/v1/settings/model", tags=["设置"])
 async def api_update_model_settings(
     body: ModelSettingsBody,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_admin),
 ) -> Dict[str, Any]:
     """更新模型配置并**立即生效**（无需重启）。
 
@@ -97,7 +97,7 @@ async def api_update_model_settings(
 @router.post("/api/v1/settings/model/test", tags=["设置"])
 async def api_test_model(
     body: TestBody,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_admin),
 ) -> Dict[str, Any]:
     """测试连接。不写入任何配置，可以放心试。"""
     try:
@@ -109,7 +109,7 @@ async def api_test_model(
 
 @router.delete("/api/v1/settings/model", tags=["设置"])
 async def api_clear_model_settings(
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_admin),
 ) -> Dict[str, Any]:
     """清除界面覆盖，恢复到 ``config/config.yaml`` 的配置。"""
     from api.deps import _reset_cached_config, reset_all_singletons

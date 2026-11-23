@@ -23,6 +23,13 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from src.utils import get_logger, load_config, merge_dict, resolve_path
+from src.secrets_store import (
+    SecretStoreError,
+    get_secret,
+    hydrate_config_secrets,
+    set_secret,
+    strip_plaintext_secrets,
+)
 
 logger = get_logger("settings_service")
 
@@ -52,7 +59,21 @@ def load_overrides() -> Dict[str, Any]:
         import yaml
 
         with open(path, "r", encoding="utf-8") as f:
-            return yaml.safe_load(f) or {}
+            raw = yaml.safe_load(f) or {}
+        cleaned, found = strip_plaintext_secrets(raw)
+        if cleaned != raw:
+            persisted = 0
+            for name, value in found.items():
+                try:
+                    persisted += int(set_secret(name, value))
+                except SecretStoreError:
+                    logger.warning("旧明文凭据无法迁移到加密存储: %s", name)
+            save_overrides(cleaned)
+            logger.warning(
+                "已从 local_overrides.yaml 清除明文 api_key；加密迁移成功 %d 项",
+                persisted,
+            )
+        return cleaned
     except Exception as exc:  # noqa: BLE001
         logger.warning("读取 %s 失败，已忽略：%s", path.name, exc)
         return {}
@@ -62,6 +83,9 @@ def save_overrides(data: Dict[str, Any]) -> None:
     """写入覆盖文件（原子写：先写临时文件再替换）。"""
     import yaml
 
+    data, found = strip_plaintext_secrets(data or {})
+    if found:
+        logger.error("拒绝把明文 api_key 写入覆盖文件，非法键数量：%d", len(found))
     path = overrides_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
@@ -85,48 +109,43 @@ def effective_config() -> Dict[str, Any]:
     """主配置 + 覆盖文件的合并结果（覆盖优先）。"""
     base = load_config("config/config.yaml")
     overrides = load_overrides()
-    return merge_dict(base, overrides) if overrides else base
+    merged = merge_dict(base, overrides) if overrides else base
+    return hydrate_config_secrets(merged)
 
 
 # ----------------------------------------------------------------------
 #  读取当前模型设置
 # ----------------------------------------------------------------------
-def _mask(secret: str) -> str:
-    if not secret:
-        return ""
-    secret = str(secret)
-    if secret.startswith("${"):     # config 里引用环境变量的占位符，原样返回
-        return secret
-    return f"{secret[:6]}…" if len(secret) > 8 else "已设置"
-
-
 def get_model_settings(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """返回当前 LLM / Embedding 配置（api_key 脱敏）。"""
     cfg = cfg or effective_config()
     llm = cfg.get("llm") or {}
     emb = cfg.get("embedding") or {}
 
-    def _section(source: Dict[str, Any], backend: str) -> Dict[str, Any]:
+    def _section(source: Dict[str, Any], backend: str, kind: str) -> Dict[str, Any]:
         section = source.get(backend) or {}
+        secret_name = f"{kind}.{backend}.api_key"
+        managed = bool(get_secret(secret_name) or section.get("api_key"))
         return {
             "model": section.get("model") or source.get("model_name", ""),
             "base_url": section.get("base_url", ""),
-            "api_key": _mask(section.get("api_key", "")),
+            "api_key": "已设置" if managed else "",
+            "api_key_managed": managed,
         }
 
     return {
         "llm": {
             "backend": llm.get("backend", "extractive"),
             "local": {"model": llm.get("model_name", ""), "device": llm.get("device", "auto")},
-            "ollama": _section(llm, "ollama"),
-            "openai": _section(llm, "openai"),
+            "ollama": _section(llm, "ollama", "llm"),
+            "openai": _section(llm, "openai", "llm"),
         },
         "embedding": {
             "backend": emb.get("backend", "onnx"),
-            "onnx": _section(emb, "onnx"),
+            "onnx": _section(emb, "onnx", "embedding"),
             "local": {"model": emb.get("model_name", ""), "device": emb.get("device", "auto")},
-            "ollama": _section(emb, "ollama"),
-            "openai": _section(emb, "openai"),
+            "ollama": _section(emb, "ollama", "embedding"),
+            "openai": _section(emb, "openai", "embedding"),
         },
         "supports": {
             "llm_backends": list(SUPPORTED_LLM_BACKENDS),
@@ -143,7 +162,7 @@ def get_model_settings(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
 def _clean_section(payload: Dict[str, Any]) -> Dict[str, Any]:
     """过滤掉空值，避免把空字符串写进配置覆盖掉有效默认值。"""
     out: Dict[str, Any] = {}
-    for key in ("model", "base_url", "api_key"):
+    for key in ("model", "base_url"):
         value = payload.get(key)
         if value is None:
             continue
@@ -182,6 +201,7 @@ def update_model_settings(payload: Dict[str, Any]) -> Dict[str, Any]:
     before = effective_config()
     before_emb = (before.get("embedding") or {}).get("backend", "onnx")
 
+    warnings: list[str] = []
     overrides = load_overrides()
     llm_over = dict(overrides.get("llm") or {})
     emb_over = dict(overrides.get("embedding") or {})
@@ -189,14 +209,38 @@ def update_model_settings(payload: Dict[str, Any]) -> Dict[str, Any]:
     if llm_backend:
         llm_over["backend"] = llm_backend
     for backend in ("ollama", "openai"):
-        section = _clean_section(llm_in.get(backend) or {})
+        raw_section = dict(llm_in.get(backend) or {})
+        api_key = str(raw_section.pop("api_key", "") or "").strip()
+        section = _clean_section(raw_section)
+        if api_key:
+            try:
+                if set_secret(f"llm.{backend}.api_key", api_key):
+                    warnings.append(f"{backend} 对话模型凭据已加密保存")
+                else:
+                    warnings.append(
+                        f"{backend} 对话模型凭据未落盘；请通过环境变量/Secret Manager 提供"
+                    )
+            except SecretStoreError as exc:
+                raise SettingsError(str(exc)) from exc
         if section:
             llm_over[backend] = {**(llm_over.get(backend) or {}), **section}
 
     if emb_backend:
         emb_over["backend"] = emb_backend
     for backend in ("ollama", "openai"):
-        section = _clean_section(emb_in.get(backend) or {})
+        raw_section = dict(emb_in.get(backend) or {})
+        api_key = str(raw_section.pop("api_key", "") or "").strip()
+        section = _clean_section(raw_section)
+        if api_key:
+            try:
+                if set_secret(f"embedding.{backend}.api_key", api_key):
+                    warnings.append(f"{backend} 向量模型凭据已加密保存")
+                else:
+                    warnings.append(
+                        f"{backend} 向量模型凭据未落盘；请通过环境变量/Secret Manager 提供"
+                    )
+            except SecretStoreError as exc:
+                raise SettingsError(str(exc)) from exc
         if section:
             emb_over[backend] = {**(emb_over.get(backend) or {}), **section}
 
@@ -223,7 +267,6 @@ def update_model_settings(payload: Dict[str, Any]) -> Dict[str, Any]:
     _reset_cached_config()
     reset_all_singletons()
 
-    warnings = []
     after = effective_config()
     after_emb = (after.get("embedding") or {}).get("backend", "local")
     if after_emb != before_emb and {after_emb, before_emb} != {"onnx", "local"}:
@@ -284,6 +327,8 @@ def test_model_connection(payload: Dict[str, Any]) -> Dict[str, Any]:
     base_url = str(payload.get("base_url") or "").strip().rstrip("/")
     api_key = str(payload.get("api_key") or "").strip()
     model = str(payload.get("model") or "").strip()
+    if backend in ("ollama", "openai") and not api_key:
+        api_key = get_secret(f"{kind}.{backend}.api_key") or ""
 
     # ---- 本地后端：测的是"依赖与权重就位没有"，不是网络 ----
     if backend == "extractive":

@@ -78,6 +78,7 @@ data/bm25/
 
 # Eval artifacts (runtime)
 data/eval/report.json
+data/eval/ci_gate_report.json
 data/eval/reports/
 !data/eval/reports/.gitkeep
 
@@ -116,3 +117,6 @@ dist/
 
 # 界面写入的本地模型设置（个性化，不进仓库）
 config/local_overrides.yaml
+data/secrets.enc
+data/secrets.enc.tmp
+.secrets/

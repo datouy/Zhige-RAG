@@ -42,7 +42,7 @@ from src.llm import LocalLLM
 from src.rag_pipeline import RAGPipeline
 from src.text_splitter import ChineseTextSplitter, RecursiveTextSplitter
 from src.utils import apply_env_overrides, get_logger, load_config
-from src.vector_store import ChromaStore, hybrid_kwargs
+from src.vector_store import hybrid_kwargs
 
 logger = get_logger("api.deps")
 
@@ -72,7 +72,10 @@ def get_cached_config(path: str = "config/config.yaml") -> Dict[str, Any]:
     # 环境变量最后叠加 —— 容器 / CI 场景下部署者的意图优先，也符合 12-factor。
     # 因此若同一项同时被环境变量与界面设置指定，以环境变量为准；
     # src.settings_service 会在保存时检测并提醒用户。
-    return apply_env_overrides(cfg)
+    cfg = apply_env_overrides(cfg)
+    from src.secrets_store import hydrate_config_secrets
+
+    return hydrate_config_secrets(cfg)
 
 
 def _reset_cached_config() -> None:
@@ -158,7 +161,7 @@ def reset_llm_gate() -> None:
 # =====================================================================
 _pipeline: Optional[RAGPipeline] = None
 _embedding: Optional[EmbeddingModel] = None
-_vector_store: Optional[ChromaStore] = None
+_vector_store: Optional[Any] = None
 _singletons_lock = Lock()
 
 
@@ -181,7 +184,7 @@ def get_embedding() -> Any:
     return _embedding
 
 
-def get_vector_store() -> ChromaStore:
+def get_vector_store() -> Any:
     """获取或创建全局 VectorStore 实例。"""
     global _vector_store
     if _vector_store is None:
@@ -190,6 +193,7 @@ def get_vector_store() -> ChromaStore:
         embed = get_embedding()
         cfg = get_runtime_config()
         from src.embeddings_provider import embedding_collection_name
+        from src.vector_store import create_vector_store
 
         # 非 local 后端会自动带上后端与模型指纹：换 Embedding 模型会改变向量
         # 维度，复用旧 collection 会直接报错，也会让检索结果不可信。
@@ -199,12 +203,15 @@ def get_vector_store() -> ChromaStore:
         )
         with _singletons_lock:
             if _vector_store is None:
-                _vector_store = ChromaStore(
-                    persist_directory=cfg["vector_store"]["persist_directory"],
+                vs_cfg = cfg.get("vector_store", {})
+                _vector_store = create_vector_store(
+                    backend=vs_cfg.get("backend", "chroma"),
+                    pgvector_dsn=vs_cfg.get("pgvector_dsn", ""),
+                    persist_directory=vs_cfg.get("persist_directory", "data/chroma_db"),
                     collection_name=collection,
                     embedding_model=embed,
-                    distance_fn=cfg["vector_store"].get("distance_fn", "cosine"),
-            **hybrid_kwargs(cfg.get("vector_store", {})),
+                    distance_fn=vs_cfg.get("distance_fn", "cosine"),
+                    **hybrid_kwargs(vs_cfg),
                 )
     return _vector_store
 
