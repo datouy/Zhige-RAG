@@ -115,6 +115,10 @@ def get_rate_limit_key(request: Request, username: Optional[str] = None) -> str:
     return f"ip:{get_real_client_ip(request)}"
 
 
-#: 全局限流器实例。所有路由与 ``api/main.py`` 共用同一个，
-#: 这样 ``app.state.limiter`` 与各端点的 ``@limiter.limit`` 才作用在同一份计数上。
-limiter = Limiter(key_func=get_rate_limit_key)
+#: 多副本部署必须使用 Redis 统一计数；本地默认使用内存后端。
+_RATE_LIMIT_STORAGE = (
+    os.getenv("RATE_LIMIT_STORAGE_URL", "").strip()
+    or os.getenv("REDIS_URL", "").strip()
+    or "memory://"
+)
+limiter = Limiter(key_func=get_rate_limit_key, storage_uri=_RATE_LIMIT_STORAGE)

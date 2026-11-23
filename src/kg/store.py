@@ -420,9 +420,16 @@ class SQLiteGraphStore(KGStore):
 
 
 class Neo4jStore(KGStore):
-    """Optional Neo4j backend."""
+    """Neo4j backend；所有节点和关系都带 tenant_id，多副本共享时仍按用户隔离。"""
 
-    def __init__(self, uri: str, user: str, password: str, database: str = "neo4j") -> None:
+    def __init__(
+        self,
+        uri: str,
+        user: str,
+        password: str,
+        database: str = "neo4j",
+        tenant_id: str = "default",
+    ) -> None:
         try:
             from neo4j import GraphDatabase  # type: ignore
         except ImportError as exc:
@@ -431,6 +438,7 @@ class Neo4jStore(KGStore):
         self.user = user
         self.password = password
         self.database = database or "neo4j"
+        self.tenant_id = str(tenant_id or "default")
         self.driver = GraphDatabase.driver(uri, auth=(user, password))
 
     def _session(self):
@@ -444,8 +452,10 @@ class Neo4jStore(KGStore):
             count = 0
             for e in entities:
                 tx.run(
-                    "MERGE (n:Entity {name: $name}) SET n.type = $type, n.description = $description, n.aliases = $aliases, n.attributes = $attributes, n.created_at = datetime()",
-                    {"name": e.name, "type": e.type, "description": e.description, "aliases": [a for a in e.aliases], "attributes": dict(e.attributes)},
+                    "MERGE (n:Entity {name: $name, tenant_id: $tenant_id}) "
+                    "SET n.type = $type, n.description = $description, n.aliases = $aliases, "
+                    "n.attributes = $attributes, n.created_at = datetime()",
+                    {"name": e.name, "tenant_id": self.tenant_id, "type": e.type, "description": e.description, "aliases": [a for a in e.aliases], "attributes": dict(e.attributes)},
                 )
                 count += 1
             tx.commit()
@@ -459,8 +469,13 @@ class Neo4jStore(KGStore):
             count = 0
             for r in relations:
                 tx.run(
-                    "MATCH (a:Entity {name: $source}) MATCH (b:Entity {name: $target}) MERGE (a)-[rel:RELATION {type: $type}]->(b) SET rel.description = $description, rel.weight = $weight, rel.attributes = $attributes, rel.source_doc = $source_doc, rel.confidence = $confidence, rel.created_at = datetime()",
-                    {"source": r.source, "target": r.target, "type": r.type, "description": r.description, "weight": float(r.weight), "attributes": dict(r.attributes), "source_doc": r.attributes.get("source_doc", ""), "confidence": float(r.attributes.get("confidence", r.weight))},
+                    "MATCH (a:Entity {name: $source, tenant_id: $tenant_id}) "
+                    "MATCH (b:Entity {name: $target, tenant_id: $tenant_id}) "
+                    "MERGE (a)-[rel:RELATION {type: $type, tenant_id: $tenant_id}]->(b) "
+                    "SET rel.description = $description, rel.weight = $weight, "
+                    "rel.attributes = $attributes, rel.source_doc = $source_doc, "
+                    "rel.confidence = $confidence, rel.created_at = datetime()",
+                    {"source": r.source, "target": r.target, "tenant_id": self.tenant_id, "type": r.type, "description": r.description, "weight": float(r.weight), "attributes": dict(r.attributes), "source_doc": r.attributes.get("source_doc", ""), "confidence": float(r.attributes.get("confidence", r.weight))},
                 )
                 count += 1
             tx.commit()
@@ -469,8 +484,8 @@ class Neo4jStore(KGStore):
     def get_entity(self, name: str) -> Optional[Entity]:
         with self._session() as session:
             record = session.run(
-                "MATCH (n:Entity {name: $name}) RETURN n.name AS name, n.type AS type, n.description AS description, n.aliases AS aliases, n.attributes AS attributes",
-                {"name": name},
+                "MATCH (n:Entity {name: $name, tenant_id: $tenant_id}) RETURN n.name AS name, n.type AS type, n.description AS description, n.aliases AS aliases, n.attributes AS attributes",
+                {"name": name, "tenant_id": self.tenant_id},
             ).single()
             if not record:
                 return None
@@ -486,13 +501,13 @@ class Neo4jStore(KGStore):
         with self._session() as session:
             if fuzzy:
                 records = session.run(
-                    "MATCH (n:Entity) WHERE toLower(n.name) CONTAINS toLower($name) RETURN n.name AS name, n.type AS type, n.description AS description, n.aliases AS aliases, n.attributes AS attributes LIMIT $limit",
-                    {"name": name, "limit": limit},
+                    "MATCH (n:Entity {tenant_id: $tenant_id}) WHERE toLower(n.name) CONTAINS toLower($name) RETURN n.name AS name, n.type AS type, n.description AS description, n.aliases AS aliases, n.attributes AS attributes LIMIT $limit",
+                    {"name": name, "tenant_id": self.tenant_id, "limit": limit},
                 ).data()
             else:
                 records = session.run(
-                    "MATCH (n:Entity {name: $name}) RETURN n.name AS name, n.type AS type, n.description AS description, n.aliases AS aliases, n.attributes AS attributes LIMIT $limit",
-                    {"name": name, "limit": limit},
+                    "MATCH (n:Entity {name: $name, tenant_id: $tenant_id}) RETURN n.name AS name, n.type AS type, n.description AS description, n.aliases AS aliases, n.attributes AS attributes LIMIT $limit",
+                    {"name": name, "tenant_id": self.tenant_id, "limit": limit},
                 ).data()
             return [
                 Entity(
@@ -511,13 +526,13 @@ class Neo4jStore(KGStore):
             in_records: List[dict] = []
             if direction in ("both", "out"):
                 out_records = session.run(
-                    "MATCH (a:Entity {name: $name})-[r:RELATION]->(b:Entity) RETURN a.name AS source, b.name AS target, r.type AS type, r.description AS description, r.weight AS weight, r.attributes AS attributes, r.source_doc AS source_doc, r.confidence AS confidence",
-                    {"name": entity_name},
+                    "MATCH (a:Entity {name: $name, tenant_id: $tenant_id})-[r:RELATION {tenant_id: $tenant_id}]->(b:Entity {tenant_id: $tenant_id}) RETURN a.name AS source, b.name AS target, r.type AS type, r.description AS description, r.weight AS weight, r.attributes AS attributes, r.source_doc AS source_doc, r.confidence AS confidence",
+                    {"name": entity_name, "tenant_id": self.tenant_id},
                 ).data()
             if direction in ("both", "in"):
                 in_records = session.run(
-                    "MATCH (a:Entity {name: $name})<-[r:RELATION]-(b:Entity) RETURN b.name AS source, a.name AS target, r.type AS type, r.description AS description, r.weight AS weight, r.attributes AS attributes, r.source_doc AS source_doc, r.confidence AS confidence",
-                    {"name": entity_name},
+                    "MATCH (a:Entity {name: $name, tenant_id: $tenant_id})<-[r:RELATION {tenant_id: $tenant_id}]-(b:Entity {tenant_id: $tenant_id}) RETURN b.name AS source, a.name AS target, r.type AS type, r.description AS description, r.weight AS weight, r.attributes AS attributes, r.source_doc AS source_doc, r.confidence AS confidence",
+                    {"name": entity_name, "tenant_id": self.tenant_id},
                 ).data()
 
             def _to_rel(rec):
@@ -533,6 +548,10 @@ class Neo4jStore(KGStore):
             return [_to_rel(rec) for rec in out_records] + [_to_rel(rec) for rec in in_records]
 
     def query_cypher(self, cypher: str, params: Optional[Dict] = None) -> List[Dict]:
+        # 原始 Cypher 无法保证行级租户隔离，只允许固定模板查询使用安全方法。
+        raise PermissionError("Neo4j 原始 Cypher 仅允许系统管理员通过受控接口执行")
+
+    def query_cypher_admin(self, cypher: str, params: Optional[Dict] = None) -> List[Dict]:
         with self._session() as session:
             try:
                 result = session.run(cypher, dict(params or {}))
@@ -542,16 +561,25 @@ class Neo4jStore(KGStore):
 
     def count(self) -> Dict[str, int]:
         with self._session() as session:
-            entities = session.run("MATCH (n:Entity) RETURN count(n) AS c").single()["c"]
-            relations = session.run("MATCH ()-[r:RELATION]->() RETURN count(r) AS c").single()["c"]
+            entities = session.run(
+                "MATCH (n:Entity {tenant_id: $tenant_id}) RETURN count(n) AS c",
+                {"tenant_id": self.tenant_id},
+            ).single()["c"]
+            relations = session.run(
+                "MATCH ()-[r:RELATION {tenant_id: $tenant_id}]->() RETURN count(r) AS c",
+                {"tenant_id": self.tenant_id},
+            ).single()["c"]
             return {"entities": int(entities), "relations": int(relations)}
 
     def clear(self) -> None:
         with self._session() as session:
-            session.run("MATCH (n:Entity) DETACH DELETE n")
+            session.run(
+                "MATCH (n:Entity {tenant_id: $tenant_id}) DETACH DELETE n",
+                {"tenant_id": self.tenant_id},
+            )
 
 
-def create_kg_store(config: Dict) -> KGStore:
+def create_kg_store(config: Dict, tenant_id: str = "default") -> KGStore:
     """Create KGStore based on config, fallback to SQLite if neo4j is unavailable."""
     backend = (config.get("backend") or "sqlite").lower()
     if backend == "neo4j":
@@ -562,10 +590,13 @@ def create_kg_store(config: Dict) -> KGStore:
                 user=str(neo4j_cfg.get("user", "neo4j")),
                 password=str(neo4j_cfg.get("password", "")),
                 database=str(neo4j_cfg.get("database", "neo4j")),
+                tenant_id=tenant_id,
             )
             return store
         except Exception as exc:
             from src.utils import get_logger
             get_logger("kg.store").warning("Neo4j 不可用，回退到 SQLite: %s", exc)
+            if bool(config.get("strict_backend", False)):
+                raise
     sqlite_path = config.get("sqlite_path", "data/kg.db")
     return SQLiteGraphStore(db_path=sqlite_path)

@@ -97,6 +97,21 @@ class BaseVectorStore:
     def count(self) -> int:  # pragma: no cover
         raise NotImplementedError
 
+    def get_by_source(self, source: str, where=None):  # pragma: no cover
+        raise NotImplementedError
+
+    def get_by_ids(self, ids):  # pragma: no cover
+        raise NotImplementedError
+
+    def update_chunk(self, chunk_id: str, text: str, embedding, metadata):  # pragma: no cover
+        raise NotImplementedError
+
+    def list_sources(self, where=None):  # pragma: no cover
+        raise NotImplementedError
+
+    def delete_collection(self) -> bool:  # pragma: no cover
+        raise NotImplementedError
+
 
 def create_vector_store(
     backend: str = "chroma",
@@ -948,6 +963,37 @@ class ChromaStore(BaseVectorStore):
             hits = [h for _, h in sorted(zip(indices, hits), key=lambda pair: pair[0])]
         return hits
 
+    def get_by_ids(self, ids: Sequence[str]) -> List[Hit]:
+        """按 id 读取分块；Chroma 与 pgvector 的统一接口。"""
+        ids = [str(item) for item in (ids or []) if item]
+        if not ids:
+            return []
+        data = self.collection.get(ids=ids, include=["documents", "metadatas"])
+        got_ids = data.get("ids") or []
+        docs = data.get("documents") or []
+        metas = data.get("metadatas") or []
+        return [
+            Hit(
+                id=got_ids[i],
+                text=docs[i] if i < len(docs) else "",
+                score=1.0,
+                metadata=metas[i] if i < len(metas) else {},
+            )
+            for i in range(len(got_ids))
+        ]
+
+    def update_chunk(self, chunk_id: str, text: str, embedding, metadata) -> bool:
+        self.collection.upsert(
+            ids=[chunk_id],
+            documents=[text],
+            embeddings=[list(map(float, embedding))],
+            metadatas=[metadata],
+        )
+        if self._bm25 is not None:
+            self._bm25.upsert_documents([chunk_id], [text], [metadata])
+        self._invalidate_count_cache(invalidate_bm25=False)
+        return True
+
     def query(
         self,
         query_text: str,
@@ -1063,11 +1109,11 @@ class ChromaStore(BaseVectorStore):
         self._invalidate_count_cache(invalidate_bm25=False)
         return before - after
 
-    def list_sources(self) -> List[Dict[str, Any]]:
+    def list_sources(self, where: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         """列出所有来源文档及其分块数。"""
         if self.count() == 0:
             return []
-        data = self.collection.get(include=["metadatas"])
+        data = self.collection.get(where=where, include=["metadatas"]) if where else self.collection.get(include=["metadatas"])
         metas = data.get("metadatas") or []
         agg: Dict[str, Dict[str, Any]] = {}
         for m in metas:
@@ -1093,3 +1139,12 @@ class ChromaStore(BaseVectorStore):
         )
         self._invalidate_count_cache()
         logger.warning("集合 %s 已重置", self.collection_name)
+
+    def delete_collection(self) -> bool:
+        try:
+            self.client.delete_collection(self.collection_name)
+            self._invalidate_count_cache()
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("删除 collection %s 失败: %s", self.collection_name, exc)
+            return False

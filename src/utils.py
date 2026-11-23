@@ -415,6 +415,22 @@ def apply_env_overrides(cfg: dict) -> dict:
         # ---- 存储路径（容器 / 测试环境隔离）----
         "VECTOR_STORE_PERSIST_DIR": ("vector_store", "persist_directory"),
         "RAW_DOCS_DIR": ("paths", "raw_docs"),
+        # ---- 向量 / 图谱集中式后端（企业多副本）----
+        "VECTOR_STORE_BACKEND": ("vector_store", "backend"),
+        "PGVECTOR_DSN": ("vector_store", "pgvector_dsn"),
+        "KG_BACKEND": ("knowledge_graph", "backend"),
+        "KG_STRICT_BACKEND": ("knowledge_graph", "strict_backend"),
+        "NEO4J_URI": ("knowledge_graph", "neo4j", "uri"),
+        "NEO4J_USER": ("knowledge_graph", "neo4j", "user"),
+        "NEO4J_PASSWORD": ("knowledge_graph", "neo4j", "password"),
+        "NEO4J_DATABASE": ("knowledge_graph", "neo4j", "database"),
+        # ---- 企业身份 ----
+        "AUTH_MODE": ("security", "mode"),
+        "AUTH_SESSION_TTL_MINUTES": ("security", "session_ttl_minutes"),
+        "AUTH_MAX_FAILED_ATTEMPTS": ("security", "max_failed_attempts"),
+        "AUTH_LOCK_MINUTES": ("security", "lock_minutes"),
+        "AUTH_COOKIE_SECURE": ("security", "cookie_secure"),
+        "AUTH_ALLOW_TESTCLIENT": ("security", "allow_testclient"),
     }
     for env_key, path in mapping.items():
         val = os.environ.get(env_key)

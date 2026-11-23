@@ -8,9 +8,14 @@ metadata:
     version: v1
 data:
   # Application settings
-  APP_VERSION: "0.3.0"
+  APP_VERSION: "0.4.0"
   LOG_LEVEL: "INFO"
   LOG_FORMAT: "json"
+
+  # Enterprise authentication (single-replica manifest)
+  AUTH_MODE: "enterprise"
+  AUTH_COOKIE_SECURE: "true"
+  SECRETS_BACKEND: "env"
 
   # Database settings
   DB_TYPE: "postgresql"

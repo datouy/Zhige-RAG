@@ -21,6 +21,15 @@ services:
       # Database（口令一律走环境变量，禁止明文写死在 compose 里；
       # 未设置时 compose 会直接报错退出，而不是静默用弱口令启动）
       - DATABASE_URL=postgresql+psycopg://${POSTGRES_USER:-raguser}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD 必须设置（见 .env.example）}@postgres:5432/${POSTGRES_DB:-chineseragkb}
+      - REDIS_URL=redis://redis:6379/0
+      - RATE_LIMIT_STORAGE_URL=redis://redis:6379/0
+      # ---- 企业认证 ----
+      - AUTH_MODE=${AUTH_MODE:-enterprise}
+      - AUTH_COOKIE_SECURE=${AUTH_COOKIE_SECURE:-false}
+      - SECRETS_BACKEND=${SECRETS_BACKEND:-env}
+      - RATE_LIMIT_QUERY=${RATE_LIMIT_QUERY:-60/minute}
+      - BOOTSTRAP_ADMIN_USERNAME=${BOOTSTRAP_ADMIN_USERNAME:-admin}
+      - BOOTSTRAP_ADMIN_PASSWORD=${BOOTSTRAP_ADMIN_PASSWORD:?必须设置初始管理员强口令}
       # ---- 模型后端 ----
       # 默认无 LLM：原文摘录 + ONNX 向量，模型已打进 lite 镜像。
       - LLM_BACKEND=${LLM_BACKEND:-extractive}
@@ -33,8 +42,6 @@ services:
       - OPENAI_MODEL=${OPENAI_MODEL:-deepseek-chat}
       # Security
       - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-http://localhost:8000,http://127.0.0.1:8000}
-      # Rate Limiting
-      - RATE_LIMIT_STORAGE_URL=redis://redis:6379/0
       # Chroma
       - VECTOR_STORE_PERSIST_DIR=/app/data/chroma
       # Paths

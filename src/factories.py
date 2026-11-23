@@ -17,9 +17,9 @@ from typing import Any, Dict, List, Optional, Set
 from threading import Lock
 
 from src.utils import get_logger
-from src.vector_store import ChromaStore, hybrid_kwargs
+from src.vector_store import BaseVectorStore, create_vector_store, hybrid_kwargs
 from src.embeddings import EmbeddingModel
-from src.kg.store import SQLiteGraphStore
+from src.kg.store import create_kg_store
 
 logger = get_logger("factories")
 
@@ -48,11 +48,11 @@ def _sanitize_user_id(user_id: str) -> str:
 class TenantAwareFactory:
     """多租户组件工厂，按 user_id 隔离资源。"""
     _lock = Lock()
-    _chroma_stores: Dict[str, ChromaStore] = {}
+    _chroma_stores: Dict[str, BaseVectorStore] = {}
     # user_id -> 其名下的 collection 全名集合（用于 cleanup 反查，
     # 因为 chroma_stores 的 key 是脱敏后的名字，无法从 user_id 直接匹配）
     _user_collections: Dict[str, Set[str]] = {}
-    _kg_stores: Dict[str, SQLiteGraphStore] = {}
+    _kg_stores: Dict[str, Any] = {}
     _embedding: Optional[EmbeddingModel] = None
 
     @classmethod
@@ -75,7 +75,7 @@ class TenantAwareFactory:
         return cls._embedding
 
     @classmethod
-    def get_chroma_store(cls, user_id: str, config: dict) -> ChromaStore:
+    def get_chroma_store(cls, user_id: str, config: dict) -> BaseVectorStore:
         """获取用户专属的 ChromaStore。
 
         collection_name 格式：{sanitized_user_id}_{base_collection_name}
@@ -97,47 +97,54 @@ class TenantAwareFactory:
             embed = cls.get_embedding(config)
             with cls._lock:
                 if collection_name not in cls._chroma_stores:
-                    persist_dir = config["vector_store"]["persist_directory"]
-                    cls._chroma_stores[collection_name] = ChromaStore(
-                        persist_directory=persist_dir,
+                    vs_cfg = config.get("vector_store", {})
+                    cls._chroma_stores[collection_name] = create_vector_store(
+                        backend=vs_cfg.get("backend", "chroma"),
+                        pgvector_dsn=vs_cfg.get("pgvector_dsn", ""),
+                        persist_directory=vs_cfg.get("persist_directory", "data/chroma_db"),
                         collection_name=collection_name,
                         embedding_model=embed,
-                        distance_fn=config["vector_store"].get("distance_fn", "cosine"),
-            **hybrid_kwargs(config.get("vector_store", {})),
+                        distance_fn=vs_cfg.get("distance_fn", "cosine"),
+                        **hybrid_kwargs(vs_cfg),
                     )
                     cls._user_collections.setdefault(user_id, set()).add(collection_name)
         return cls._chroma_stores[collection_name]
 
     @classmethod
-    def get_chroma_store_by_name(cls, collection_name: str, config: dict) -> ChromaStore:
+    def get_chroma_store_by_name(cls, collection_name: str, config: dict) -> BaseVectorStore:
         """通过完整 collection_name 获取 ChromaStore（不隔离用户）。"""
         if collection_name not in cls._chroma_stores:
             embed = cls.get_embedding(config)
             with cls._lock:
                 if collection_name not in cls._chroma_stores:
-                    persist_dir = config["vector_store"]["persist_directory"]
-                    cls._chroma_stores[collection_name] = ChromaStore(
-                        persist_directory=persist_dir,
+                    vs_cfg = config.get("vector_store", {})
+                    cls._chroma_stores[collection_name] = create_vector_store(
+                        backend=vs_cfg.get("backend", "chroma"),
+                        pgvector_dsn=vs_cfg.get("pgvector_dsn", ""),
+                        persist_directory=vs_cfg.get("persist_directory", "data/chroma_db"),
                         collection_name=collection_name,
                         embedding_model=embed,
-                        distance_fn=config["vector_store"].get("distance_fn", "cosine"),
-            **hybrid_kwargs(config.get("vector_store", {})),
+                        distance_fn=vs_cfg.get("distance_fn", "cosine"),
+                        **hybrid_kwargs(vs_cfg),
                     )
         return cls._chroma_stores[collection_name]
 
     @classmethod
-    def get_kg_store(cls, user_id: str, config: dict) -> SQLiteGraphStore:
-        """获取用户专属的 KG SQLite Store。
-
-        db_path 格式：{项目根}/data/kg_{user_id}.db
-        """
+    def get_kg_store(cls, user_id: str, config: dict) -> Any:
+        """获取用户专属 KG Store（SQLite 或带 tenant_id 的集中式 Neo4j）。"""
         if user_id not in cls._kg_stores:
             with cls._lock:
                 if user_id not in cls._kg_stores:
-                    # 锚定项目根目录，避免受进程工作目录影响
-                    db_path = _runtime_data_dir() / f"kg_{user_id}.db"
-                    db_path.parent.mkdir(parents=True, exist_ok=True)
-                    cls._kg_stores[user_id] = SQLiteGraphStore(db_path=str(db_path))
+                    kg_cfg = dict(config.get("knowledge_graph") or {})
+                    backend = str(kg_cfg.get("backend", "sqlite")).lower()
+                    if backend == "sqlite":
+                        db_path = _runtime_data_dir() / f"kg_{user_id}.db"
+                        db_path.parent.mkdir(parents=True, exist_ok=True)
+                        kg_cfg["sqlite_path"] = str(db_path)
+                    else:
+                        # 集中式后端不可静默回退到每个 Pod 的本地文件。
+                        kg_cfg.setdefault("strict_backend", True)
+                    cls._kg_stores[user_id] = create_kg_store(kg_cfg, tenant_id=user_id)
         return cls._kg_stores[user_id]
 
     @classmethod
@@ -154,7 +161,7 @@ class TenantAwareFactory:
             for key in cls._chroma_stores:
                 if key.startswith(f"{safe_uid}_"):
                     names.add(key)
-            stores: List[ChromaStore] = [
+            stores: List[BaseVectorStore] = [
                 cls._chroma_stores.pop(name) for name in names if name in cls._chroma_stores
             ]
             cls._user_collections.pop(user_id, None)
@@ -163,7 +170,11 @@ class TenantAwareFactory:
         # 慢操作放在锁外：删除 collection 与关闭 KG 连接都是 IO
         for store in stores:
             try:
-                store.client.delete_collection(store.collection_name)
+                delete = getattr(store, "delete_collection", None)
+                if callable(delete):
+                    delete()
+                else:
+                    store.client.delete_collection(store.collection_name)
                 logger.info("已删除用户 %s 的 collection %s", user_id, store.collection_name)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("删除 collection %s 失败: %s", store.collection_name, exc)
