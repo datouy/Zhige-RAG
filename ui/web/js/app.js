@@ -27,6 +27,20 @@ class ChatApp {
         this.searchSequence = 0;
         this.searchTimer = null;
         this.reconnectTimer = null;
+        this.authStatus = null;
+        this.currentUser = null;
+        this.authGateActive = false;
+        this.appBootstrapped = false;
+        this.onboarding = null;
+        this.currentVerification = null;
+        this.currentTimings = {};
+        this.completedRequestId = null;
+        this.lastAssistantMessage = null;
+        this.feedbackContext = null;
+        this.agentTemplates = [];
+        this.adminTab = "overview";
+        this.adminTeamData = null;
+        this.evaluationResult = null;
         this.el = {};
         this.init();
     }
@@ -36,6 +50,7 @@ class ChatApp {
         this.bindEvents();
         this.updateShortcutLabel();
         try {
+            if (!(await this.ensureAuthenticated())) return;
             await this.bootstrap();
         } catch (error) {
             this.showAlert(`启动失败：${error.message}`, "error");
@@ -64,6 +79,13 @@ class ChatApp {
             "agent-form-result", "agent-delete", "agent-cancel", "agent-save",
             "mcp-open", "mcp-modal", "mcp-servers-list", "mcp-form", "mcp-name",
             "mcp-command", "mcp-args", "mcp-form-result",
+            "auth-gate", "auth-login-form", "auth-login", "auth-password", "auth-login-result",
+            "auth-bootstrap-form", "auth-bootstrap-name", "auth-bootstrap-email",
+            "auth-bootstrap-password", "auth-bootstrap-token", "auth-bootstrap-token-row",
+            "auth-bootstrap-result", "feedback-modal", "feedback-form", "feedback-type",
+            "feedback-correction", "feedback-citation", "feedback-missing", "feedback-result",
+            "feedback-submit", "admin-modal", "admin-tabs", "admin-content", "admin-open",
+            "team-logout", "account-summary",
         ];
         ids.forEach((id) => { this.el[id] = document.getElementById(id); });
     }
@@ -104,6 +126,26 @@ class ChatApp {
         this.el["mcp-form"]?.addEventListener("submit", (event) => {
             event.preventDefault();
             this.createMcpServer();
+        });
+        this.el["auth-login-form"]?.addEventListener("submit", (event) => {
+            event.preventDefault();
+            this.loginTeam();
+        });
+        this.el["auth-bootstrap-form"]?.addEventListener("submit", (event) => {
+            event.preventDefault();
+            this.bootstrapTeam();
+        });
+        this.el["feedback-form"]?.addEventListener("submit", (event) => {
+            event.preventDefault();
+            this.submitNotHelpfulFeedback();
+        });
+        this.el["admin-open"]?.addEventListener("click", () => this.openAdmin());
+        this.el["team-logout"]?.addEventListener("click", () => this.logoutTeam());
+        this.el["admin-tabs"]?.querySelectorAll("[data-admin-tab]").forEach((button) => {
+            button.addEventListener("click", () => this.openAdminTab(button.dataset.adminTab));
+        });
+        document.querySelectorAll("[data-modal-cancel]").forEach((button) => {
+            button.addEventListener("click", () => this.closeAllModals());
         });
 
         this.el["composer"]?.addEventListener("submit", (event) => {
@@ -219,20 +261,125 @@ class ChatApp {
         try { data = text ? JSON.parse(text) : null; } catch { data = text; }
         if (!response.ok) {
             const detail = data && (data.detail || data.message || data.error);
+            if (response.status === 401 && this.authStatus?.team_mode && !String(path).startsWith("/team/")) {
+                this.showAuthGate();
+            }
             throw new Error(typeof detail === "string" ? detail : (detail ? JSON.stringify(detail) : text || `HTTP ${response.status}`));
         }
         return data;
     }
 
+    async ensureAuthenticated() {
+        this.authStatus = await this.api("/team/status");
+        if (this.authStatus.team_mode && !this.authStatus.authenticated) {
+            this.showAuthGate();
+            return false;
+        }
+        try {
+            const me = await this.api("/team/me");
+            this.currentUser = me.user || null;
+        } catch {
+            this.currentUser = this.authStatus.user || null;
+        }
+        this.renderAccountState();
+        return true;
+    }
+
+    showAuthGate() {
+        if (!this.authStatus?.team_mode) return;
+        this.authGateActive = true;
+        clearTimeout(this.reconnectTimer);
+        this.ws?.close();
+        this.agentWs?.close();
+        this.el["app-layout"].hidden = true;
+        this.el["auth-gate"].hidden = false;
+        const bootstrap = Boolean(this.authStatus.bootstrap_available);
+        this.el["auth-login-form"].hidden = bootstrap;
+        this.el["auth-bootstrap-form"].hidden = !bootstrap;
+        this.el["auth-bootstrap-token-row"].hidden = !this.authStatus.bootstrap_token_required;
+        requestAnimationFrame(() => {
+            (bootstrap ? this.el["auth-bootstrap-name"] : this.el["auth-login"]).focus();
+        });
+    }
+
+    async finishTeamLogin(user) {
+        this.currentUser = user || null;
+        this.authStatus = { ...(this.authStatus || {}), authenticated: true, bootstrap_available: false, user: user || null };
+        this.authGateActive = false;
+        this.el["auth-gate"].hidden = true;
+        this.renderAccountState();
+        this.appBootstrapped = false;
+        this.currentKb = null;
+        this.currentSession = null;
+        this.knowledgeBases = [];
+        this.sessions = [];
+        this.agents = [];
+        this.currentUser = user || null;
+        await this.bootstrap();
+    }
+
+    async loginTeam() {
+        this.el["auth-login-result"].textContent = "正在验证";
+        try {
+            const result = await this.api("/team/login", {
+                method: "POST",
+                body: { login: this.el["auth-login"].value.trim(), password: this.el["auth-password"].value },
+            });
+            this.el["auth-password"].value = "";
+            await this.finishTeamLogin(result.user);
+        } catch (error) {
+            this.el["auth-login-result"].textContent = error.message;
+        }
+    }
+
+    async bootstrapTeam() {
+        this.el["auth-bootstrap-result"].textContent = "正在创建管理员";
+        try {
+            const result = await this.api("/team/bootstrap", {
+                method: "POST",
+                body: {
+                    username: this.el["auth-bootstrap-name"].value.trim(),
+                    email: this.el["auth-bootstrap-email"].value.trim(),
+                    password: this.el["auth-bootstrap-password"].value,
+                    bootstrap_token: this.el["auth-bootstrap-token"].value,
+                },
+            });
+            this.el["auth-bootstrap-password"].value = "";
+            await this.finishTeamLogin(result.user);
+        } catch (error) {
+            this.el["auth-bootstrap-result"].textContent = error.message;
+        }
+    }
+
+    async logoutTeam() {
+        try { await this.api("/team/logout", { method: "POST" }); } catch {}
+        this.currentUser = null;
+        this.authStatus = { ...(this.authStatus || {}), authenticated: false };
+        this.showAuthGate();
+    }
+
+    renderAccountState() {
+        const team = Boolean(this.authStatus?.team_mode);
+        const role = this.currentUser?.role || (team ? "viewer" : "admin");
+        const name = this.currentUser?.username || (team ? "未登录" : "本地工作空间");
+        if (this.el["account-summary"]) this.el["account-summary"].textContent = `${name} · ${role === "admin" ? "管理员" : role === "editor" ? "编辑者" : "成员"}`;
+        if (this.el["admin-open"]) this.el["admin-open"].hidden = role !== "admin";
+        if (this.el["team-logout"]) this.el["team-logout"].hidden = !team;
+    }
+
     async bootstrap() {
         this.el["app-layout"].hidden = false;
+        this.appBootstrapped = true;
         await this.loadDefaults();
         await this.loadKnowledgeBases();
+        await this.loadOnboarding();
         await this.loadAgents();
         await this.loadSessions();
         await this.restoreSessionFromUrl();
         this.connectWebSocket();
         this.el["chat-input"].focus();
+        const params = new URLSearchParams(window.location.search);
+        if (params.get("docs") === "1") this.openDocs();
     }
 
     async loadDefaults() {
@@ -242,6 +389,150 @@ class ChatApp {
         } catch {
             // The configured frontend default remains usable when this endpoint is unavailable.
         }
+    }
+
+    async loadOnboarding() {
+        try {
+            this.onboarding = await this.api("/onboarding");
+        } catch {
+            this.onboarding = null;
+        }
+        if (!this.currentSession) this.clearMessages();
+    }
+
+    onboardingExamples() {
+        if (Array.isArray(this.onboarding?.examples) && this.onboarding.examples.length) {
+            return this.onboarding.examples;
+        }
+        return [
+            {
+                label: "制度与流程",
+                title: "查清具体标准和时限",
+                question: "2026 版制度下，一线城市住宿标准和报销时限分别是什么？",
+                hint: "定位到制度条款并附原文",
+            },
+            {
+                label: "合同与审批",
+                title: "确认多级审批责任",
+                question: "超过 50 万元的合同需要哪些角色审批？",
+                hint: "汇总审批角色并标注依据",
+            },
+            {
+                label: "产品与安全",
+                title: "看懂系统如何保证可信",
+                question: "知阁如何让回答可追溯？",
+                hint: "从产品机制资料中提取答案",
+            },
+            {
+                label: "可信边界",
+                title: "没有资料时明确拒答",
+                question: "公司年会的抽奖一等奖是什么？",
+                hint: "验证系统不会编造答案",
+                tone: "boundary",
+            },
+        ];
+    }
+
+    welcomeMarkup() {
+        const ready = Boolean(this.onboarding?.ready);
+        const examples = this.onboardingExamples();
+        const cards = examples.map((item) => `
+            <button class="welcome-question ${item.tone === "boundary" ? "is-boundary" : ""}"
+                    type="button" data-sample-question="${this.esc(item.question)}">
+                <span class="welcome-question-top">
+                    <span class="welcome-question-label">${this.esc(item.label || "示例问题")}</span>
+                    <span class="welcome-question-try">试问</span>
+                </span>
+                <strong>${this.esc(item.title || item.question)}</strong>
+                <span class="welcome-question-prompt">${this.esc(item.question)}</span>
+                <small>${this.esc(item.hint || "查看答案与引用依据")}</small>
+            </button>`).join("");
+        return `
+            <div class="empty-state welcome-overview" id="welcome-state">
+                <section class="welcome-hero" aria-labelledby="welcome-title">
+                    <div class="welcome-copy">
+                        <p class="welcome-eyebrow">企业知识库问答</p>
+                        <h2 id="welcome-title">公司资料，问一句就有答案</h2>
+                        <p class="welcome-lead">制度、合同、产品与运营资料都能问。关键结论附原文出处，资料不足时直接拒答。</p>
+                        <div class="welcome-scopes" aria-label="适用场景">
+                            <span>制度流程</span><span>合同审批</span><span>产品知识</span><span>团队协作</span>
+                        </div>
+                    </div>
+                    <div class="welcome-start">
+                        <button class="welcome-primary" type="button" data-demo-experience>
+                            <span>${ready ? "继续体验示例问答" : "看一次真实问答"}</span>
+                            <small>${ready ? "四篇资料已就绪，直接提问" : "自动载入四篇示例资料"}</small>
+                        </button>
+                        <button class="welcome-upload" type="button" data-upload>
+                            <span>换成我的资料</span>
+                            <small>PDF · Word · Excel · 网页</small>
+                        </button>
+                    </div>
+                </section>
+                <section class="welcome-question-section" aria-labelledby="welcome-examples-title">
+                    <div class="welcome-section-head">
+                        <div>
+                            <h3 id="welcome-examples-title">可以这样问</h3>
+                            <p>点一个问题，直接看回答和依据</p>
+                        </div>
+                        <span>${examples.length} 种能力</span>
+                    </div>
+                    <div class="welcome-question-grid">${cards}</div>
+                </section>
+                <div class="welcome-proof" aria-label="产品能力概览">
+                    <span><strong>答案可核验</strong>点击引用回到原文</span>
+                    <span><strong>边界可感知</strong>没有依据就明确拒答</span>
+                    <span><strong>越用越准确</strong>差评进入评估与治理</span>
+                </div>
+            </div>`;
+    }
+
+    bindWelcomeActions() {
+        this.el.messages.querySelectorAll("[data-upload]").forEach((button) => {
+            button.addEventListener("click", () => this.el["file-input"].click());
+        });
+        this.el.messages.querySelectorAll("[data-import-url]").forEach((button) => {
+            button.addEventListener("click", () => this.openImport());
+        });
+        this.el.messages.querySelectorAll("[data-search]").forEach((button) => {
+            button.addEventListener("click", () => this.openSearch());
+        });
+        this.el.messages.querySelectorAll("[data-demo-experience]").forEach((button) => {
+            button.addEventListener("click", () => {
+                const first = this.onboardingExamples()[0]?.question;
+                this.askSample(first);
+            });
+        });
+        this.el.messages.querySelectorAll("[data-sample-question]").forEach((button) => {
+            button.addEventListener("click", () => this.askSample(button.dataset.sampleQuestion));
+        });
+    }
+
+    async loadDemo() {
+        const buttons = this.el.messages.querySelectorAll("[data-demo], [data-demo-experience]");
+        buttons.forEach((button) => { button.disabled = true; });
+        try {
+            const result = await this.api("/onboarding/demo", { method: "POST" });
+            this.onboarding = result;
+            await this.loadKnowledgeBases();
+            const kbId = result.kb?.id || result.demo_kb_id;
+            if (kbId) await this.selectKb(kbId);
+            this.showAlert(`示例库已就绪 · ${result.chunks || 0} 个可检索分块`);
+        } catch (error) {
+            this.showAlert(`载入示例失败：${error.message}`, "error");
+        } finally {
+            buttons.forEach((button) => { button.disabled = false; });
+        }
+    }
+
+    async askSample(question) {
+        if (!question) return;
+        if (!this.onboarding?.ready) {
+            await this.loadDemo();
+        } else if (this.onboarding?.demo_kb_id && this.currentKb?.id !== this.onboarding.demo_kb_id) {
+            await this.selectKb(this.onboarding.demo_kb_id);
+        }
+        await this.sendMessage(question);
     }
 
     urlState() {
@@ -444,6 +735,13 @@ class ChatApp {
                 if (message.role === "assistant") {
                     const sources = message.sources || [];
                     this.addMessageActions(node, queryForAnswer, sources);
+                    this.attachEvidence(
+                        node,
+                        message.verification || null,
+                        message.timings || {},
+                        sources,
+                        queryForAnswer,
+                    );
                     if (sources.length) this.showSources(sources);
                 }
             });
@@ -571,6 +869,7 @@ class ChatApp {
 
     scheduleReconnect() {
         clearTimeout(this.reconnectTimer);
+        if (this.authGateActive) return;
         this.reconnectTimer = setTimeout(() => this.connectWebSocket(), 3000);
     }
 
@@ -619,6 +918,10 @@ class ChatApp {
         this.activeSocket = socket;
         this.lastUserQuery = query;
         this.currentSources = [];
+        this.currentVerification = null;
+        this.currentTimings = {};
+        this.completedRequestId = null;
+        this.lastAssistantMessage = null;
         this.pendingAgentPersist = this.agentMode ? { query } : null;
         this.setInputBusy(true);
         this.showTypingIndicator();
@@ -635,7 +938,11 @@ class ChatApp {
 
     async handleEvent(payload) {
         const { event, data } = payload;
-        if (payload.request_id && payload.request_id !== this.activeRequestId) return;
+        const requestId = payload.request_id || null;
+        const requestMatches = !requestId
+            || requestId === this.activeRequestId
+            || requestId === this.completedRequestId;
+        if (!requestMatches) return;
         if (event === "hits") {
             this.currentSources = data || [];
         } else if (event === "token") {
@@ -643,9 +950,13 @@ class ChatApp {
             this.appendToken(String(data ?? ""));
         } else if (event === "done") {
             this.hideTypingIndicator();
+            this.completedRequestId = requestId || this.activeRequestId;
+            if (Array.isArray(data)) this.currentSources = data;
+            else if (Array.isArray(data?.sources)) this.currentSources = data.sources;
+            if (payload.verification) this.currentVerification = payload.verification;
             this.isStreaming = false;
             this.activeRequestId = null;
-            this.finalizeAssistant();
+            this.finalizeAssistant(this.completedRequestId);
             this.showSources(this.currentSources);
             await this.persistAgentTurn();
             this.setInputBusy(false);
@@ -661,8 +972,13 @@ class ChatApp {
             this.showAlert(`回答失败：${data}`, "error");
         } else if (event === "cancelled") {
             this.finishStoppedStream();
-        } else if (event === "metadata" && Array.isArray(data?.sources)) {
-            this.currentSources = data.sources;
+        } else if (event === "metadata") {
+            if (Array.isArray(data?.sources)) this.currentSources = data.sources;
+            if (data?.verification) this.currentVerification = data.verification;
+            if (data?.timings && typeof data.timings === "object") {
+                this.currentTimings = { ...data.timings };
+            }
+            this.refreshCurrentEvidence();
         } else if (event === "action" && data?.tool) {
             const indicator = document.querySelector("#typing-indicator .typing-indicator");
             if (indicator) indicator.setAttribute("aria-label", `正在使用 ${data.tool}`);
@@ -714,7 +1030,13 @@ class ChatApp {
             if (answer) {
                 await this.api(`/sessions/${this.currentSession.id}/messages`, {
                     method: "POST",
-                    body: { role: "assistant", content: answer, sources: [] },
+                body: {
+                    role: "assistant",
+                    content: answer,
+                    sources: this.currentSources,
+                    verification: this.currentVerification,
+                    timings: this.currentTimings,
+                },
                 });
             }
         } catch (error) {
@@ -730,25 +1052,13 @@ class ChatApp {
     }
 
     clearMessages() {
-        this.el.messages.innerHTML = `
-            <div class="empty-state" id="welcome-state">
-                <h2>开始提问</h2>
-                <div class="empty-actions">
-                    <button type="button" data-upload>${this.icon("upload")}添加文档</button>
-                    <button type="button" data-import-url>${this.icon("link")}导入网页</button>
-                    <button type="button" data-search>${this.icon("search")}搜索资料</button>
-                </div>
-            </div>`;
-        this.el.messages.querySelectorAll("[data-upload]").forEach((button) => {
-            button.addEventListener("click", () => this.el["file-input"].click());
-        });
-        this.el.messages.querySelectorAll("[data-import-url]").forEach((button) => {
-            button.addEventListener("click", () => this.openImport());
-        });
-        this.el.messages.querySelectorAll("[data-search]").forEach((button) => {
-            button.addEventListener("click", () => this.openSearch());
-        });
+        this.el.messages.innerHTML = this.welcomeMarkup();
+        this.bindWelcomeActions();
         this.currentSources = [];
+        this.currentVerification = null;
+        this.currentTimings = {};
+        this.completedRequestId = null;
+        this.lastAssistantMessage = null;
     }
 
     appendMessage(role, content) {
@@ -779,13 +1089,23 @@ class ChatApp {
         this.scrollBottom();
     }
 
-    finalizeAssistant() {
-        this.el.messages.querySelectorAll(".message.assistant.streaming").forEach((message) => {
+    finalizeAssistant(requestId = null) {
+        const streaming = Array.from(this.el.messages.querySelectorAll(".message.assistant.streaming"));
+        streaming.forEach((message) => {
             message.classList.remove("streaming");
             const body = message.querySelector(".message-content");
             this.setRichText(body, body.textContent);
             this.addMessageActions(message, this.lastUserQuery, this.currentSources);
+            this.lastAssistantMessage = message;
+            this.attachEvidence(
+                message,
+                this.currentVerification,
+                this.currentTimings,
+                this.currentSources,
+                this.lastUserQuery,
+            );
         });
+        if (streaming.length && requestId) this.completedRequestId = requestId;
     }
 
     showTypingIndicator() {
@@ -829,6 +1149,95 @@ class ChatApp {
     scoreLabel(source) {
         const label = source.score_kind === "keyword" ? "词面" : source.score_kind === "rerank" ? "相关" : "相近";
         return `${label} ${source.score.toFixed(2)}`;
+    }
+
+    durationLabel(value) {
+        const ms = Number(value);
+        if (!Number.isFinite(ms) || ms < 0) return "—";
+        return ms >= 1000 ? `${(ms / 1000).toFixed(ms >= 10000 ? 0 : 1)} 秒` : `${Math.round(ms)} ms`;
+    }
+
+    evidenceStatus(verification) {
+        const status = verification?.refused ? "refused" : (verification?.status || "unverified");
+        return {
+            status,
+            label: {
+                verified: "依据充分",
+                partial: "部分待核实",
+                unverified: "未通过校验",
+                refused: "无依据拒答",
+            }[status] || "待校验",
+            note: {
+                verified: "关键事实均能找到对应原文。",
+                partial: "结论有来源，但仍有事实或引用需要人工核对。",
+                unverified: "引用覆盖或原文接地不足，请打开来源逐项核对。",
+                refused: "当前知识库没有足够依据，系统已拒答并记录知识缺口。",
+            }[status] || "系统尚未返回完整的可验证性报告。",
+        };
+    }
+
+    attachEvidence(message, verification, timings, sources = [], query = "") {
+        if (!message) return;
+        message.querySelector(".evidence-card")?.remove();
+        if (!verification && !sources?.length && !Object.keys(timings || {}).length) return;
+        const state = this.evidenceStatus(verification);
+        const ratio = Number(verification?.cited_sentence_ratio);
+        const sourceList = Array.isArray(sources) ? sources : [];
+        const issues = [];
+        if (verification?.invalid_citations?.length) {
+            issues.push(`无效引用：${verification.invalid_citations.map((item) => `[${item}]`).join("、")}`);
+        }
+        if (verification?.unsupported_facts?.length) {
+            issues.push(`待核实事实：${verification.unsupported_facts.slice(0, 4).join("、")}`);
+        }
+        if (verification?.unsupported_sentences?.length) {
+            issues.push(`${verification.unsupported_sentences.length} 句引用与所引原文贴合度不足`);
+        }
+        const card = document.createElement("section");
+        card.className = "evidence-card";
+        card.dataset.status = state.status;
+        card.innerHTML = `
+            <div class="evidence-head">
+                <span class="evidence-badge">${this.esc(state.label)}</span>
+                <span class="evidence-time">${this.esc(this.durationLabel(timings?.total_ms))}</span>
+            </div>
+            <div class="evidence-metrics">
+                <span class="evidence-metric"><strong>${Number.isFinite(ratio) ? `${Math.round(ratio * 100)}%` : "—"}</strong> 句子引用率</span>
+                <span class="evidence-metric"><strong>${sourceList.length}</strong> 个来源</span>
+                <span class="evidence-metric"><strong>${this.esc(this.durationLabel(timings?.retrieval_ms))}</strong> 检索</span>
+                <span class="evidence-metric"><strong>${this.esc(this.durationLabel(timings?.ttft_ms))}</strong> 首字</span>
+            </div>
+            <p class="evidence-note">${this.esc(state.note)}</p>
+            ${issues.length ? `<p class="evidence-note evidence-warning">${this.esc(issues.join("；"))}</p>` : ""}
+            ${sourceList.length ? `<div class="evidence-source-row">${sourceList.slice(0, 5).map((source, index) =>
+                `<button class="evidence-source" type="button" data-evidence-source="${index}" title="${this.esc(source.title || source.source || "查看引用原文")}">[${this.esc(source.index || index + 1)}] ${this.esc(source.title || source.source || "来源")}</button>`
+            ).join("")}</div>` : ""}
+            ${state.status === "refused" ? '<div class="evidence-head"><span class="evidence-note">已进入知识缺口队列</span><button class="evidence-action" type="button" data-evidence-upload>补充资料</button></div>' : ""}`;
+        card.querySelectorAll("[data-evidence-source]").forEach((button) => {
+            button.addEventListener("click", () => {
+                const source = sourceList[Number(button.dataset.evidenceSource)];
+                if (source) this.showChunkDetail(source);
+            });
+        });
+        card.querySelector("[data-evidence-upload]")?.addEventListener("click", () => {
+            if (!this.currentKb) this.showAlert("请先选择要补充资料的知识库", "error");
+            else this.el["file-input"].click();
+        });
+        const actions = message.querySelector(":scope > .message-actions");
+        if (actions) message.insertBefore(card, actions);
+        else message.appendChild(card);
+    }
+
+    refreshCurrentEvidence() {
+        if (!this.lastAssistantMessage || !document.body.contains(this.lastAssistantMessage)) return;
+        this.attachEvidence(
+            this.lastAssistantMessage,
+            this.currentVerification,
+            this.currentTimings,
+            this.currentSources,
+            this.lastUserQuery,
+        );
+        this.scrollBottom();
     }
 
     async showChunkDetail(source) {
@@ -956,7 +1365,7 @@ class ChatApp {
         const helpful = this.actionButton("up", "有帮助");
         const notHelpful = this.actionButton("down", "没帮助");
         helpful.addEventListener("click", () => this.submitFeedback(helpful, notHelpful, "helpful", query, answer, sources));
-        notHelpful.addEventListener("click", () => this.submitFeedback(notHelpful, helpful, "not_helpful", query, answer, sources));
+        notHelpful.addEventListener("click", () => this.openFeedback(query, answer, sources));
 
         const regenerate = this.actionButton("refresh", "重新生成");
         regenerate.addEventListener("click", () => this.regenerate(query));
@@ -986,6 +1395,10 @@ class ChatApp {
                     rating,
                     correction: "",
                     question_type: "",
+                    citation_issue: false,
+                    missing_source: false,
+                    kb_id: this.currentKb?.id || null,
+                    session_id: this.currentSession?.id || null,
                 },
             });
             selected.setAttribute("aria-pressed", "true");
@@ -993,6 +1406,57 @@ class ChatApp {
             this.showAlert("已记录");
         } catch (error) {
             this.showAlert(`反馈失败：${error.message}`, "error");
+        }
+    }
+
+    openFeedback(query, answer, sources) {
+        if (!query) return;
+        this.feedbackContext = {
+            query,
+            answer: answer || "",
+            sources: Array.isArray(sources) ? sources : [],
+            kb_id: this.currentKb?.id || null,
+            session_id: this.currentSession?.id || null,
+        };
+        this.el["feedback-form"].reset();
+        this.el["feedback-result"].textContent = "";
+        this.openModalElement(this.el["feedback-modal"]);
+    }
+
+    async submitNotHelpfulFeedback() {
+        const context = this.feedbackContext;
+        if (!context) {
+            this.el["feedback-result"].textContent = "反馈上下文已失效，请重新点击没帮助";
+            return;
+        }
+        const button = this.el["feedback-submit"];
+        button.disabled = true;
+        this.el["feedback-result"].textContent = "正在进入治理队列";
+        try {
+            const result = await this.api("/feedback", {
+                method: "POST",
+                body: {
+                    query: context.query,
+                    answer: context.answer,
+                    sources_json: JSON.stringify(context.sources),
+                    rating: "not_helpful",
+                    correction: this.el["feedback-correction"].value.trim(),
+                    question_type: this.el["feedback-type"].value,
+                    citation_issue: this.el["feedback-citation"].checked || this.el["feedback-type"].value === "citation",
+                    missing_source: this.el["feedback-missing"].checked || this.el["feedback-type"].value === "missing_source",
+                    kb_id: context.kb_id,
+                    session_id: context.session_id,
+                },
+            });
+            this.el["feedback-result"].textContent = result.knowledge_gap_id
+                ? `已进入知识缺口队列 · ${result.knowledge_gap_id.slice(0, 8)}`
+                : "反馈已提交";
+            this.showAlert(result.knowledge_gap_id ? "差评已进入质量治理队列" : "已记录反馈");
+            setTimeout(() => this.closeAllModals(), 900);
+        } catch (error) {
+            this.el["feedback-result"].textContent = `提交失败：${error.message}`;
+        } finally {
+            button.disabled = false;
         }
     }
 
@@ -1233,16 +1697,20 @@ class ChatApp {
     }
 
     async loadAgents() {
-        try {
-            const data = await this.api("/agents");
-            this.agents = data.agents || [];
-            if (this.activeAgent) {
-                this.activeAgent = this.agents.find((agent) => agent.id === this.activeAgent.id) || null;
-            }
-            if (!this.activeAgent && this.agentMode) this.setConversationMode("knowledge");
-        } catch {
+        const [agentResult, templateResult] = await Promise.allSettled([
+            this.api("/agents"),
+            this.api("/agent/templates"),
+        ]);
+        if (agentResult.status === "fulfilled") {
+            this.agents = agentResult.value.agents || [];
+        } else {
             this.agents = [];
         }
+        this.agentTemplates = templateResult.status === "fulfilled" ? (templateResult.value.templates || []) : [];
+        if (this.activeAgent) {
+            this.activeAgent = this.agents.find((agent) => agent.id === this.activeAgent.id) || null;
+        }
+        if (!this.activeAgent && this.agentMode) this.setConversationMode("knowledge");
     }
 
     async openAgents() {
@@ -1261,11 +1729,16 @@ class ChatApp {
     renderAgents() {
         const box = this.el["agents-list"];
         if (!box) return;
-        if (!this.agents.length) {
-            box.innerHTML = '<div class="command-empty">暂无 Agent</div>';
-            return;
-        }
-        box.innerHTML = this.agents.map((agent) => {
+        const templates = this.agentTemplates.length ? `
+            <section class="agent-templates">
+                <div class="agent-template-grid">${this.agentTemplates.map((template) => `
+                    <button class="agent-template" type="button" data-agent-template="${this.esc(template.id)}">
+                        <strong>${this.esc(template.name)}</strong>
+                        <small>${this.esc(template.description || "预填工作说明与工具")}</small>
+                        <span class="status-pill info">使用模板</span>
+                    </button>`).join("")}</div>
+            </section>` : "";
+        const rows = this.agents.length ? this.agents.map((agent) => {
             const kbName = this.knowledgeBases.find((kb) => kb.id === agent.kb_id)?.name || "知识库";
             return `<div class="agent-row ${this.activeAgent?.id === agent.id ? "active" : ""}" data-agent-row="${this.esc(agent.id)}">
                 <button class="agent-select" type="button" data-agent-use="${this.esc(agent.id)}">
@@ -1276,7 +1749,14 @@ class ChatApp {
                     <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m12.5 4 3.5 3.5-8 8H4.5V12z"/><path d="m11 5.5 3.5 3.5"/></svg>
                 </button>
             </div>`;
-        }).join("");
+        }).join("") : '<div class="command-empty">还没有自定义 Agent；可从上方模板开始。</div>';
+        box.innerHTML = `${templates}${rows}`;
+        box.querySelectorAll("[data-agent-template]").forEach((button) => {
+            button.addEventListener("click", () => {
+                const template = this.agentTemplates.find((item) => item.id === button.dataset.agentTemplate);
+                if (template) this.startAgentEditor(null, template);
+            });
+        });
         box.querySelectorAll("[data-agent-use]").forEach((button) => {
             button.addEventListener("click", () => {
                 const agent = this.agents.find((item) => item.id === button.dataset.agentUse);
@@ -1307,21 +1787,22 @@ class ChatApp {
         this.el["chat-input"].focus();
     }
 
-    async startAgentEditor(agent = null) {
+    async startAgentEditor(agent = null, template = null) {
+        const source = agent || template || {};
         this.el["agents-list-view"].hidden = true;
         this.el["agent-form"].hidden = false;
         this.el["agent-id"].value = agent?.id || "";
-        this.el["agent-name"].value = agent?.name || "";
+        this.el["agent-name"].value = source.name || "";
         this.el["agent-kb"].innerHTML = this.knowledgeBases.map((kb) =>
             `<option value="${this.esc(kb.id)}">${this.esc(kb.name)}</option>`
         ).join("");
-        this.el["agent-kb"].value = agent?.kb_id || this.currentKb?.id || this.knowledgeBases[0]?.id || "";
-        this.el["agent-instructions"].value = agent?.instructions || "";
+        this.el["agent-kb"].value = source.kb_id || this.currentKb?.id || this.knowledgeBases[0]?.id || "";
+        this.el["agent-instructions"].value = source.instructions || "";
         this.el["agent-delete"].hidden = !agent;
-        this.el["agent-form-result"].textContent = "";
-        this.agentMaxSteps = agent?.max_steps || 5;
+        this.el["agent-form-result"].textContent = template && !agent ? "模板已填入；保存后会创建你自己的 Agent。" : "";
+        this.agentMaxSteps = source.max_steps || 5;
         const defaults = ["search_documents", "list_documents", "get_document_chunks", "calculator", "get_current_time", "text_stats"];
-        this.agentSelectedTools = new Set(agent?.allowed_tools || defaults);
+        this.agentSelectedTools = new Set(source.allowed_tools || defaults);
         this.agentToolsRendered = false;
         await this.loadAgentToolOptions();
         requestAnimationFrame(() => this.el["agent-name"].focus());
@@ -1429,18 +1910,24 @@ class ChatApp {
             box.innerHTML = '<div class="command-empty">暂无连接</div>';
             return;
         }
-        box.innerHTML = this.mcpServers.map((server) => `
+        const approvalLabels = { pending: "等待管理员审批", approved: "已批准", rejected: "已拒绝" };
+        const approvalClasses = { pending: "warn", approved: "ok", rejected: "bad" };
+        box.innerHTML = this.mcpServers.map((server) => {
+            const approval = server.approval_status || "pending";
+            const canTest = server.enabled && approval === "approved";
+            return `
             <div class="mcp-row" data-mcp-row="${this.esc(server.id)}">
                 <div class="mcp-main">
-                    <span class="mcp-name">${this.esc(server.name)}</span>
-                    <span class="mcp-meta">${server.enabled ? `${server.tool_count} 工具` : "已停用"}${server.last_error ? ` · ${this.esc(server.last_error)}` : ""}</span>
+                    <span class="mcp-name">${this.esc(server.name)} <span class="status-pill ${approvalClasses[approval] || ""}">${this.esc(approvalLabels[approval] || approval)}</span></span>
+                    <span class="mcp-meta">${server.enabled ? `${server.tool_count || 0} 工具` : "已停用"}${server.last_error ? ` · ${this.esc(server.last_error)}` : ""}</span>
                     <code class="mcp-command">${this.esc(server.command)}</code>
                 </div>
-                <button class="btn btn-ghost btn-sm" type="button" data-mcp-test="${this.esc(server.id)}">检查</button>
+                <button class="btn btn-ghost btn-sm" type="button" data-mcp-test="${this.esc(server.id)}" ${canTest ? "" : 'disabled title="管理员批准后才能检查"'}>检查</button>
                 <button class="icon-button" type="button" data-mcp-delete="${this.esc(server.id)}" aria-label="删除 ${this.esc(server.name)}">
                     <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 6h12M8 6V4h4v2M6 6l1 10h6l1-10"/></svg>
                 </button>
-            </div>`).join("");
+            </div>`;
+        }).join("");
         box.querySelectorAll("[data-mcp-test]").forEach((button) => {
             button.addEventListener("click", () => this.testMcpServer(button.dataset.mcpTest, button));
         });
@@ -1508,7 +1995,7 @@ class ChatApp {
 
     async loadMcpToolCatalog() {
         const servers = this.mcpServers.length ? this.mcpServers : (await this.api("/mcp/servers").catch(() => ({ servers: [] }))).servers || [];
-        const enabled = servers.filter((server) => server.enabled);
+        const enabled = servers.filter((server) => server.enabled && (server.approval_status || "approved") === "approved");
         const results = await Promise.all(enabled.map(async (server) => {
             try {
                 const data = await this.api(`/mcp/servers/${server.id}/tools`);
@@ -1521,6 +2008,575 @@ class ChatApp {
             }
         }));
         return results.flat();
+    }
+
+    async openAdmin() {
+        const role = this.currentUser?.role || (this.authStatus?.team_mode ? "viewer" : "admin");
+        if (role !== "admin") {
+            this.showAlert("当前账号没有管理权限", "error");
+            return;
+        }
+        this.openModalElement(this.el["admin-modal"]);
+        await this.openAdminTab(this.adminTab || "overview");
+    }
+
+    async openAdminTab(tab) {
+        const validTabs = new Set(["overview", "quality", "team", "audit", "eval", "backup"]);
+        this.adminTab = validTabs.has(tab) ? tab : "overview";
+        this.el["admin-tabs"]?.querySelectorAll("[data-admin-tab]").forEach((button) => {
+            button.setAttribute("aria-selected", String(button.dataset.adminTab === this.adminTab));
+        });
+        const content = this.el["admin-content"];
+        if (!content) return;
+        content.innerHTML = '<div class="admin-empty">正在加载治理数据</div>';
+        try {
+            if (this.adminTab === "overview") {
+                this.renderAdminOverview(await this.api("/admin/overview"));
+            } else if (this.adminTab === "quality") {
+                this.renderAdminQuality(await this.api("/admin/quality"));
+            } else if (this.adminTab === "team") {
+                await this.loadAdminTeam();
+            } else if (this.adminTab === "audit") {
+                await this.loadAdminAudit();
+            } else if (this.adminTab === "eval") {
+                this.renderAdminEvaluation(await this.api("/admin/evaluations"));
+            } else if (this.adminTab === "backup") {
+                this.renderAdminBackup(await this.api("/admin/backup"));
+            }
+        } catch (error) {
+            content.innerHTML = `<div class="admin-empty">加载失败：${this.esc(error.message)}</div>`;
+        }
+    }
+
+    adminHeading(title, description, action = "") {
+        return `<div class="admin-section-head"><div><h3>${this.esc(title)}</h3><p>${this.esc(description)}</p></div>${action}</div>`;
+    }
+
+    adminMetric(label, value) {
+        return `<div class="metric-card"><span>${this.esc(label)}</span><strong>${this.esc(value)}</strong></div>`;
+    }
+
+    formatAdminTime(value) {
+        if (!value) return "—";
+        const date = new Date(value);
+        return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString("zh-CN", { hour12: false });
+    }
+
+    renderAdminOverview(data) {
+        const content = this.el["admin-content"];
+        const ingest = data.ingest || {};
+        const byStatus = ingest.by_status || {};
+        content.innerHTML = `<section class="admin-section">
+            ${this.adminHeading("工作区概览", "成员、资料、质量风险与恢复状态的统一入口")}
+            <div class="metric-grid">
+                ${this.adminMetric("活跃成员", data.users?.active ?? 0)}
+                ${this.adminMetric("知识库", data.knowledge?.kbs ?? 0)}
+                ${this.adminMetric("已登记资料", data.knowledge?.documents ?? 0)}
+                ${this.adminMetric("可检索分块", data.knowledge?.chunks ?? 0)}
+                ${this.adminMetric("未处理差评", data.quality?.unresolved_feedback ?? 0)}
+                ${this.adminMetric("开放知识缺口", data.quality?.open_gaps ?? 0)}
+                ${this.adminMetric("索引失败资料", data.knowledge?.failed_documents ?? 0)}
+                ${this.adminMetric("待审批 MCP", data.security?.pending_mcp_approvals ?? 0)}
+            </div>
+            <div class="admin-row">
+                <div class="admin-row-head">
+                    <span class="admin-row-title">运行状态</span>
+                    <span class="status-pill ${data.settings?.database_ok ? "ok" : "bad"}">${data.settings?.database_ok ? "数据库正常" : "数据库异常"}</span>
+                </div>
+                <p class="admin-row-text">当前操作者：${this.esc(data.settings?.authenticated_as || "-")} · 入库任务 ${Number(ingest.total || 0)} 个 · 处理中 ${Number(ingest.pending || 0)} 个</p>
+                <div class="admin-row-actions">
+                    ${Object.entries(byStatus).map(([status, count]) => `<span class="status-pill ${status === "failed" ? "bad" : status === "done" ? "ok" : "info"}">${this.esc(status)} ${Number(count || 0)}</span>`).join("") || '<span class="status-pill">暂无入库任务</span>'}
+                    ${data.security?.restore_pending ? '<span class="status-pill warn">有待应用恢复包</span>' : '<span class="status-pill ok">无待恢复包</span>'}
+                </div>
+            </div>
+        </section>`;
+    }
+
+    renderAdminQuality(data) {
+        const content = this.el["admin-content"];
+        const feedback = data.feedback || [];
+        const gaps = data.knowledge_gaps || [];
+        const stats = data.stats || {};
+        content.innerHTML = `<section class="admin-section">
+            ${this.adminHeading("质量治理", "逐条处理差评、修正知识缺口，并把问题转成可回归的资料")}
+            <div class="metric-grid">
+                ${this.adminMetric("差评率", `${Math.round(Number(stats.bad_rate || 0) * 100)}%`)}
+                ${this.adminMetric("未处理差评", stats.unresolved_feedback ?? 0)}
+                ${this.adminMetric("开放缺口", stats.open_gaps ?? 0)}
+                ${this.adminMetric("反馈总量", stats.feedback_total ?? 0)}
+            </div>
+            <div>
+                <div class="admin-section-head"><div><h3>待处理差评</h3><p>处理时可补充纠正结论；未解决的缺资料问题会同步进入知识缺口。</p></div></div>
+                <div class="admin-list">
+                    ${feedback.length ? feedback.map((item) => `<article class="admin-row" data-admin-feedback="${this.esc(item.id)}">
+                        <div class="admin-row-head">
+                            <span class="admin-row-title">${this.esc(item.query)}</span>
+                            <span class="status-pill ${item.resolved ? "ok" : "warn"}">${item.resolved ? "已处理" : "待处理"}</span>
+                        </div>
+                        <p class="admin-row-text">${this.esc(item.answer || "无回答快照")}</p>
+                        <div class="admin-row-actions">
+                            <span class="status-pill">${this.esc(item.question_type || "未分类")}</span>
+                            ${item.citation_issue ? '<span class="status-pill bad">引用问题</span>' : ""}
+                            ${item.missing_source ? '<span class="status-pill warn">缺资料</span>' : ""}
+                            <span class="admin-row-meta">${this.esc(this.formatAdminTime(item.created_at))}</span>
+                        </div>
+                        ${item.correction ? `<p class="admin-row-text">纠正：${this.esc(item.correction)}</p>` : ""}
+                        <textarea class="form-control" rows="2" maxlength="2000" data-feedback-resolution="${this.esc(item.id)}" placeholder="处理说明">${this.esc(item.correction || "")}</textarea>
+                        <div class="admin-row-actions">
+                            <button class="btn btn-ghost btn-sm" type="button" data-feedback-resolve="true" data-id="${this.esc(item.id)}">标记已处理</button>
+                            <button class="btn btn-ghost btn-sm" type="button" data-feedback-resolve="false" data-id="${this.esc(item.id)}">重新打开</button>
+                            <button class="btn btn-secondary btn-sm" type="button" data-feedback-gap="${this.esc(item.id)}">转为知识缺口</button>
+                        </div>
+                    </article>`).join("") : '<div class="admin-empty">暂无差评，质量队列为空</div>'}
+                </div>
+            </div>
+            <div>
+                <div class="admin-section-head"><div><h3>知识缺口</h3><p>拒答和缺资料反馈会在这里沉淀，处理后才能形成闭环。</p></div></div>
+                <div class="admin-list">
+                    ${gaps.length ? gaps.map((item) => `<article class="admin-row" data-admin-gap="${this.esc(item.id)}">
+                        <div class="admin-row-head">
+                            <span class="admin-row-title">${this.esc(item.query)}</span>
+                            <span class="status-pill warn">${this.esc(item.status)}</span>
+                        </div>
+                        <p class="admin-row-text">${this.esc(item.detail || item.answer || "等待补充依据")}</p>
+                        <div class="admin-row-actions">
+                            <span class="status-pill">${this.esc(item.reason || "refused")}</span>
+                            <span class="admin-row-meta">${this.esc(this.formatAdminTime(item.created_at))}</span>
+                        </div>
+                        <div class="admin-form-grid">
+                            <select class="form-control" data-gap-status="${this.esc(item.id)}" aria-label="缺口状态">
+                                ${["open", "in_progress", "resolved", "dismissed"].map((status) => `<option value="${status}" ${item.status === status ? "selected" : ""}>${status}</option>`).join("")}
+                            </select>
+                            <input class="form-control" data-gap-resolution="${this.esc(item.id)}" maxlength="4000" value="${this.esc(item.resolution || "")}" placeholder="处理结论或补充资料说明">
+                        </div>
+                        <div class="admin-row-actions"><button class="btn btn-primary btn-sm" type="button" data-gap-save="${this.esc(item.id)}">保存处理结果</button></div>
+                    </article>`).join("") : '<div class="admin-empty">暂无知识缺口</div>'}
+                </div>
+            </div>
+        </section>`;
+        content.querySelectorAll("[data-feedback-resolve]").forEach((button) => {
+            button.addEventListener("click", () => this.resolveAdminFeedback(button.dataset.id, button.dataset.feedbackResolve === "true", false, button));
+        });
+        content.querySelectorAll("[data-feedback-gap]").forEach((button) => {
+            button.addEventListener("click", () => this.resolveAdminFeedback(button.dataset.feedbackGap, true, true, button));
+        });
+        content.querySelectorAll("[data-gap-save]").forEach((button) => {
+            button.addEventListener("click", () => this.saveAdminGap(button.dataset.gapSave, button));
+        });
+    }
+
+    async resolveAdminFeedback(feedbackId, resolved, createGap, button) {
+        button.disabled = true;
+        try {
+            const resolution = this.el["admin-content"].querySelector(`[data-feedback-resolution="${CSS.escape(feedbackId)}"]`)?.value.trim() || "";
+            await this.api(`/feedback/${encodeURIComponent(feedbackId)}/resolve`, {
+                method: "PATCH",
+                body: { resolved, resolution, create_gap: createGap },
+            });
+            this.showAlert(createGap ? "已创建知识缺口" : "反馈状态已更新");
+            await this.openAdminTab("quality");
+        } catch (error) {
+            this.showAlert(`处理失败：${error.message}`, "error");
+        } finally {
+            button.disabled = false;
+        }
+    }
+
+    async saveAdminGap(gapId, button) {
+        button.disabled = true;
+        try {
+            const status = this.el["admin-content"].querySelector(`[data-gap-status="${CSS.escape(gapId)}"]`)?.value || "open";
+            const resolution = this.el["admin-content"].querySelector(`[data-gap-resolution="${CSS.escape(gapId)}"]`)?.value.trim() || "";
+            await this.api(`/knowledge-gaps/${encodeURIComponent(gapId)}`, {
+                method: "PATCH",
+                body: { status, resolution },
+            });
+            this.showAlert("知识缺口已更新");
+            await this.openAdminTab("quality");
+        } catch (error) {
+            this.showAlert(`更新失败：${error.message}`, "error");
+        } finally {
+            button.disabled = false;
+        }
+    }
+
+    async loadAdminTeam() {
+        const content = this.el["admin-content"];
+        const [usersData, mcpData] = await Promise.all([
+            this.api("/team/users"),
+            this.api("/team/mcp-servers"),
+        ]);
+        let membersData = { members: [], error: "" };
+        if (this.currentKb?.id) {
+            try {
+                membersData = await this.api(`/team/kbs/${encodeURIComponent(this.currentKb.id)}/members`);
+            } catch (error) {
+                membersData = { members: [], error: error.message };
+            }
+        }
+        this.adminTeamData = {
+            users: usersData.users || [],
+            servers: mcpData.servers || [],
+            members: membersData.members || [],
+            membersError: membersData.error || "",
+        };
+        const teamMode = Boolean(this.authStatus?.team_mode);
+        const memberIds = new Set(this.adminTeamData.members.map((member) => member.id));
+        const shareableUsers = this.adminTeamData.users.filter((user) => user.is_active && !memberIds.has(user.id));
+        content.innerHTML = `<section class="admin-section">
+            ${this.adminHeading("团队与权限", "管理成员角色、知识库共享和 MCP 工具审批")}
+            ${teamMode ? `<form id="admin-create-user" class="admin-row">
+                <div class="admin-row-head"><span class="admin-row-title">新增成员</span><span class="status-pill info">团队模式</span></div>
+                <div class="admin-form-grid">
+                    <input class="form-control" name="username" minlength="2" maxlength="50" placeholder="用户名" required>
+                    <input class="form-control" name="email" type="email" maxlength="255" placeholder="邮箱" required>
+                    <input class="form-control" name="password" type="password" minlength="8" maxlength="128" placeholder="初始密码（至少 8 位）" required>
+                    <input class="form-control" name="department" maxlength="100" placeholder="部门（可选）">
+                    <select class="form-control" name="role"><option value="viewer">viewer · 只读</option><option value="editor">editor · 可编辑</option><option value="admin">admin · 管理员</option></select>
+                    <button class="btn btn-primary btn-sm" type="submit">创建成员</button>
+                </div>
+                <div class="admin-row-meta" data-admin-team-result></div>
+            </form>` : '<div class="admin-row"><p class="admin-row-text">当前是本地单用户模式。设置 <code>ZHIGE_AUTH_MODE=team</code> 并重启后，可创建成员和分配角色。</p></div>'}
+            <div class="admin-row">
+                <table class="admin-table">
+                    <thead><tr><th>成员</th><th>部门</th><th>角色</th><th>启用</th><th></th></tr></thead>
+                    <tbody>${this.adminTeamData.users.map((user) => `<tr data-admin-user="${this.esc(user.id)}">
+                        <td><strong>${this.esc(user.username)}</strong><div class="admin-row-meta">${this.esc(user.email)}</div></td>
+                        <td>${this.esc(user.department || "—")}</td>
+                        <td><select class="form-control" data-user-role ${teamMode ? "" : "disabled"}><option value="viewer" ${user.role === "viewer" ? "selected" : ""}>viewer</option><option value="editor" ${user.role === "editor" ? "selected" : ""}>editor</option><option value="admin" ${user.role === "admin" ? "selected" : ""}>admin</option></select></td>
+                        <td><input type="checkbox" data-user-active ${user.is_active ? "checked" : ""} ${teamMode ? "" : "disabled"} aria-label="启用 ${this.esc(user.username)}"></td>
+                        <td><button class="btn btn-ghost btn-sm" type="button" data-user-save="${this.esc(user.id)}" ${teamMode ? "" : "disabled"}>保存</button></td>
+                    </tr>`).join("")}</tbody>
+                </table>
+            </div>
+            <div class="admin-row">
+                <div class="admin-row-head"><span class="admin-row-title">知识库共享 · ${this.esc(this.currentKb?.name || "未选择知识库")}</span><span class="status-pill">${this.esc(this.currentKb?.access_role || "")}</span></div>
+                ${membersData.error ? `<p class="admin-row-text">成员加载失败：${this.esc(membersData.error)}</p>` : ""}
+                <div class="admin-row-actions">${this.adminTeamData.members.length ? this.adminTeamData.members.map((member) => `<span class="status-pill">${this.esc(member.username)} · ${this.esc(member.access_role)}</span>`).join("") : '<span class="admin-row-meta">暂无共享成员</span>'}</div>
+                ${teamMode && this.currentKb ? `<form id="admin-share-form" class="admin-form-grid">
+                    <select class="form-control" name="user_id"><option value="">选择成员</option>${shareableUsers.map((user) => `<option value="${this.esc(user.id)}">${this.esc(user.username)} · ${this.esc(user.email)}</option>`).join("")}</select>
+                    <select class="form-control" name="role"><option value="viewer">只读</option><option value="editor">可编辑</option></select>
+                    <button class="btn btn-secondary btn-sm" type="submit">共享当前知识库</button>
+                </form>` : ""}
+                <div class="admin-row-actions">${this.adminTeamData.members.filter((member) => member.member_id).map((member) => `<button class="btn btn-ghost btn-sm" type="button" data-member-remove="${this.esc(member.member_id)}">移除 ${this.esc(member.username)}</button>`).join("")}</div>
+            </div>
+            <div class="admin-row">
+                <div class="admin-row-head"><span class="admin-row-title">MCP 工具审批</span><span class="status-pill warn">${this.adminTeamData.servers.filter((server) => server.approval_status === "pending").length} 个待审批</span></div>
+                <div class="admin-list">${this.adminTeamData.servers.length ? this.adminTeamData.servers.map((server) => `<article class="admin-row" data-admin-mcp="${this.esc(server.id)}">
+                    <div class="admin-row-head"><span class="admin-row-title">${this.esc(server.name)}</span><span class="status-pill ${server.approval_status === "approved" ? "ok" : server.approval_status === "rejected" ? "bad" : "warn"}">${this.esc(server.approval_status || "pending")}</span></div>
+                    <code class="admin-row-meta">${this.esc(server.command)}</code>
+                    <div class="admin-form-grid">
+                        <input class="form-control span-2" data-mcp-reason="${this.esc(server.id)}" maxlength="1000" placeholder="审批备注或拒绝原因">
+                        <div class="admin-row-actions span-2">
+                            <button class="btn btn-primary btn-sm" type="button" data-mcp-decision="approved" data-id="${this.esc(server.id)}">批准</button>
+                            <button class="btn btn-ghost btn-sm" type="button" data-mcp-decision="rejected" data-id="${this.esc(server.id)}">拒绝</button>
+                        </div>
+                    </div>
+                </article>`).join("") : '<div class="admin-empty">暂无 MCP 连接</div>'}</div>
+            </div>
+        </section>`;
+        content.querySelector("#admin-create-user")?.addEventListener("submit", (event) => {
+            event.preventDefault();
+            this.createAdminUser(event.currentTarget);
+        });
+        content.querySelectorAll("[data-user-save]").forEach((button) => {
+            button.addEventListener("click", () => this.saveAdminUser(button.dataset.userSave, button));
+        });
+        content.querySelector("#admin-share-form")?.addEventListener("submit", (event) => {
+            event.preventDefault();
+            this.shareAdminKb(event.currentTarget);
+        });
+        content.querySelectorAll("[data-member-remove]").forEach((button) => {
+            button.addEventListener("click", () => this.removeAdminKbMember(button.dataset.memberRemove, button));
+        });
+        content.querySelectorAll("[data-mcp-decision]").forEach((button) => {
+            button.addEventListener("click", () => this.decideAdminMcp(button.dataset.id, button.dataset.mcpDecision, button));
+        });
+    }
+
+    async createAdminUser(form) {
+        if (!form.reportValidity()) return;
+        const button = form.querySelector("button[type=submit]");
+        const result = form.querySelector("[data-admin-team-result]");
+        button.disabled = true;
+        result.textContent = "正在创建成员";
+        const data = new FormData(form);
+        try {
+            await this.api("/team/users", {
+                method: "POST",
+                body: {
+                    username: String(data.get("username") || "").trim(),
+                    email: String(data.get("email") || "").trim(),
+                    password: String(data.get("password") || ""),
+                    department: String(data.get("department") || "").trim(),
+                    role: String(data.get("role") || "viewer"),
+                },
+            });
+            this.showAlert("成员已创建");
+            await this.loadAdminTeam();
+        } catch (error) {
+            result.textContent = `创建失败：${error.message}`;
+        } finally {
+            button.disabled = false;
+        }
+    }
+
+    async saveAdminUser(userId, button) {
+        const row = this.el["admin-content"].querySelector(`[data-admin-user="${CSS.escape(userId)}"]`);
+        if (!row) return;
+        button.disabled = true;
+        try {
+            await this.api(`/team/users/${encodeURIComponent(userId)}`, {
+                method: "PATCH",
+                body: {
+                    role: row.querySelector("[data-user-role]").value,
+                    is_active: row.querySelector("[data-user-active]").checked,
+                },
+            });
+            this.showAlert("成员权限已更新");
+            await this.loadAdminTeam();
+        } catch (error) {
+            this.showAlert(`更新成员失败：${error.message}`, "error");
+        } finally {
+            button.disabled = false;
+        }
+    }
+
+    async shareAdminKb(form) {
+        if (!this.currentKb?.id) return;
+        const data = new FormData(form);
+        const userId = String(data.get("user_id") || "");
+        if (!userId) {
+            this.showAlert("请选择要共享的成员", "error");
+            return;
+        }
+        const button = form.querySelector("button[type=submit]");
+        button.disabled = true;
+        try {
+            await this.api(`/team/kbs/${encodeURIComponent(this.currentKb.id)}/members`, {
+                method: "POST",
+                body: { user_id: userId, role: String(data.get("role") || "viewer") },
+            });
+            this.showAlert("知识库共享已更新");
+            await this.loadAdminTeam();
+        } catch (error) {
+            this.showAlert(`共享失败：${error.message}`, "error");
+        } finally {
+            button.disabled = false;
+        }
+    }
+
+    async removeAdminKbMember(memberId, button) {
+        if (!this.currentKb?.id || !confirm("移除这个成员的知识库访问权限？")) return;
+        button.disabled = true;
+        try {
+            await this.api(`/team/kbs/${encodeURIComponent(this.currentKb.id)}/members/${encodeURIComponent(memberId)}`, { method: "DELETE" });
+            this.showAlert("已移除共享权限");
+            await this.loadAdminTeam();
+        } catch (error) {
+            this.showAlert(`移除失败：${error.message}`, "error");
+        } finally {
+            button.disabled = false;
+        }
+    }
+
+    async decideAdminMcp(serverId, decision, button) {
+        button.disabled = true;
+        try {
+            const reason = this.el["admin-content"].querySelector(`[data-mcp-reason="${CSS.escape(serverId)}"]`)?.value.trim() || "";
+            await this.api(`/team/mcp-servers/${encodeURIComponent(serverId)}/decision`, {
+                method: "POST",
+                body: { decision, reason },
+            });
+            this.showAlert(decision === "approved" ? "MCP 连接已批准" : "MCP 连接已拒绝");
+            this.mcpServers = [];
+            await this.loadAdminTeam();
+        } catch (error) {
+            this.showAlert(`审批失败：${error.message}`, "error");
+        } finally {
+            button.disabled = false;
+        }
+    }
+
+    async loadAdminAudit() {
+        const content = this.el["admin-content"];
+        const data = await this.api("/admin/audit?limit=200");
+        const labels = {
+            document_delete: "删除资料", document_status: "资料状态", document_reindex: "重索引",
+            kb_share: "知识库共享", feedback_resolve: "处理差评", knowledge_gap_update: "知识缺口",
+            backup_export: "导出备份", backup_restore: "恢复包", mcp_approve: "MCP 审批",
+            config_change: "配置变更", evaluation_run: "运行评估",
+            user_disable: "停用成员", user_enable: "启用成员",
+        };
+        content.innerHTML = `<section class="admin-section">
+            ${this.adminHeading("审计日志", "追踪资料、权限、审批、备份和质量治理操作", '<button class="btn btn-ghost btn-sm" id="admin-audit-refresh" type="button">刷新</button>')}
+            <input class="form-control" id="admin-audit-filter" type="search" placeholder="按动作、操作者或资源筛选">
+            <div class="admin-list">${data.items?.length ? data.items.map((item) => `<article class="admin-row" data-audit-row data-search="${this.esc(`${item.action} ${item.user_id || ""} ${item.resource || ""}`)}">
+                <div class="admin-row-head"><span class="admin-row-title">${this.esc(labels[item.action] || item.action)}</span><span class="status-pill ${item.success ? "ok" : "bad"}">${item.success ? "成功" : "失败"}</span></div>
+                <div class="admin-row-actions"><span class="status-pill">${this.esc(item.action)}</span><span class="admin-row-meta">${this.esc(this.formatAdminTime(item.created_at))}</span></div>
+                <p class="admin-row-text">操作者 ${this.esc(item.user_id || "—")} · 资源 ${this.esc(item.resource || "—")}${item.error ? ` · ${this.esc(item.error)}` : ""}</p>
+                ${Object.keys(item.details || {}).length ? `<pre class="admin-code">${this.esc(JSON.stringify(item.details, null, 2))}</pre>` : ""}
+            </article>`).join("") : '<div class="admin-empty">暂无审计记录</div>'}</div>
+        </section>`;
+        content.querySelector("#admin-audit-refresh")?.addEventListener("click", () => this.openAdminTab("audit"));
+        content.querySelector("#admin-audit-filter")?.addEventListener("input", (event) => {
+            const keyword = event.target.value.trim().toLowerCase();
+            content.querySelectorAll("[data-audit-row]").forEach((row) => {
+                row.hidden = Boolean(keyword) && !String(row.dataset.search || "").toLowerCase().includes(keyword);
+            });
+        });
+    }
+
+    renderAdminEvaluation(data) {
+        const content = this.el["admin-content"];
+        const reports = data.reports || [];
+        const percent = (value) => Number.isFinite(Number(value))
+            ? `${(Number(value) * 100).toFixed(Number(value) === 1 ? 0 : 1)}%`
+            : "—";
+        const metricCard = (summary, title, meta, path = "") => {
+            const verifiability = summary?.verifiability || {};
+            const latency = Number(summary?.avg_latency_ms);
+            return `<article class="admin-row">
+                <div class="admin-row-head"><span class="admin-row-title">${this.esc(title)}</span><span class="status-pill ${Number(summary?.retrieval_hit_rate) >= 0.8 ? "ok" : "warn"}">${this.esc(String(summary?.samples || 0))} 题</span></div>
+                <div class="admin-row-meta">${this.esc(meta || path || "评估报告")}</div>
+                <div class="metric-grid">
+                    <div class="metric-card"><span>检索命中</span><strong>${percent(summary?.retrieval_hit_rate)}</strong></div>
+                    <div class="metric-card"><span>关键词覆盖</span><strong>${percent(summary?.avg_keyword_coverage)}</strong></div>
+                    <div class="metric-card"><span>可验证回答</span><strong>${percent(verifiability.verified_rate)}</strong></div>
+                    <div class="metric-card"><span>平均耗时</span><strong>${Number.isFinite(latency) ? `${Math.round(latency)} ms` : "—"}</strong></div>
+                </div>
+                <details><summary class="admin-row-meta">查看完整指标与逐题明细</summary><pre class="admin-code">${this.esc(JSON.stringify(summary, null, 2))}</pre></details>
+            </article>`;
+        };
+        content.innerHTML = `<section class="admin-section">
+            ${this.adminHeading("评估与回归", "把差评导出为评估集后，用同一套指标验证检索和回答是否退化", '<button class="btn btn-primary btn-sm" id="admin-eval-run" type="button">运行评估</button>')}
+            ${this.evaluationResult ? metricCard(this.evaluationResult, "本次运行结果", `${this.evaluationResult.kb?.name || this.currentKb?.name || "默认知识库"} · ${this.formatAdminTime(new Date().toISOString())}`, this.evaluationResult.archive_path) : ""}
+            <div class="admin-list">${reports.length ? reports.map((report) => metricCard(report.summary || { samples: 0 }, report.name, `${this.formatAdminTime(report.updated_at)} · ${Math.max(1, Math.round(Number(report.size || 0) / 1024))} KB`, report.path)).join("") : '<div class="admin-empty">还没有评估报告。准备当前知识库的评估集后运行。</div>'}</div>
+        </section>`;
+        content.querySelector("#admin-eval-run")?.addEventListener("click", (event) => this.runAdminEvaluation(event.currentTarget));
+    }
+
+    async runAdminEvaluation(button) {
+        button.disabled = true;
+        button.textContent = "评估运行中";
+        const content = this.el["admin-content"];
+        let status = content.querySelector("[data-eval-status]");
+        if (!status) {
+            status = document.createElement("div");
+            status.dataset.evalStatus = "";
+            status.className = "admin-empty";
+            content.prepend(status);
+        }
+        status.textContent = "正在逐题运行检索与回答，可能需要几分钟。页面保持可用。";
+        try {
+            const query = this.currentKb?.id
+                ? `?kb_id=${encodeURIComponent(this.currentKb.id)}`
+                : "";
+            this.evaluationResult = await this.api(`/eval/run${query}`, { method: "POST" });
+            this.showAlert("评估已完成");
+            this.renderAdminEvaluation(await this.api("/admin/evaluations"));
+        } catch (error) {
+            status.textContent = `评估失败：${error.message}`;
+            button.disabled = false;
+            button.textContent = "运行评估";
+        }
+    }
+
+    renderAdminBackup(data) {
+        const content = this.el["admin-content"];
+        const pending = data.pending;
+        const backups = data.backups || [];
+        content.innerHTML = `<section class="admin-section">
+            ${this.adminHeading("备份与恢复", "备份运行数据与原文，恢复包在服务重启前保持隔离", '<button class="btn btn-primary btn-sm" id="admin-backup-create" type="button">立即备份</button>')}
+            <div class="admin-row">
+                <div class="admin-row-head"><span class="admin-row-title">备份安全边界</span><span class="status-pill ok">秘密排除</span></div>
+                <p class="admin-row-text">包含数据库、向量索引、原文、评估集和知识图谱；不打包 .env、API Key、Cookie 或浏览器数据。账号口令摘要随数据库用于恢复团队账号，备份文件应按敏感数据保管。</p>
+            </div>
+            ${pending ? `<div class="admin-row">
+                <div class="admin-row-head"><span class="admin-row-title">待应用恢复包</span><span class="status-pill warn">等待重启</span></div>
+                <p class="admin-row-text">${this.esc(pending.original_name || "backup.zip")} · ${this.esc(this.formatAdminTime(pending.created_at))} · ${this.esc(String(pending.token || "").slice(0, 10))}</p>
+                <div class="admin-row-actions"><button class="btn btn-ghost btn-sm" id="admin-restore-cancel" type="button">取消待恢复包</button></div>
+            </div>` : ""}
+            <div class="admin-row">
+                <div class="admin-row-head"><span class="admin-row-title">恢复工作区</span><span class="status-pill info">需二次确认</span></div>
+                <form id="admin-restore-form" class="admin-form-grid">
+                    <input class="form-control span-2" id="admin-restore-file" type="file" accept=".zip,application/zip" required>
+                    <input class="form-control span-2" id="admin-restore-confirm" maxlength="7" placeholder="输入 RESTORE 确认" required>
+                    <button class="btn btn-secondary btn-sm" type="submit">校验并暂存恢复包</button>
+                </form>
+                <div class="admin-row-meta" data-restore-result>恢复前会自动再生成一份当前数据备份。</div>
+            </div>
+            <div class="admin-row">
+                <div class="admin-row-head"><span class="admin-row-title">最近备份</span><span class="status-pill">${backups.length} 个</span></div>
+                <div class="admin-list">${backups.length ? backups.map((backup) => `<div class="admin-row-head">
+                    <a href="${this.esc(backup.download_url)}" download>${this.esc(backup.name)}</a>
+                    <span class="admin-row-meta">${Math.max(1, Math.round(Number(backup.size || 0) / 1024 / 1024))} MB · ${this.esc(this.formatAdminTime(backup.created_at))}</span>
+                </div>`).join("") : '<div class="admin-empty">还没有备份</div>'}</div>
+            </div>
+            ${data.last ? `<div class="admin-row"><div class="admin-row-head"><span class="admin-row-title">上次恢复记录</span><span class="status-pill">${this.esc(data.last.status || "unknown")}</span></div><pre class="admin-code">${this.esc(JSON.stringify(data.last, null, 2))}</pre></div>` : ""}
+        </section>`;
+        content.querySelector("#admin-backup-create")?.addEventListener("click", (event) => this.createAdminBackup(event.currentTarget));
+        content.querySelector("#admin-restore-form")?.addEventListener("submit", (event) => {
+            event.preventDefault();
+            this.stageAdminRestore(event.currentTarget);
+        });
+        content.querySelector("#admin-restore-cancel")?.addEventListener("click", () => this.cancelAdminRestore());
+    }
+
+    async createAdminBackup(button) {
+        button.disabled = true;
+        button.textContent = "正在备份";
+        try {
+            const result = await this.api("/admin/backup", { method: "POST" });
+            this.showAlert(`备份完成 · ${Math.max(1, Math.round(Number(result.size || 0) / 1024 / 1024))} MB`);
+            await this.openAdminTab("backup");
+        } catch (error) {
+            this.showAlert(`备份失败：${error.message}`, "error");
+        } finally {
+            button.disabled = false;
+            button.textContent = "立即备份";
+        }
+    }
+
+    async stageAdminRestore(form) {
+        const file = this.el["admin-restore-file"].files?.[0];
+        const confirmText = this.el["admin-restore-confirm"].value.trim();
+        const resultBox = form.querySelector("[data-restore-result]");
+        if (!file) {
+            resultBox.textContent = "请选择 ZIP 恢复包";
+            return;
+        }
+        if (confirmText.toUpperCase() !== "RESTORE") {
+            resultBox.textContent = "请输入 RESTORE 确认恢复";
+            return;
+        }
+        const body = new FormData();
+        body.append("file", file);
+        body.append("confirm", confirmText);
+        const button = form.querySelector("button[type=submit]");
+        button.disabled = true;
+        resultBox.textContent = "正在校验恢复包";
+        try {
+            const result = await this.api("/admin/restore", { method: "POST", body, raw: true });
+            resultBox.textContent = result.message || "恢复包已暂存，请重启服务";
+            this.showAlert("恢复包校验通过，将在重启时应用");
+            await this.openAdminTab("backup");
+        } catch (error) {
+            resultBox.textContent = `恢复包校验失败：${error.message}`;
+        } finally {
+            button.disabled = false;
+        }
+    }
+
+    async cancelAdminRestore() {
+        if (!confirm("取消待应用的恢复包？当前工作区不会改变。")) return;
+        try {
+            await this.api("/admin/restore", { method: "DELETE" });
+            this.showAlert("待恢复包已取消");
+            await this.openAdminTab("backup");
+        } catch (error) {
+            this.showAlert(`取消失败：${error.message}`, "error");
+        }
     }
 
     setSidebarOpen(open) {
@@ -1778,19 +2834,107 @@ class ChatApp {
             return;
         }
         box.innerHTML = `<ul class="docs-list">${list.map((document) => `
-            <li>
-                <button class="docs-item" type="button" data-source="${this.esc(document.source)}">
+            <li class="docs-record">
+                <button class="docs-item" type="button" data-doc-open="${this.esc(document.id)}">
                     <span class="item-main">${this.esc(document.title || document.source)}</span>
-                    <span class="item-meta">${Number(document.chunks || 0)} 分块</span>
+                    <span class="item-meta">${Number(document.chunks || 0)} 分块 · ${this.esc(document.doc_status || "active")} · ${this.esc(document.index_status || "indexed")}</span>
                 </button>
+                ${this.documentActionsMarkup(document)}
             </li>
         `).join("")}</ul>`;
-        box.querySelectorAll(".docs-item").forEach((item) => {
-            item.addEventListener("click", () => this.openDocChunks(item.dataset.source));
+        box.querySelectorAll("[data-doc-open]").forEach((item) => {
+            item.addEventListener("click", () => {
+                const document = this.documents.find((entry) => entry.id === item.dataset.docOpen);
+                if (document) this.openDocChunks(document.source, document);
+            });
+        });
+        box.querySelectorAll(".docs-record").forEach((row) => {
+            const document = this.documents.find((entry) => entry.id === row.querySelector("[data-doc-open]")?.dataset.docOpen);
+            if (document) this.bindDocumentActions(row, document);
         });
     }
 
-    async openDocChunks(source) {
+    documentActionsMarkup(document) {
+        const locked = document.access_role === "viewer";
+        const status = document.doc_status || "active";
+        const indexStatus = document.index_status || "indexed";
+        const indexClass = indexStatus === "failed" ? "bad" : indexStatus === "indexed" ? "ok" : "warn";
+        return `<div class="docs-row-actions">
+            <span class="status-pill ${indexClass}" title="${this.esc(document.last_index_error || "")}">${this.esc(indexStatus)}</span>
+            <select class="form-control docs-status-select" data-doc-status="${this.esc(document.id)}" aria-label="资料状态" ${locked ? "disabled" : ""}>
+                <option value="active" ${status === "active" ? "selected" : ""}>生效</option>
+                <option value="draft" ${status === "draft" ? "selected" : ""}>草稿</option>
+                <option value="expired" ${status === "expired" ? "selected" : ""}>失效</option>
+            </select>
+            <button class="btn btn-ghost btn-sm" type="button" data-doc-reindex="${this.esc(document.id)}" ${locked || document.source_type === "web" ? "disabled" : ""}>重索引</button>
+            <button class="btn btn-ghost btn-sm docs-delete" type="button" data-doc-delete="${this.esc(document.id)}" ${locked ? "disabled" : ""}>删除</button>
+        </div>`;
+    }
+
+    bindDocumentActions(root, document) {
+        root.querySelector(`[data-doc-status="${CSS.escape(document.id)}"]`)?.addEventListener("change", (event) => {
+            this.updateDocumentStatus(document, event.target.value, event.target);
+        });
+        root.querySelector(`[data-doc-reindex="${CSS.escape(document.id)}"]`)?.addEventListener("click", (event) => {
+            this.reindexDocument(document, event.currentTarget);
+        });
+        root.querySelector(`[data-doc-delete="${CSS.escape(document.id)}"]`)?.addEventListener("click", () => {
+            this.deleteDocument(document);
+        });
+    }
+
+    async updateDocumentStatus(document, status, select) {
+        select.disabled = true;
+        try {
+            await this.api(`/documents/${encodeURIComponent(document.id)}/status`, {
+                method: "PATCH",
+                body: { status },
+            });
+            document.doc_status = status;
+            this.showAlert(`资料状态已改为 ${status}`);
+            if (this.el["docs-modal"].classList.contains("active")) await this.loadDocs();
+        } catch (error) {
+            select.value = document.doc_status || "active";
+            this.showAlert(`状态修改失败：${error.message}`, "error");
+        } finally {
+            select.disabled = false;
+        }
+    }
+
+    async reindexDocument(document, button) {
+        button.disabled = true;
+        const label = button.textContent;
+        button.textContent = "索引中";
+        try {
+            const result = await this.api(`/documents/${encodeURIComponent(document.id)}/reindex`, { method: "POST" });
+            this.showAlert(`重新索引完成 · ${result.ingested || result.chunks || 0} 个分块`);
+            await this.loadDocs();
+            await this.loadKnowledgeBases();
+        } catch (error) {
+            this.showAlert(`重索引失败：${error.message}`, "error");
+            if (this.el["docs-modal"].classList.contains("active")) await this.loadDocs();
+        } finally {
+            button.disabled = false;
+            button.textContent = label;
+        }
+    }
+
+    async deleteDocument(document) {
+        if (!confirm(`删除“${document.title || document.source}”的索引记录？`)) return;
+        const purgeRaw = document.source_type !== "web"
+            && confirm("是否同时删除本地原始文件？选择取消将保留原文件，之后可重新上传。");
+        try {
+            const params = new URLSearchParams({ purge_raw: String(purgeRaw) });
+            await this.api(`/documents/${encodeURIComponent(document.id)}?${params}`, { method: "DELETE" });
+            this.showAlert(`已删除 ${document.title || document.source}`);
+            await this.loadDocs();
+            await this.loadKnowledgeBases();
+        } catch (error) {
+            this.showAlert(`删除失败：${error.message}`, "error");
+        }
+    }
+
+    async openDocChunks(source, document = null) {
         const box = this.el["docs-content"];
         box.innerHTML = '<div class="command-empty">加载中</div>';
         const params = new URLSearchParams();
@@ -1800,20 +2944,28 @@ class ChatApp {
             const data = await this.api(`/documents/${encodeURIComponent(source)}/chunks?${params}`);
             this.el["docs-back"].hidden = false;
             this.el["docs-filter"].hidden = true;
-            this.renderChunks(source, data.chunks || []);
+            this.renderChunks(source, data.chunks || [], document);
         } catch (error) {
             box.innerHTML = `<div class="command-empty">${this.esc(error.message)}</div>`;
         }
     }
 
-    renderChunks(source, chunks) {
+    renderChunks(source, chunks, document = null) {
         const box = this.el["docs-content"];
+        const detailHead = document ? `<header class="docs-detail-head">
+            <div>
+                <h3>${this.esc(document.title || source)}</h3>
+                <div class="docs-detail-meta">${Number(document.chunks || chunks.length)} 分块 · ${this.esc(document.doc_status || "active")} · ${this.esc(document.index_status || "indexed")}</div>
+            </div>
+            ${this.documentActionsMarkup(document)}
+        </header>` : `<h3 class="docs-doc-title">${this.esc(source)}</h3>`;
         if (!chunks.length) {
-            box.innerHTML = '<div class="command-empty">暂无分块</div>';
+            box.innerHTML = `${detailHead}<div class="command-empty">暂无分块</div>`;
+            if (document) this.bindDocumentActions(box, document);
             return;
         }
         const sorted = chunks.slice().sort((a, b) => Number(a.metadata?.chunk_index || 0) - Number(b.metadata?.chunk_index || 0));
-        box.innerHTML = `<h3 class="docs-doc-title">${this.esc(source)}</h3>${sorted.map((chunk, index) => {
+        box.innerHTML = `${detailHead}${sorted.map((chunk, index) => {
             const heading = chunk.metadata?.chunk_prefix || chunk.metadata?.breadcrumb || "";
             return `<article class="chunk-card" data-chunk="${this.esc(chunk.id)}">
                 <div class="chunk-head">
@@ -1826,6 +2978,7 @@ class ChatApp {
         box.querySelectorAll(".chunk-card").forEach((card) => {
             card.querySelector(".chunk-save").addEventListener("click", () => this.saveChunk(card.dataset.chunk, card));
         });
+        if (document) this.bindDocumentActions(box, document);
     }
 
     async saveChunk(chunkId, card) {

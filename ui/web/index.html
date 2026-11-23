@@ -6,11 +6,44 @@
     <meta name="color-scheme" content="light dark">
     <title>知阁</title>
     <link rel="stylesheet" href="/css/main.css">
-    <link rel="stylesheet" href="/css/shell.css?v=20261120-6">
+    <link rel="stylesheet" href="/css/shell.css?v=20261123-5">
 </head>
 <body>
     <a class="skip-link" href="#chat-input">跳到提问</a>
     <div id="alert-container" role="status" aria-live="polite"></div>
+
+    <section id="auth-gate" class="auth-gate" aria-labelledby="auth-title" hidden>
+        <div class="auth-atmosphere" aria-hidden="true"></div>
+        <div class="auth-card">
+            <div class="auth-brand"><span class="auth-mark">知</span><span>知阁</span></div>
+            <p class="auth-eyebrow">企业知识可信问答</p>
+            <h1 id="auth-title">登录你的工作空间</h1>
+            <p class="auth-lead">答案附出处，资料不足会明确拒答。</p>
+            <form id="auth-login-form" class="stack-form auth-form" hidden>
+                <label class="form-label" for="auth-login">账号或邮箱</label>
+                <input id="auth-login" class="form-control" autocomplete="username" required>
+                <label class="form-label" for="auth-password">密码</label>
+                <input id="auth-password" class="form-control" type="password" autocomplete="current-password" required>
+                <div id="auth-login-result" class="settings-result" aria-live="polite"></div>
+                <button class="btn btn-primary auth-submit" type="submit">进入知识库</button>
+            </form>
+            <form id="auth-bootstrap-form" class="stack-form auth-form" hidden>
+                <p class="auth-note">首次启用团队模式，请创建管理员。系统会接管现有本地知识库。</p>
+                <label class="form-label" for="auth-bootstrap-name">管理员名称</label>
+                <input id="auth-bootstrap-name" class="form-control" minlength="2" maxlength="50" autocomplete="username" required>
+                <label class="form-label" for="auth-bootstrap-email">邮箱</label>
+                <input id="auth-bootstrap-email" class="form-control" type="email" autocomplete="email" required>
+                <label class="form-label" for="auth-bootstrap-password">密码</label>
+                <input id="auth-bootstrap-password" class="form-control" type="password" minlength="8" autocomplete="new-password" required>
+                <div id="auth-bootstrap-token-row" hidden>
+                    <label class="form-label" for="auth-bootstrap-token">初始化令牌</label>
+                    <input id="auth-bootstrap-token" class="form-control" autocomplete="one-time-code">
+                </div>
+                <div id="auth-bootstrap-result" class="settings-result" aria-live="polite"></div>
+                <button class="btn btn-primary auth-submit" type="submit">初始化并进入</button>
+            </form>
+        </div>
+    </section>
 
     <div class="app-layout" id="app-layout" hidden>
         <button class="sidebar-backdrop" id="sidebar-backdrop" type="button" aria-label="关闭导航"></button>
@@ -105,21 +138,63 @@
             </header>
 
             <section id="messages" class="messages" aria-label="对话内容" aria-live="polite">
-                <div class="empty-state" id="welcome-state">
-                    <h2>开始提问</h2>
-                    <div class="empty-actions">
-                        <button type="button" data-upload>
-                            <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 13V3m0 0L6.5 6.5M10 3l3.5 3.5M4 12v4h12v-4"/></svg>
-                            添加文档
-                        </button>
-                        <button type="button" data-import-url>
-                            <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M8.2 11.8a3.2 3.2 0 0 0 4.5 0l2-2a3.2 3.2 0 0 0-4.5-4.5l-1 1M11.8 8.2a3.2 3.2 0 0 0-4.5 0l-2 2a3.2 3.2 0 0 0 4.5 4.5l1-1"/></svg>
-                            导入网页
-                        </button>
-                        <button type="button" data-search>
-                            <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="9" cy="9" r="5.5"/><path d="m13 13 4 4"/></svg>
-                            搜索资料
-                        </button>
+                <div class="empty-state welcome-overview" id="welcome-state">
+                    <section class="welcome-hero" aria-labelledby="welcome-title">
+                        <div class="welcome-copy">
+                            <p class="welcome-eyebrow">企业知识库问答</p>
+                            <h2 id="welcome-title">公司资料，问一句就有答案</h2>
+                            <p class="welcome-lead">制度、合同、产品与运营资料都能问。关键结论附原文出处，资料不足时直接拒答。</p>
+                            <div class="welcome-scopes" aria-label="适用场景">
+                                <span>制度流程</span><span>合同审批</span><span>产品知识</span><span>团队协作</span>
+                            </div>
+                        </div>
+                        <div class="welcome-start">
+                            <button class="welcome-primary" type="button" data-demo-experience>
+                                <span>看一次真实问答</span>
+                                <small>自动载入四篇示例资料</small>
+                            </button>
+                            <button class="welcome-upload" type="button" data-upload>
+                                <span>换成我的资料</span>
+                                <small>PDF · Word · Excel · 网页</small>
+                            </button>
+                        </div>
+                    </section>
+                    <section class="welcome-question-section" aria-labelledby="welcome-examples-title">
+                        <div class="welcome-section-head">
+                            <div><h3 id="welcome-examples-title">可以这样问</h3><p>点一个问题，直接看回答和依据</p></div>
+                            <span>4 种能力</span>
+                        </div>
+                        <div class="welcome-question-grid">
+                            <button class="welcome-question" type="button" data-sample-question="2026 版制度下，一线城市住宿标准和报销时限分别是什么？">
+                                <span class="welcome-question-top"><span class="welcome-question-label">制度与流程</span><span class="welcome-question-try">试问</span></span>
+                                <strong>查清具体标准和时限</strong>
+                                <span class="welcome-question-prompt">2026 版制度下，一线城市住宿标准和报销时限分别是什么？</span>
+                                <small>定位到制度条款并附原文</small>
+                            </button>
+                            <button class="welcome-question" type="button" data-sample-question="超过 50 万元的合同需要哪些角色审批？">
+                                <span class="welcome-question-top"><span class="welcome-question-label">合同与审批</span><span class="welcome-question-try">试问</span></span>
+                                <strong>确认多级审批责任</strong>
+                                <span class="welcome-question-prompt">超过 50 万元的合同需要哪些角色审批？</span>
+                                <small>汇总审批角色并标注依据</small>
+                            </button>
+                            <button class="welcome-question" type="button" data-sample-question="知阁如何让回答可追溯？">
+                                <span class="welcome-question-top"><span class="welcome-question-label">产品与安全</span><span class="welcome-question-try">试问</span></span>
+                                <strong>看懂系统如何保证可信</strong>
+                                <span class="welcome-question-prompt">知阁如何让回答可追溯？</span>
+                                <small>从产品机制资料中提取答案</small>
+                            </button>
+                            <button class="welcome-question is-boundary" type="button" data-sample-question="公司年会的抽奖一等奖是什么？">
+                                <span class="welcome-question-top"><span class="welcome-question-label">可信边界</span><span class="welcome-question-try">试问</span></span>
+                                <strong>没有资料时明确拒答</strong>
+                                <span class="welcome-question-prompt">公司年会的抽奖一等奖是什么？</span>
+                                <small>验证系统不会编造答案</small>
+                            </button>
+                        </div>
+                    </section>
+                    <div class="welcome-proof" aria-label="产品能力概览">
+                        <span><strong>答案可核验</strong>点击引用回到原文</span>
+                        <span><strong>边界可感知</strong>没有依据就明确拒答</span>
+                        <span><strong>越用越准确</strong>差评进入评估与治理</span>
                     </div>
                 </div>
             </section>
@@ -151,7 +226,7 @@
                     <button class="composer-action" type="button" data-upload aria-label="添加文档" title="添加文档">
                         <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 4v12M4 10h12"/></svg>
                     </button>
-                    <textarea id="chat-input" rows="1" placeholder="提问" aria-label="提问"></textarea>
+                    <textarea id="chat-input" rows="1" placeholder="问制度、合同或产品资料" aria-label="提问"></textarea>
                     <button id="send-btn" class="send-button" type="submit" aria-label="发送">
                         <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 10h11m-4-4 4 4-4 4"/></svg>
                     </button>
@@ -357,6 +432,15 @@
                     <button id="emb-test" class="btn btn-secondary btn-sm" type="button">测试</button>
                 </section>
 
+                <section class="settings-section governance-section">
+                    <h3>团队与治理</h3>
+                    <p id="account-summary" class="settings-hint">本地工作空间</p>
+                    <div class="settings-action-row">
+                        <button id="admin-open" class="btn btn-secondary btn-sm" type="button">管理后台</button>
+                        <button id="team-logout" class="btn btn-ghost btn-sm" type="button" hidden>退出登录</button>
+                    </div>
+                </section>
+
                 <div id="settings-result" class="settings-result" aria-live="polite"></div>
                 <div class="form-actions">
                     <button id="settings-reset" class="btn btn-ghost" type="button">恢复默认</button>
@@ -366,6 +450,67 @@
         </div>
     </div>
 
-    <script src="/js/app.js?v=20261120-6"></script>
+    <div id="feedback-modal" class="modal" role="dialog" aria-modal="true" aria-labelledby="feedback-title">
+        <div class="modal-content feedback-modal-content">
+            <div class="modal-header">
+                <div>
+                    <p class="modal-kicker">质量纠错</p>
+                    <h2 id="feedback-title">这次回答哪里不对？</h2>
+                </div>
+                <button class="modal-close icon-button" type="button" aria-label="关闭">
+                    <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m5 5 10 10M15 5 5 15"/></svg>
+                </button>
+            </div>
+            <form id="feedback-form" class="stack-form">
+                <label class="form-label" for="feedback-type">主要问题</label>
+                <select id="feedback-type" class="form-control">
+                    <option value="answer_error">答案不准确</option>
+                    <option value="missing_source">知识库缺少资料</option>
+                    <option value="retrieval">资料存在但没有检索到</option>
+                    <option value="citation">引用与原文不匹配</option>
+                    <option value="incomplete">答案不完整</option>
+                    <option value="other">其他</option>
+                </select>
+                <label class="form-label" for="feedback-correction">期望答案或补充说明</label>
+                <textarea id="feedback-correction" class="form-control" rows="4" maxlength="8000" placeholder="可填写正确结论、缺失的资料名称或需要改进的地方"></textarea>
+                <div class="feedback-checks">
+                    <label><input id="feedback-citation" type="checkbox"> 引用有误</label>
+                    <label><input id="feedback-missing" type="checkbox"> 知识库缺少这份资料</label>
+                </div>
+                <div id="feedback-result" class="settings-result" aria-live="polite"></div>
+                <div class="form-actions">
+                    <button class="btn btn-ghost" type="button" data-modal-cancel>取消</button>
+                    <button id="feedback-submit" class="btn btn-primary" type="submit">提交并进入治理队列</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <div id="admin-modal" class="modal" role="dialog" aria-modal="true" aria-labelledby="admin-title">
+        <div class="modal-content modal-wide admin-modal-content">
+            <div class="modal-header admin-header">
+                <div>
+                    <p class="modal-kicker">Enterprise workspace</p>
+                    <h2 id="admin-title">管理后台</h2>
+                </div>
+                <button class="modal-close icon-button" type="button" aria-label="关闭">
+                    <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m5 5 10 10M15 5 5 15"/></svg>
+                </button>
+            </div>
+            <div class="admin-shell">
+                <nav id="admin-tabs" class="admin-tabs" aria-label="管理分类">
+                    <button type="button" data-admin-tab="overview" aria-selected="true">概览</button>
+                    <button type="button" data-admin-tab="quality">质量治理</button>
+                    <button type="button" data-admin-tab="team">团队与 MCP</button>
+                    <button type="button" data-admin-tab="audit">审计</button>
+                    <button type="button" data-admin-tab="eval">评估</button>
+                    <button type="button" data-admin-tab="backup">备份恢复</button>
+                </nav>
+                <div id="admin-content" class="admin-content" aria-live="polite"></div>
+            </div>
+        </div>
+    </div>
+
+    <script src="/js/app.js?v=20261123-5"></script>
 </body>
 </html>
