@@ -32,24 +32,29 @@ from sqlalchemy.orm import Session
 
 from api.deps import get_runtime_config
 from src.db.database import get_db
-from src.db.models import ChatMessage, User
+from src.db.models import ChatMessage, KnowledgeBase, User
 from src.kb_service import (
     KBError,
     append_message,
     create_kb,
     create_session,
+    can_access_kb,
     delete_kb,
     delete_session,
     ensure_default_kb,
+    get_accessible_kb,
     get_session,
-    list_kbs,
+    list_accessible_kbs,
+    list_kb_members,
     list_messages,
     list_sessions,
     refresh_kb_stats,
+    set_kb_sharing,
     update_kb,
     update_session,
 )
 from src.middleware.identity import get_current_user
+from src.security import effective_role
 from src.utils import get_logger
 
 logger = get_logger("api.routes.kb")
@@ -68,6 +73,17 @@ class KBCreateBody(BaseModel):
 class KBUpdateBody(BaseModel):
     name: Optional[str] = Field(None, min_length=1, max_length=100)
     description: Optional[str] = Field(None, max_length=500)
+
+
+class KBMemberBody(BaseModel):
+    user_id: str = Field(..., min_length=1, max_length=36)
+    permission: str = Field("read", pattern=r"^(read|write)$")
+
+
+class KBSharingBody(BaseModel):
+    visibility: Optional[str] = Field(None, pattern=r"^(private|department|company)$")
+    department: Optional[str] = Field(None, max_length=100)
+    members: Optional[List[KBMemberBody]] = None
 
 
 class SessionCreateBody(BaseModel):
@@ -89,15 +105,30 @@ class MessageCreateBody(BaseModel):
 # ======================================================================
 #  序列化
 # ======================================================================
-def _kb_dict(kb) -> Dict[str, Any]:
+def _kb_permission(db: Session, user: User, kb: KnowledgeBase) -> str:
+    if effective_role(user) == "admin" or kb.user_id == user.id:
+        return "manage"
+    if can_access_kb(db, user, kb, "write"):
+        return "write"
+    return "read"
+
+
+def _kb_dict(db: Session, user: User, kb: KnowledgeBase) -> Dict[str, Any]:
+    permission = _kb_permission(db, user, kb)
     return {
         "id": kb.id,
+        "owner_id": kb.user_id,
         "name": kb.name,
         "description": kb.description or "",
         "collection_name": kb.collection_name,
         "doc_count": kb.doc_count or 0,
         "chunk_count": kb.chunk_count or 0,
         "is_default": bool(kb.is_default),
+        "visibility": kb.visibility or "private",
+        "department": kb.department or "",
+        "permission": permission,
+        "can_write": permission in {"manage", "write"},
+        "can_manage": permission == "manage",
         "created_at": kb.created_at.isoformat() if kb.created_at else None,
         "updated_at": kb.updated_at.isoformat() if kb.updated_at else None,
     }
@@ -131,9 +162,9 @@ async def api_list_kb(
     user: User = current_user
     try:
         ensure_default_kb(db, user.id, get_runtime_config())
-        items = list_kbs(db, user.id)
+        items = list_accessible_kbs(db, user)
         return {
-            "knowledge_bases": [_kb_dict(kb) for kb in items],
+            "knowledge_bases": [_kb_dict(db, user, kb) for kb in items],
             "total": len(items),
         }
     except Exception as exc:
@@ -151,7 +182,7 @@ async def api_create_kb(
     user: User = current_user
     try:
         kb = create_kb(db, user, body.name, body.description, get_runtime_config())
-        return _kb_dict(kb)
+        return _kb_dict(db, user, kb)
     except KBError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
@@ -168,8 +199,9 @@ async def api_get_kb(
     """知识库详情（统计会实时重算）。"""
     user: User = current_user
     try:
-        kb = refresh_kb_stats(db, user.id, kb_id)
-        return _kb_dict(kb)
+        accessible = get_accessible_kb(db, user, kb_id, "read")
+        kb = refresh_kb_stats(db, accessible.user_id, kb_id)
+        return _kb_dict(db, user, kb)
     except KBError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -184,8 +216,11 @@ async def api_update_kb(
     """改名 / 改描述。"""
     user: User = current_user
     try:
-        kb = update_kb(db, user.id, kb_id, body.name, body.description)
-        return _kb_dict(kb)
+        accessible = get_accessible_kb(db, user, kb_id, "write")
+        if effective_role(user) != "admin" and accessible.user_id != user.id:
+            raise KBError("只有知识库所有者或系统管理员可以修改知识库")
+        kb = update_kb(db, accessible.user_id, kb_id, body.name, body.description)
+        return _kb_dict(db, user, kb)
     except KBError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -199,12 +234,63 @@ async def api_delete_kb(
     """删除知识库（连带其向量 collection、文档台账与会话）。默认库不可删。"""
     user: User = current_user
     try:
-        return delete_kb(db, user.id, kb_id, get_runtime_config())
+        accessible = get_accessible_kb(db, user, kb_id, "write")
+        if effective_role(user) != "admin" and accessible.user_id != user.id:
+            raise KBError("只有知识库所有者或系统管理员可以删除知识库")
+        return delete_kb(db, accessible.user_id, kb_id, get_runtime_config())
     except KBError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         logger.error("删除知识库失败: %s", exc)
         raise HTTPException(status_code=500, detail="删除知识库失败") from exc
+
+
+@router.get("/api/v1/kb/{kb_id}/members", tags=["知识库"])
+async def api_list_kb_members(
+    kb_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    try:
+        kb = get_accessible_kb(db, current_user, kb_id, "write")
+        if effective_role(current_user) != "admin" and kb.user_id != current_user.id:
+            raise KBError("只有知识库所有者或系统管理员可以查看成员权限")
+        rows = list_kb_members(db, kb_id)
+        return {
+            "members": [
+                {
+                    "user_id": row.user_id,
+                    "permission": row.permission,
+                    "created_at": row.created_at.isoformat() if row.created_at else None,
+                }
+                for row in rows
+            ],
+            "visibility": kb.visibility,
+            "department": kb.department or "",
+        }
+    except KBError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.put("/api/v1/kb/{kb_id}/sharing", tags=["知识库"])
+async def api_update_kb_sharing(
+    kb_id: str,
+    body: KBSharingBody,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    try:
+        kb = set_kb_sharing(
+            db,
+            current_user,
+            kb_id,
+            visibility=body.visibility,
+            department=body.department,
+            members=[item.model_dump() for item in body.members] if body.members is not None else None,
+        )
+        return _kb_dict(db, current_user, kb)
+    except KBError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 # ======================================================================
@@ -265,8 +351,12 @@ async def api_create_session(
         kb_id = body.kb_id
         if not kb_id:
             kb_id = ensure_default_kb(db, user.id, get_runtime_config()).id
+        else:
+            kb_id = get_accessible_kb(db, user, kb_id, "read").id
         session = create_session(db, user.id, body.title, kb_id)
         return _session_dict(session)
+    except KBError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     except Exception as exc:
         logger.error("创建会话失败: %s", exc)
         raise HTTPException(status_code=500, detail="创建会话失败") from exc

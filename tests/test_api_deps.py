@@ -192,17 +192,11 @@ class TestRouteModuleSurface:
             "/api/v1/agent/chat",
             "/api/v1/eval/run",
             "/api/v1/config",
+            "/api/v1/auth/login",
+            "/api/v1/auth/logout",
+            "/api/v1/auth/me",
+            "/api/v1/admin/users",
             "/ws/chat",
             "/api/v1/ws/agent",
         ):
             assert required in paths, f"missing route: {required}"
-
-        # 登录 / 注册路由必须已经不存在
-        for removed in (
-            "/api/v1/auth/register",
-            "/api/v1/auth/login",
-            "/api/v1/auth/refresh",
-            "/api/v1/auth/me",
-            "/api/v1/auth/logout",
-        ):
-            assert removed not in paths, f"auth route should be removed: {removed}"

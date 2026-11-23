@@ -10,6 +10,29 @@
 <body>
     <div id="alert-container"></div>
 
+    <!-- ============ 企业登录 ============ -->
+    <div id="login-overlay" class="modal active">
+        <div class="modal-content login-modal">
+            <div class="welcome-header">
+                <div class="welcome-logo">📚</div>
+                <h1>登录知阁</h1>
+                <p class="welcome-subtitle">企业模式需要账号认证</p>
+            </div>
+            <form id="login-form" class="login-form">
+                <label class="form-label" for="login-username">用户名或邮箱</label>
+                <input id="login-username" class="form-control" autocomplete="username" required>
+                <label class="form-label" for="login-password">密码</label>
+                <input id="login-password" type="password" class="form-control"
+                       autocomplete="current-password" required>
+                <div id="login-error" class="login-error" role="alert"></div>
+                <button id="login-submit" class="btn btn-primary btn-block" type="submit">
+                    登录
+                </button>
+            </form>
+            <p class="welcome-hint">本地模式会自动进入；企业模式请使用管理员分配的账号。</p>
+        </div>
+    </div>
+
     <!-- ============ 首次使用引导（仅首次显示）============ -->
     <div id="welcome-overlay" class="modal">
         <div class="modal-content welcome-modal">
@@ -54,7 +77,7 @@
                 <button id="welcome-start" class="btn btn-primary btn-block" type="button">
                     开始使用
                 </button>
-                <p class="welcome-hint">数据全程保留在你的电脑上，无需登录</p>
+                <p class="welcome-hint">本地模式数据留在本机；企业模式受账号和权限保护</p>
             </div>
         </div>
     </div>
@@ -82,6 +105,10 @@
             </section>
 
             <div class="sidebar-foot">
+                <div class="user-badge">
+                    <span id="user-name">未登录</span>
+                    <button id="logout-btn" class="btn btn-ghost btn-sm" type="button">退出</button>
+                </div>
                 <button id="upload-btn" class="btn btn-secondary btn-block" type="button">上传文档</button>
                 <button id="url-btn" class="btn btn-secondary btn-block" type="button">导入网页</button>
                 <button id="docs-btn" class="btn btn-secondary btn-block" type="button">文档管理</button>

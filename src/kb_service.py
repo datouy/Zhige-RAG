@@ -18,11 +18,20 @@ import re
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
-from src.db.models import ChatMessage, ChatSession, DocumentRecord, KnowledgeBase, User
+from src.db.models import (
+    ChatMessage,
+    ChatSession,
+    DocumentRecord,
+    KnowledgeBase,
+    KnowledgeBaseMember,
+    User,
+)
 from src.factories import _sanitize_user_id
-from src.utils import get_logger, resolve_path
+from src.security import effective_role
+from src.utils import get_logger
 
 logger = get_logger("kb_service")
 
@@ -90,6 +99,164 @@ def get_kb(db: Session, user_id: str, kb_id: str) -> KnowledgeBase:
     return kb
 
 
+def _member_permission(db: Session, user_id: str, kb_id: str) -> Optional[str]:
+    row = (
+        db.query(KnowledgeBaseMember)
+        .filter(
+            KnowledgeBaseMember.kb_id == kb_id,
+            KnowledgeBaseMember.user_id == user_id,
+        )
+        .first()
+    )
+    return str(row.permission or "read") if row is not None else None
+
+
+def can_access_kb(
+    db: Session,
+    user: User,
+    kb: KnowledgeBase,
+    required_permission: str = "read",
+) -> bool:
+    """对象级知识库授权；默认拒绝，admin 与所有者拥有完整权限。"""
+    required = str(required_permission or "read").lower()
+    if required not in {"read", "write"}:
+        return False
+    if effective_role(user) == "admin" or kb.user_id == user.id:
+        return True
+    member = _member_permission(db, user.id, kb.id)
+    if member == "write":
+        return True
+    if member == "read":
+        return required == "read"
+    visibility = str(kb.visibility or "private").lower()
+    if required == "read" and visibility == "company":
+        return True
+    dept = str(getattr(user, "department", "") or "").strip()
+    if (
+        required == "read"
+        and visibility == "department"
+        and dept
+        and dept == str(kb.department or "").strip()
+    ):
+        return True
+    return False
+
+
+def get_accessible_kb(
+    db: Session,
+    user: User,
+    kb_id: str,
+    required_permission: str = "read",
+) -> KnowledgeBase:
+    """按对象 ACL 取知识库；不存在与越权统一返回同一错误。"""
+    kb = db.get(KnowledgeBase, kb_id)
+    if kb is None or not can_access_kb(db, user, kb, required_permission):
+        raise KBError("知识库不存在或无权访问")
+    return kb
+
+
+def list_accessible_kbs(db: Session, user: User) -> List[KnowledgeBase]:
+    """列出所有者、显式成员、本部门共享和全员共享的知识库。"""
+    if effective_role(user) == "admin":
+        return (
+            db.query(KnowledgeBase)
+            .order_by(KnowledgeBase.is_default.desc(), KnowledgeBase.created_at.asc())
+            .all()
+        )
+    member_ids = [
+        row[0]
+        for row in db.query(KnowledgeBaseMember.kb_id)
+        .filter(KnowledgeBaseMember.user_id == user.id)
+        .all()
+    ]
+    conditions = [
+        KnowledgeBase.user_id == user.id,
+        KnowledgeBase.visibility == "company",
+    ]
+    if member_ids:
+        conditions.append(KnowledgeBase.id.in_(member_ids))
+    dept = str(getattr(user, "department", "") or "").strip()
+    if dept:
+        conditions.append(
+            (KnowledgeBase.visibility == "department")
+            & (KnowledgeBase.department == dept)
+        )
+    return (
+        db.query(KnowledgeBase)
+        .filter(or_(*conditions))
+        .order_by(KnowledgeBase.is_default.desc(), KnowledgeBase.created_at.asc())
+        .all()
+    )
+
+
+def set_kb_sharing(
+    db: Session,
+    user: User,
+    kb_id: str,
+    *,
+    visibility: Optional[str] = None,
+    department: Optional[str] = None,
+    members: Optional[List[Dict[str, str]]] = None,
+) -> KnowledgeBase:
+    """所有者/admin 调整知识库共享范围与显式成员。"""
+    kb = db.get(KnowledgeBase, kb_id)
+    if kb is None or not can_access_kb(db, user, kb, "write"):
+        raise KBError("知识库不存在或无权访问")
+    if effective_role(user) != "admin" and kb.user_id != user.id:
+        raise KBError("只有知识库所有者或系统管理员可以调整共享权限")
+
+    if visibility is not None:
+        normalized = str(visibility).strip().lower()
+        if normalized not in {"private", "department", "company"}:
+            raise KBError("visibility 仅支持 private / department / company")
+        kb.visibility = normalized
+    if department is not None:
+        kb.department = str(department).strip()[:100]
+    if kb.visibility == "department" and not (kb.department or user.department):
+        raise KBError("部门共享必须设置部门")
+    if kb.visibility == "department" and not kb.department:
+        kb.department = str(user.department or "").strip()
+
+    if members is not None:
+        db.query(KnowledgeBaseMember).filter(KnowledgeBaseMember.kb_id == kb.id).delete(
+            synchronize_session=False
+        )
+        seen: set[str] = set()
+        for item in members:
+            target_id = str((item or {}).get("user_id") or "").strip()
+            permission = str((item or {}).get("permission") or "read").strip().lower()
+            if not target_id or target_id in seen:
+                continue
+            if target_id == kb.user_id:
+                continue
+            if permission not in {"read", "write"}:
+                raise KBError("成员权限仅支持 read / write")
+            target = db.get(User, target_id)
+            if target is None or not bool(target.is_active):
+                raise KBError(f"成员不存在或已停用：{target_id}")
+            db.add(
+                KnowledgeBaseMember(
+                    kb_id=kb.id,
+                    user_id=target.id,
+                    permission=permission,
+                    created_by=user.id,
+                )
+            )
+            seen.add(target_id)
+    db.commit()
+    db.refresh(kb)
+    return kb
+
+
+def list_kb_members(db: Session, kb_id: str) -> List[KnowledgeBaseMember]:
+    return (
+        db.query(KnowledgeBaseMember)
+        .filter(KnowledgeBaseMember.kb_id == kb_id)
+        .order_by(KnowledgeBaseMember.created_at.asc())
+        .all()
+    )
+
+
 def ensure_default_kb(
     db: Session, user_id: str, cfg: Dict[str, Any]
 ) -> KnowledgeBase:
@@ -117,6 +284,8 @@ def ensure_default_kb(
             user_id, None, base_collection, cfg.get("embedding"), is_default=True
         ),
         is_default=True,
+        visibility="private",
+        department="",
     )
     db.add(kb)
     db.commit()
@@ -170,6 +339,8 @@ def create_kb(
         description=(description or "").strip(),
         collection_name="",  # 先占位，拿到 id 后再算（命名里含 kb 短 id）
         is_default=False,
+        visibility="private",
+        department=str(user.department or ""),
     )
     db.add(kb)
     db.flush()  # 需要 id 才能算 collection 名
@@ -263,50 +434,20 @@ def delete_kb(db: Session, user_id: str, kb_id: str, cfg: Dict[str, Any]) -> Dic
 
 
 def _drop_collection(collection_name: str, cfg: Dict[str, Any]) -> bool:
-    """删除 Chroma collection（不存在或失败返回 False，不阻塞主流程）。
-
-    关键：**必须复用进程内已打开的 Chroma client**。Chroma 的 ``PersistentClient``
-    对同一 persist 目录在同一个进程里只允许存在一种配置实例，再建一个会直接抛
-    ``An instance of Chroma already exists ... with different settings`` ——
-    这正是"删除知识库后向量库仍在"的原因。
-    """
+    """删除当前向量后端的 collection/table；失败返回 False。"""
     if not collection_name:
         return False
 
     from src.factories import TenantAwareFactory
 
-    # 1) 优先取被删库自己的 store；否则退而取任意一个（它们共享同一 client）
-    client = None
-    cached = TenantAwareFactory._chroma_stores.pop(collection_name, None)
-    if cached is not None:
-        client = getattr(cached, "client", None)
-    if client is None:
-        for store in list(TenantAwareFactory._chroma_stores.values()):
-            client = getattr(store, "client", None)
-            if client is not None:
-                break
-
-    # 2) 进程内确实没有打开的 client 时，才新建（配置需与 vector_store 一致）
-    if client is None:
-        try:
-            import chromadb
-            from chromadb.config import Settings
-
-            persist_dir = resolve_path(
-                (cfg.get("vector_store") or {}).get(
-                    "persist_directory", "data/chroma_db"
-                )
-            )
-            client = chromadb.PersistentClient(
-                path=str(persist_dir),
-                settings=Settings(anonymized_telemetry=False, allow_reset=False),
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("无法获取 Chroma client，跳过 collection 删除: %s", exc)
-            return False
-
     try:
-        client.delete_collection(collection_name)
+        store = TenantAwareFactory._chroma_stores.pop(collection_name, None)
+        if store is None:
+            store = TenantAwareFactory.get_chroma_store_by_name(collection_name, cfg)
+        delete = getattr(store, "delete_collection", None)
+        if not callable(delete):
+            raise RuntimeError("当前向量后端不支持删除 collection")
+        delete()
         logger.info("已删除 collection：%s", collection_name)
         return True
     except Exception as exc:  # noqa: BLE001
@@ -491,6 +632,7 @@ __all__ = [
     "DEFAULT_KB_NAME",
     "KBError",
     "append_message",
+    "can_access_kb",
     "collection_name_for",
     "create_kb",
     "create_session",
@@ -498,12 +640,16 @@ __all__ = [
     "delete_session",
     "ensure_default_kb",
     "ensure_session",
+    "get_accessible_kb",
     "get_kb",
     "get_session",
     "list_kbs",
+    "list_accessible_kbs",
+    "list_kb_members",
     "list_messages",
     "list_sessions",
     "refresh_kb_stats",
+    "set_kb_sharing",
     "update_kb",
     "update_session",
 ]

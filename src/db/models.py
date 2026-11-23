@@ -2,9 +2,8 @@
 
 包含 User、UsageLog 等数据库模型。
 
-说明：本服务不需要登录，因此 ``User`` 表里没有口令相关字段，
-也不存在 refresh token 表 —— 全服务只有一个固定的"本地用户"
-（见 :mod:`src.middleware.identity`），它的作用是标记数据归属。
+认证凭据和企业会话分别存放在 ``auth_credentials`` / ``auth_sessions``；
+local 模式仍使用固定本地用户（见 :mod:`src.middleware.identity`）。
 
 四层架构补充表：
 - DocumentRecord  ：数据层文档登记表（来源/状态/权限/更新时间/内容哈希）
@@ -14,7 +13,17 @@
 from __future__ import annotations
 import uuid
 from datetime import datetime
-from sqlalchemy import Column, String, Boolean, DateTime, Integer, Text, UniqueConstraint, Index
+from sqlalchemy import (
+    Boolean,
+    Column,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import declarative_base
 
 Base = declarative_base()
@@ -24,11 +33,9 @@ Base = declarative_base()
 class User(Base):
     """用户模型。
 
-    服务不提供注册 / 登录，这个表实际只有一行：固定的本地用户。
-    保留它是因为文档、知识库、会话等数据都要记录 ``user_id``。
-
-    历史库里的 ``password_hash`` 列会在启动时被 ``init_db`` 自动删除
-    （见 :mod:`src.db.database` 的 ``_LEGACY_COLUMN_CLEANUP``）。
+    enterprise 模式下每行对应一个真实账号；local 模式只有固定的
+    ``00000000-0000-0000-0000-000000000001`` 用户。历史
+    ``password_hash`` 列仍会由 ``init_db`` 清理，新凭据使用独立表。
     """
     __tablename__ = "users"
 
@@ -38,10 +45,58 @@ class User(Base):
     # 所属部门/分组：与文档 metadata.acl（逗号分隔）配合实现数据层权限过滤；
     # 空串 = 仅可见 acl="*" 的全员文档
     department = Column(String(100), default="", nullable=False)
+    # 企业模式职责：member / kb_admin / admin / auditor。
+    # is_admin 保留用于兼容旧数据与旧调用点，有效角色以 effective_role() 为准。
+    role = Column(String(20), default="member", nullable=False, index=True)
     is_active = Column(Boolean, default=True)
     is_admin = Column(Boolean, default=False)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class AuthCredential(Base):
+    """企业模式密码凭据。
+
+    与 User 分表，避免历史无登录数据库的结构清理误删认证字段。密码使用
+    scrypt + 独立随机盐保存，不保存明文，也不使用可逆加密。
+    """
+
+    __tablename__ = "auth_credentials"
+
+    user_id = Column(
+        String(36),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    password_hash = Column(String(512), nullable=False)
+    failed_attempts = Column(Integer, default=0, nullable=False)
+    locked_until = Column(DateTime, nullable=True)
+    password_changed_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(
+        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False
+    )
+
+
+class AuthSession(Base):
+    """服务端可撤销登录会话。数据库只保存 token 的 SHA-256 摘要。"""
+
+    __tablename__ = "auth_sessions"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(
+        String(36),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    token_hash = Column(String(64), unique=True, nullable=False, index=True)
+    expires_at = Column(DateTime, nullable=False, index=True)
+    revoked = Column(Boolean, default=False, nullable=False, index=True)
+    ip_address = Column(String(128), nullable=True)
+    user_agent = Column(String(512), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    last_seen_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
 
 class UsageLog(Base):
@@ -167,6 +222,9 @@ class KnowledgeBase(Base):
     collection_name = Column(String(255), nullable=False)
     doc_count = Column(Integer, default=0, nullable=False)
     chunk_count = Column(Integer, default=0, nullable=False)
+    # private（仅所有者）/ department（本部门只读）/ company（全员只读）
+    visibility = Column(String(20), default="private", nullable=False, index=True)
+    department = Column(String(100), default="", nullable=False, index=True)
     # 每个用户的第一个库标记为默认库：未显式指定 kb_id 的写入/检索都落到这里
     is_default = Column(Boolean, default=False, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -174,6 +232,33 @@ class KnowledgeBase(Base):
 
     __table_args__ = (
         UniqueConstraint("user_id", "name", name="uq_kb_user_name"),
+    )
+
+
+class KnowledgeBaseMember(Base):
+    """显式知识库成员授权；所有者与 admin 不需要成员行。"""
+
+    __tablename__ = "knowledge_base_members"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    kb_id = Column(
+        String(36),
+        ForeignKey("knowledge_bases.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    user_id = Column(
+        String(36),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    permission = Column(String(20), default="read", nullable=False)  # read|write
+    created_by = Column(String(36), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("kb_id", "user_id", name="uq_kb_member"),
     )
 
 

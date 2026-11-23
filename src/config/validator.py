@@ -31,6 +31,23 @@ class DatabaseConfig(_StrictModel):
     pool_pre_ping: bool = Field(True, description="使用前验证连接")
 
 
+class SecurityConfig(_StrictModel):
+    mode: str = Field("enterprise", description="enterprise | local")
+    session_ttl_minutes: int = Field(480, ge=5, le=43200)
+    max_failed_attempts: int = Field(5, ge=1, le=100)
+    lock_minutes: int = Field(15, ge=1, le=1440)
+    cookie_secure: bool = False
+    allow_testclient: bool = False
+
+    @field_validator("mode")
+    @classmethod
+    def validate_mode(cls, value: str) -> str:
+        normalized = str(value or "enterprise").strip().lower()
+        if normalized not in {"enterprise", "local"}:
+            raise ValueError("security.mode must be enterprise or local")
+        return normalized
+
+
 # ======================== LLM 配置 ========================
 
 class LLMQuantizationConfig(_StrictModel):
@@ -170,6 +187,7 @@ class KnowledgeGraphConfig(_StrictModel):
     enabled: bool = Field(True, description="是否启用知识图谱")
     auto_build_on_ingest: bool = Field(False, description="入库后异步触发建图；仅 enabled 且配置生成式 LLM 时生效")
     backend: str = Field("sqlite", description="存储后端")
+    strict_backend: bool = Field(False, description="集中式后端不可用时是否拒绝回退")
     sqlite_path: str = Field("data/kg.db", description="SQLite 数据库路径")
     max_entities_per_chunk: int = Field(20, ge=1, le=100, description="每块最大实体数")
     max_relations_per_chunk: int = Field(30, ge=1, le=100, description="每块最大关系数")
@@ -315,6 +333,7 @@ class EvaluationConfig(_StrictModel):
 class ConfigSchema(_StrictModel):
     """主配置 Schema。"""
     project: ProjectConfig = Field(default_factory=ProjectConfig)
+    security: SecurityConfig = Field(default_factory=SecurityConfig)
     app: Dict[str, str] = Field(default_factory=dict)
     paths: PathsConfig = Field(default_factory=PathsConfig)
     document_loader: DocumentLoaderConfig = Field(default_factory=DocumentLoaderConfig)

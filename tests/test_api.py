@@ -5,7 +5,7 @@
 
 说明：
 - 使用 TestClient（无需启动独立服务器）。
-- 服务不需要登录：所有端点直接访问即可，测试里没有任何 token / 登录步骤。
+- 测试运行在 local 回环模式；企业模式认证由 test_enterprise_auth.py 覆盖。
 - 问答 / WebSocket 测试通过 monkeypatch 替换 ``get_runtime_pipeline``，
   避免真实加载 LLM（模型加载 + 推理会让测试套件慢数分钟）。
 """
@@ -68,15 +68,17 @@ def client():
         chat_module.get_runtime_pipeline = original
 
 
-# =========================== 测试：无需登录 ===========================
+# =========================== 测试：本地回环模式 ===========================
 class TestNoLoginRequired:
-    """服务不需要登录：受保护端点直接可访问，登录注册端点已移除。"""
+    """local 模式仅用于回环测试；企业登录端点由独立测试覆盖。"""
 
-    @pytest.mark.parametrize("path", ["/api/v1/auth/login", "/api/v1/auth/register"])
-    def test_auth_endpoints_removed(self, client, path):
-        """登录 / 注册端点必须已删除（404 或 405）。"""
-        response = client.post(path, json={"username": "x", "password": "y"})
-        assert response.status_code in (404, 405)
+    def test_login_endpoint_exists_but_register_does_not(self, client):
+        assert client.post(
+            "/api/v1/auth/login", json={"username": "x", "password": "y"}
+        ).status_code == 401
+        assert client.post(
+            "/api/v1/auth/register", json={"username": "x", "password": "y"}
+        ).status_code in (404, 405)
 
     def test_documents_without_token(self, client):
         """不带任何凭证也能读文档列表。"""

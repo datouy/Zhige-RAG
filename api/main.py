@@ -2,8 +2,8 @@
 
 提供 REST API + WebSocket 流式问答，逐步替代 Streamlit 交互界面。
 
-本服务**不需要登录**：所有请求自动归属唯一的本地用户（见
-``src/middleware/identity.py``），因此没有任何注册 / 登录端点。
+服务支持 enterprise（默认，强制登录）与 local（仅回环地址）两种身份模式；
+认证和角色依赖见 `src/middleware/identity.py`。
 
 启动命令：
     uvicorn api.main:app --reload --host 0.0.0.0 --port 8000
@@ -169,6 +169,14 @@ async def lifespan(app: FastAPI):
     try:
         init_db()
         logger.info("数据库初始化完成")
+        from src.db.database import SessionLocal
+        from src.security import ensure_bootstrap_admin
+
+        bootstrap_db = SessionLocal()
+        try:
+            ensure_bootstrap_admin(bootstrap_db)
+        finally:
+            bootstrap_db.close()
         _log_orphan_summary()
 
         # P1.2: 启动期预热配置缓存，避免首次请求再走 yaml.safe_load
@@ -243,8 +251,8 @@ async def lifespan(app: FastAPI):
 # =========================== 应用实例 ===========================
 app = FastAPI(
     title="知阁 Zhige API",
-    description="知阁（Zhige）—— 本地中文知识库 RAG 平台，无需登录，支持多模型后端",
-    version="0.3.0",
+    description="知阁（Zhige）—— 支持企业认证与本地模式的中文知识库 RAG 平台",
+    version="0.4.0",
     lifespan=lifespan,
 )
 
@@ -309,6 +317,7 @@ app.add_middleware(
 # =========================== 路由挂载 ===========================
 from api.routes import (
     agent_router,
+    auth_router,
     chat_router,
     eval_router,
     feedback_router,
@@ -319,8 +328,9 @@ from api.routes import (
 )
 
 # 直接使用子路由里写明的 ``Depends(get_current_user)``：每个端点都要拿
-# 当前用户身份（本地单用户），P1 阶段无需 ``dependency_overrides`` hack。
+# 当前用户身份由统一依赖解析；local 模式仅允许回环地址。
 app.include_router(system_router)
+app.include_router(auth_router)
 app.include_router(settings_router)
 app.include_router(kb_router)
 app.include_router(chat_router)

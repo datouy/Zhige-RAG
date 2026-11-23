@@ -24,7 +24,7 @@ from api.deps import (
     invalidate_health_cache,
 )
 from src.db.models import User
-from src.middleware.identity import get_current_user
+from src.middleware.identity import require_admin, require_roles
 from src.utils import get_logger, resolve_path
 from sqlalchemy import text as _sa_text
 
@@ -128,23 +128,23 @@ async def health_check():
             overall_healthy = False
         checks["database"] = {"status": db_status, "details": db_details}
 
-        # ---- Chroma ----
+        # ---- Vector store ----
         chunks_total = 0
         chroma_status = "unknown"
         chroma_details: Dict[str, Any] = {}
         try:
-            from src.vector_store import probe_collections
-
             def _probe_vector_store():
-                return probe_collections(get_vector_store().client)
+                return get_vector_store().health_check()
 
             report = await run_in_threadpool(_probe_vector_store)
-            chunks_total = int(report.get("chunks", 0))
+            chunks_total = int(report.get("chunks", report.get("total_chunks", 0)) or 0)
             if report.get("status") == "healthy":
                 chroma_status = "healthy"
                 chroma_details = {
-                    "collections": report.get("collections", 0),
+                    "backend": report.get("backend", (cfg.get("vector_store") or {}).get("backend", "chroma")),
+                    "collections": report.get("collections", 1),
                     "chunks": chunks_total,
+                    "query_probe": report.get("query_probe", False),
                 }
             else:
                 chroma_status = "unhealthy"
@@ -159,6 +159,7 @@ async def health_check():
             logger.error("健康检查中的向量库探测失败: %s", e)
             overall_healthy = False
         checks["chroma"] = {"status": chroma_status, "details": chroma_details}
+        checks["vector_store"] = checks["chroma"]
 
         # ---- LLM 配置校验 ----
         llm_status = "unknown"
@@ -266,14 +267,18 @@ async def health_check():
                         _sa("SELECT collection_name FROM knowledge_bases")
                     ).fetchall()
                 }
-            client = get_vector_store().client
-            all_names = [str(getattr(c, "name", c)) for c in client.list_collections()]
-            orphaned = sorted(n for n in all_names if n and n not in active_names)
-            storage_details["chroma_collections"] = len(all_names)
-            storage_details["chroma_collections_active"] = len(active_names)
-            storage_details["chroma_collections_orphaned"] = len(orphaned)
-            if orphaned:
-                storage_details["orphaned_sample"] = orphaned[:10]
+            backend = str((cfg.get("vector_store") or {}).get("backend", "chroma")).lower()
+            orphaned: list[str] = []
+            storage_details["vector_backend"] = backend
+            if backend == "chroma":
+                client = get_vector_store().client
+                all_names = [str(getattr(c, "name", c)) for c in client.list_collections()]
+                orphaned = sorted(n for n in all_names if n and n not in active_names)
+                storage_details["chroma_collections"] = len(all_names)
+                storage_details["chroma_collections_active"] = len(active_names)
+                storage_details["chroma_collections_orphaned"] = len(orphaned)
+                if orphaned:
+                    storage_details["orphaned_sample"] = orphaned[:10]
             data_dir = resolve_path("data")
             storage_details["kg_files"] = (
                 len(list(data_dir.glob("kg_*.db"))) if data_dir.exists() else 0
@@ -293,7 +298,7 @@ async def health_check():
         payload: Dict[str, Any] = {
             "status": "ok" if overall_healthy else "degraded",
             "timestamp": _cn_timestamp(),
-            "version": "0.3.0",
+            "version": "0.4.0",
             "chunks": chunks_total,
             "sources": sources_total,
             "checks": checks,
@@ -316,7 +321,7 @@ async def health_check():
 
 
 @router.get("/api/health/invalidate")
-async def health_invalidate(current_user: User = Depends(get_current_user)):
+async def health_invalidate(current_user: User = Depends(require_admin)):
     """主动失效健康检查缓存（运维端点）。
 
     P5 审计修复：需要认证。之前完全匿名可调用，任何人都能高频刷此端点
@@ -330,7 +335,7 @@ async def health_invalidate(current_user: User = Depends(get_current_user)):
 @router.post("/api/v1/system/maintenance/cleanup", tags=["系统"])
 async def maintenance_cleanup(
     dry_run: bool = Query(True, description="true=仅预览；false=实际删除孤儿资源"),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_admin),
 ) -> Dict[str, Any]:
     """清理孤儿资源：未被任何知识库引用的 Chroma collection 与无主 KG 文件。
 
@@ -355,9 +360,13 @@ async def maintenance_cleanup(
             for row in conn.execute(_sa("SELECT id FROM users")).fetchall()
         }
 
-    client = get_vector_store().client
-    all_names = [str(getattr(c, "name", c)) for c in client.list_collections()]
-    orphan_collections = sorted(n for n in all_names if n and n not in active_names)
+    vector_backend = str((get_runtime_config().get("vector_store") or {}).get("backend", "chroma")).lower()
+    client = None
+    orphan_collections: list[str] = []
+    if vector_backend == "chroma":
+        client = get_vector_store().client
+        all_names = [str(getattr(c, "name", c)) for c in client.list_collections()]
+        orphan_collections = sorted(n for n in all_names if n and n not in active_names)
 
     data_dir = resolve_path("data")
     kg_cfg = get_runtime_config().get("knowledge_graph", {}) or {}
@@ -372,18 +381,22 @@ async def maintenance_cleanup(
 
     preview = {
         "dry_run": dry_run,
+        "vector_backend": vector_backend,
         "orphaned_collections": len(orphan_collections),
         "orphaned_collections_sample": orphan_collections[:20],
         "orphaned_kg_files": len(orphan_kg_files),
         "orphaned_kg_files_sample": [Path(p).name for p in orphan_kg_files[:20]],
     }
+    if vector_backend != "chroma":
+        preview["message"] = "集中式向量后端不使用 Chroma 孤儿 collection 清理"
     if dry_run:
         return preview
 
     removed_collections = 0
     for name in orphan_collections:
         try:
-            client.delete_collection(name)
+            if client is not None:
+                client.delete_collection(name)
             removed_collections += 1
         except Exception as exc:
             logger.warning("删除孤儿 collection %s 失败: %s", name, exc)
@@ -421,7 +434,7 @@ async def readiness_check():
         except Exception as e:
             db_status = f"error: {str(e)}"
 
-        # 检查 Chroma 向量库：文件存在不等于 collection 可读。
+        # 检查向量库后端：Chroma collection 或 pgvector 表必须真实可读。
         chroma_detail: Dict[str, Any] = {}
         try:
             def _probe_vector_store():
@@ -430,8 +443,9 @@ async def readiness_check():
             report = await run_in_threadpool(_probe_vector_store)
             chroma_status = "connected"
             chroma_detail = {
-                "collections": report.get("collections", 0),
-                "chunks": report.get("chunks", 0),
+                "backend": report.get("backend", "chroma"),
+                "collections": report.get("collections", 1),
+                "chunks": report.get("chunks", report.get("total_chunks", 0)),
                 "query_probe": report.get("query_probe", False),
             }
         except Exception as e:
@@ -478,7 +492,9 @@ async def readiness_check():
 
 
 @router.get("/api/metrics")
-async def prometheus_metrics():
+async def prometheus_metrics(
+    current_user: User = Depends(require_roles("auditor")),
+):
     """Prometheus 格式指标端点。"""
     try:
         from src.monitoring.metrics import metrics_collector, PROMETHEUS_AVAILABLE
@@ -497,7 +513,9 @@ async def prometheus_metrics():
 
 
 @router.get("/api/v1/metrics")
-async def get_metrics(current_user: User = Depends(get_current_user)):
+async def get_metrics(
+    current_user: User = Depends(require_roles("auditor")),
+):
     """JSON 格式指标端点。"""
     try:
         from src.monitoring.metrics import metrics_collector, PROMETHEUS_AVAILABLE
@@ -524,10 +542,10 @@ async def get_metrics(current_user: User = Depends(get_current_user)):
 
 
 @router.get("/api/v1/config")
-async def get_user_config(current_user: User = Depends(get_current_user)) -> Dict[str, Any]:
+async def get_user_config(current_user: User = Depends(require_admin)) -> Dict[str, Any]:
     """获取全量运行时配置（递归脱敏）。
 
-    这是本地单用户服务：读取者就是本机使用者，不做额外的权限判定；
+    仅管理员可读取；
     配置里的敏感键（密码 / 密钥 / token）由 ``_redact`` 统一替换为 ``***``。
     """
     try:

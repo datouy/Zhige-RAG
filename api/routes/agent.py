@@ -25,6 +25,7 @@ from pydantic import BaseModel, Field
 from api.deps import get_llm_gate, get_runtime_config, get_runtime_pipeline
 from src.db.models import User
 from src.middleware.identity import get_current_user
+from src.security import effective_role
 from src.utils import get_logger
 
 logger = get_logger("api.routes.agent")
@@ -40,9 +41,27 @@ _agent_by_user: Dict[str, Any] = {}
 _agent_lock = threading.RLock()
 
 
-def _get_agent_tools(user_id: Optional[str] = None):
+def _allowed_groups(user: User) -> Optional[List[str]]:
+    if effective_role(user) == "admin":
+        return None
+    groups = {"*"}
+    department = str(getattr(user, "department", "") or "").strip()
+    if department:
+        groups.add(department)
+    return sorted(groups)
+
+
+def _agent_cache_key(user_id: Optional[str], allowed_groups: Optional[List[str]]) -> str:
+    scope = "all" if allowed_groups is None else ",".join(allowed_groups)
+    return f"{user_id or '__global__'}:{scope}"
+
+
+def _get_agent_tools(
+    user_id: Optional[str] = None,
+    allowed_groups: Optional[List[str]] = None,
+):
     """获取（或创建）指定用户的 Agent 内置工具集。"""
-    cache_key = user_id or "__global__"
+    cache_key = _agent_cache_key(user_id, allowed_groups)
     if cache_key not in _agent_tools_by_user:
         with _agent_lock:
             if cache_key not in _agent_tools_by_user:
@@ -56,14 +75,19 @@ def _get_agent_tools(user_id: Optional[str] = None):
                     from api.deps import get_vector_store
 
                     vs = get_vector_store()
-                _agent_tools_by_user[cache_key] = BuiltinTools.create(vector_store=vs)
+                _agent_tools_by_user[cache_key] = BuiltinTools.create(
+                    vector_store=vs, allowed_groups=allowed_groups
+                )
     return _agent_tools_by_user[cache_key]
 
 
-def _get_agent(user_id: Optional[str] = None):
+def _get_agent(
+    user_id: Optional[str] = None,
+    allowed_groups: Optional[List[str]] = None,
+):
     """获取（或创建）指定用户的 ReActAgent 实例（LLM 为全局共享单例）。"""
     global _agent_by_user
-    cache_key = user_id or "__global__"
+    cache_key = _agent_cache_key(user_id, allowed_groups)
     if cache_key not in _agent_by_user:
         with _agent_lock:
             if cache_key not in _agent_by_user:
@@ -87,7 +111,7 @@ def _get_agent(user_id: Optional[str] = None):
                     raise RuntimeError("Pipeline 未加载 LLM，无法启动 Agent")
                 cfg = get_runtime_config()
                 max_steps = int(cfg.get("agent", {}).get("max_steps", 5))
-                tools = _get_agent_tools(user_id)
+                tools = _get_agent_tools(user_id, allowed_groups)
                 # d1 决策工具预选（可选）：仅当 decision.tool_select.enabled 时启用
                 decision_provider = None
                 if ((cfg.get("decision", {}) or {}).get("tool_select", {}) or {}).get("enabled"):
@@ -108,8 +132,9 @@ def reset_agent_cache(user_id: Optional[str] = None) -> None:
             _agent_by_user.clear()
             _agent_tools_by_user.clear()
         else:
-            _agent_by_user.pop(user_id, None)
-            _agent_tools_by_user.pop(user_id, None)
+            for mapping in (_agent_by_user, _agent_tools_by_user):
+                for key in [key for key in mapping if key.startswith(f"{user_id}:")]:
+                    mapping.pop(key, None)
 
 
 @router.get("/api/v1/agent/tools", tags=["Agent"])
@@ -119,7 +144,7 @@ async def list_agent_tools(
     """列出 Agent 可用工具（名称 + 描述 + 参数 schema）。"""
     user: User = current_user
     try:
-        tools = await run_in_threadpool(_get_agent_tools, user.id)
+        tools = await run_in_threadpool(_get_agent_tools, user.id, _allowed_groups(user))
         items = []
         for t in tools.list_tools():
             items.append(
@@ -150,7 +175,7 @@ def agent_chat_sync(
     """
     user: User = current_user
     try:
-        agent = _get_agent(user.id)
+        agent = _get_agent(user.id, _allowed_groups(user))
         if body.max_steps is not None and body.max_steps != agent.max_steps:
             from src.agent.react_agent import ReActAgent
 
@@ -194,16 +219,20 @@ def agent_chat_sync(
 async def websocket_agent(websocket: WebSocket):
     """WebSocket 流式 Agent 调用。
 
-    服务不需要登录：连接建立后直接绑定本地用户（见 :mod:`src.middleware.identity`），
-    与同路由的 REST 端点及 ``/ws/chat`` 行为一致。
+    企业模式先完成会话认证；local 模式仅允许回环地址。
     """
     from src.db.database import SessionLocal
-    from src.middleware.identity import get_local_user
+    from src.middleware.identity import authenticate_websocket
+    from src.security import AuthError
 
     db = SessionLocal()
     try:
-        ws_user = get_local_user(db)
+        try:
+            ws_user, _ = await authenticate_websocket(websocket, db)
+        except AuthError:
+            return
         user_id = ws_user.id
+        allowed_groups = _allowed_groups(ws_user)
     finally:
         db.close()
 
@@ -230,7 +259,7 @@ async def websocket_agent(websocket: WebSocket):
 
                 def _produce() -> None:
                     try:
-                        agent0 = _get_agent(user_id)
+                        agent0 = _get_agent(user_id, allowed_groups)
                         if (
                             isinstance(max_steps, int)
                             and max_steps > 0

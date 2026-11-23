@@ -28,7 +28,12 @@ _EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ingest")
 _MAX_JOBS = 200
 
 
-def create_job(kind: str, label: str, meta: Optional[Dict[str, Any]] = None) -> str:
+def create_job(
+    kind: str,
+    label: str,
+    meta: Optional[Dict[str, Any]] = None,
+    owner_id: str = "",
+) -> str:
     job_id = uuid.uuid4().hex[:12]
     now = time.time()
     with _JOBS_LOCK:
@@ -42,6 +47,7 @@ def create_job(kind: str, label: str, meta: Optional[Dict[str, Any]] = None) -> 
             "kind": kind,
             "label": label,
             "meta": meta or {},
+            "owner_id": str(owner_id or ""),
             "status": "queued",
             "progress": 0.0,
             "stage": "queued",
@@ -57,6 +63,15 @@ def get_job(job_id: str) -> Optional[Dict[str, Any]]:
     with _JOBS_LOCK:
         job = _JOBS.get(job_id)
         return dict(job) if job else None
+
+
+def get_job_for_user(job_id: str, user_id: str, is_admin: bool = False) -> Optional[Dict[str, Any]]:
+    job = get_job(job_id)
+    if job is None:
+        return None
+    if is_admin or job.get("owner_id") == str(user_id):
+        return job
+    return None
 
 
 def _update(job_id: str, **fields: Any) -> None:

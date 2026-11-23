@@ -110,10 +110,14 @@ def main() -> int:
                    capture_output=True)
     time.sleep(2)
 
-    backend_env = dict(os.environ, HF_ENDPOINT="https://hf-mirror.com")
+    backend_env = dict(
+        os.environ,
+        HF_ENDPOINT="https://hf-mirror.com",
+        AUTH_MODE=os.getenv("AUTH_MODE", "local"),
+    )
     frontend_env = dict(os.environ, HF_ENDPOINT="https://hf-mirror.com",
                         STREAMLIT_SERVER_PORT="8501",
-                        STREAMLIT_SERVER_ADDRESS="0.0.0.0",
+                        STREAMLIT_SERVER_ADDRESS="127.0.0.1",
                         STREAMLIT_SERVER_HEADLESS="true")
 
     # 1. 后端
@@ -121,7 +125,7 @@ def main() -> int:
     backend_log = LOG_DIR / "backend.log"
     backend_proc = run(
         [str(VENV_PY), "-m", "uvicorn", "api.main:app",
-         "--host", "0.0.0.0", "--port", "8000"],
+         "--host", "127.0.0.1", "--port", "8000"],
         env=backend_env,
         cwd=str(ROOT),
         stdout=open(backend_log, "w", encoding="utf-8"),
@@ -143,7 +147,7 @@ def main() -> int:
         frontend_proc = run(
             [str(VENV_PY), "-m", "streamlit", "run", "ui/app.py",
              "--server.port", "8501",
-             "--server.address", "0.0.0.0",
+             "--server.address", "127.0.0.1",
              "--server.headless=true",
              "--browser.gatherUsageStats=false"],
             env=frontend_env,

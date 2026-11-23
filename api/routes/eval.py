@@ -7,7 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException
 
 from api.deps import get_runtime_config, get_runtime_pipeline
 from src.db.models import User
-from src.middleware.identity import get_current_user
+from src.middleware.identity import require_admin
 from src.utils import get_logger, resolve_path
 
 logger = get_logger("api.routes.eval")
@@ -16,7 +16,7 @@ router = APIRouter()
 
 
 @router.post("/api/v1/eval/run", tags=["评估"])
-def run_evaluation(current_user: User = Depends(get_current_user)) -> Dict[str, Any]:
+def run_evaluation(current_user: User = Depends(require_admin)) -> Dict[str, Any]:
     """运行评估（使用已配置的评估集）。需要认证。
 
     必须是 ``def``（同步端点）：``evaluate()`` 会循环执行全量

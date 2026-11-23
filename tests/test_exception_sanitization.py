@@ -111,13 +111,13 @@ class TestExceptionSanitization:
             assert "message" in data
             assert "request_id" in data
 
-    def test_auth_endpoints_removed_and_safe(self, client):
-        """登录端点已移除，且 404 响应不泄露内部结构。"""
+    def test_auth_endpoint_rejects_bad_credentials_safely(self, client):
+        """登录失败不泄露数据库或内部结构。"""
         response = client.post(
             "/api/v1/auth/login",
-            json={"login": "nonexistent_user_12345", "password": "SomePass123"},
+            json={"username": "nonexistent_user_12345", "password": "SomePass123"},
         )
-        assert response.status_code in (404, 405)
+        assert response.status_code == 401
         content = str(response.json()).lower()
         assert "traceback" not in content
         assert "sqlalchemy" not in content

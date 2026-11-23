@@ -706,15 +706,20 @@ class RAGPipeline:
             and self.config.get("retrieval", {}).get("status_filter_fallback", True)
         ):
             with Timer("retrieve_unfiltered_fallback"):
+                from .vector_store import build_security_where
+
+                acl_only_where = build_security_where(
+                    status_filter=False, acl_groups=allowed_groups
+                )
                 hits = self.vector_store.query(
                     query_text=self._apply_query_instruction(norm_query),
                     top_k=fetch_k,
-                    where=where,
+                    where=acl_only_where,
                     score_threshold=self.config.get("retrieval", {}).get("score_threshold", 0.0),
                 )
             if hits:
                 logger.warning(
-                    "doc_status 过滤后 0 命中，已回退为不过滤检索（%d 条）。"
+                    "doc_status 过滤后 0 命中，已回退为仅 ACL 检索（%d 条）。"
                     "说明索引中存在无 doc_status 元数据的旧分块，请重新入库以启用状态过滤。",
                     len(hits),
                 )
@@ -1035,16 +1040,21 @@ class RAGPipeline:
         embedding = create_embedding(cfg.get("embedding", {}))
 
         # 2. Vector Store
-        vs = ChromaStore(
-            persist_directory=cfg["vector_store"]["persist_directory"],
+        from .vector_store import create_vector_store
+
+        vs_cfg = cfg.get("vector_store", {})
+        vs = create_vector_store(
+            backend=vs_cfg.get("backend", "chroma"),
+            pgvector_dsn=vs_cfg.get("pgvector_dsn", ""),
+            persist_directory=vs_cfg.get("persist_directory", "data/chroma_db"),
             # 非 local 后端追加"后端+模型"指纹，避免换模型后与旧向量混库
             collection_name=embedding_collection_name(
-                cfg["vector_store"].get("collection_name", "chinese_rag_kb"),
+                vs_cfg.get("collection_name", "chinese_rag_kb"),
                 cfg.get("embedding", {}),
             ),
             embedding_model=embedding,
-            distance_fn=cfg["vector_store"].get("distance_fn", "cosine"),
-            **hybrid_kwargs(cfg.get("vector_store", {})),
+            distance_fn=vs_cfg.get("distance_fn", "cosine"),
+            **hybrid_kwargs(vs_cfg),
         )
 
         # 3. LLM（P1.4：共用 _build_llm_from_cfg）

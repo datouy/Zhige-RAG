@@ -86,7 +86,7 @@ def test_submits_job_when_llm_ready(monkeypatch, tmp_path):
 
     submitted = {}
 
-    def fake_create(kind, label, meta=None):
+    def fake_create(kind, label, meta=None, owner_id=""):
         submitted["kind"] = kind
         return "job-1"
 

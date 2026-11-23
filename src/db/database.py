@@ -64,10 +64,16 @@ _LIGHT_COLUMN_MIGRATIONS = {
     "users": [
         # 数据层 ACL 分组依据
         ("department", "VARCHAR(100) NOT NULL DEFAULT ''"),
+        # 企业模式职责；历史本地用户启动后由身份层提升为 admin。
+        ("role", "VARCHAR(20) NOT NULL DEFAULT 'member'"),
     ],
     "document_records": [
         # 知识库概念层：文档归属到具体知识库；老数据留空 = 默认库
         ("kb_id", "VARCHAR(36)"),
+    ],
+    "knowledge_bases": [
+        ("visibility", "VARCHAR(20) NOT NULL DEFAULT 'private'"),
+        ("department", "VARCHAR(100) NOT NULL DEFAULT ''"),
     ],
 }
 
@@ -176,9 +182,9 @@ def _migrate_document_record_key() -> None:
 # 登录/注册时代的遗留结构清理：{表名: [列名]} 与 (表名, ...)
 #
 # 老版本支持注册登录，库里因此有 ``users.password_hash``（NOT NULL）和
-# ``refresh_tokens`` 表。服务现在不需要登录：password_hash 留着不仅无用，
-# 还会让"自动创建本地用户"撞上 NOT NULL 约束直接报错；refresh_tokens
-# 只是一堆死数据。启动时按存在性删除，重复执行安全。
+# ``refresh_tokens`` 表。新认证使用独立 auth_credentials / auth_sessions；
+# 旧 password_hash 保留在 users 表会让本地用户创建撞上 NOT NULL 约束，
+# refresh_tokens 也只是旧数据。启动时按存在性删除，重复执行安全。
 _LEGACY_COLUMN_CLEANUP = {"users": ["password_hash", "subscription_tier", "max_chunks", "max_queries_per_day"]}
 _LEGACY_TABLE_CLEANUP = ("refresh_tokens",)
 

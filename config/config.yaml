@@ -10,16 +10,26 @@
 # ------------------ 项目基础 ------------------
 project:
   name: "知阁 Zhige"
-  version: "0.3.0"
+  version: "0.4.0"
   description: "开箱即用的本地中文知识库 RAG 平台，面向个人开发者与中小企业"
 
 app:
   name: "知阁"
-  version: "0.3.0"
+  version: "0.4.0"
 
-# ------------------ 身份 ------------------
-# 本服务不提供注册与登录：所有请求自动归属固定的本地用户，
-# 数据归属关系见 src/middleware/identity.py，此处无需任何配置。
+# ------------------ 身份与企业认证 ------------------
+# mode: enterprise（默认，必须登录）| local（零登录，仅允许回环地址）
+# 企业模式的初始管理员只能由环境变量 / Secret 提供，禁止默认弱口令：
+#   BOOTSTRAP_ADMIN_USERNAME=admin
+#   BOOTSTRAP_ADMIN_PASSWORD=<至少12位、三类字符>
+# 首次登录后请修改密码并移除初始密码。
+security:
+  mode: "${AUTH_MODE:-enterprise}"
+  session_ttl_minutes: 480
+  max_failed_attempts: 5
+  lock_minutes: 15
+  cookie_secure: false          # HTTPS 部署请设 AUTH_COOKIE_SECURE=1
+  allow_testclient: false
 
 # ------------------ 数据目录 ------------------
 paths:
@@ -182,7 +192,8 @@ embedding:
 # ------------------ 向量数据库 ------------------
 vector_store:
   backend: "chroma"  # chroma | pgvector（pgvector需配pgvector_dsn并安装psycopg+pgvector扩展）
-  pgvector_dsn: ""   # 如 postgresql://user:pass@localhost:5432/zhige
+  # 企业多副本部署使用 pgvector；连接串应由 PGVECTOR_DSN 环境变量/Secret 注入。
+  pgvector_dsn: "${PGVECTOR_DSN:-}"   # 如 postgresql://user:pass@postgres:5432/zhige
   collection_name: "chinese_rag_kb"
   persist_directory: "data/chroma_db"
   distance_fn: "cosine"
@@ -568,6 +579,8 @@ knowledge_graph:
   enabled: false                  # 默认关闭
   auto_build_on_ingest: false     # 入库后异步触发建图；仅 enabled 且配置生成式 LLM 时生效
   backend: sqlite
+  # backend=neo4j 时默认严格连接：集中式部署不得静默回退到每个 Pod 的 SQLite。
+  strict_backend: false
   sqlite_path: data/kg.db
   neo4j:
     uri: bolt://localhost:7687

@@ -15,6 +15,7 @@ Pipeline 复用 LLM / Embedding（P1.4）。
 from __future__ import annotations
 
 import hashlib
+import os
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -49,7 +50,7 @@ from src.document_meta import enrich_directory, enrich_file
 from src.factories import TenantAwareFactory
 from src.memory import SESSION_MEMORY
 from src.middleware.audit import AuditAction, get_audit_logger
-from src.middleware.identity import get_current_user
+from src.middleware.identity import get_current_user, require_admin
 from src.monitoring.metrics import metrics_collector
 from src.rag_pipeline import RAGPipeline
 from src.rate_limit import limiter
@@ -58,6 +59,7 @@ from src.utils import SUPPORTED_EXTENSIONS, ensure_dir, get_logger, resolve_path
 logger = get_logger("api.routes.chat")
 
 router = APIRouter()
+_QUERY_RATE_LIMIT = os.getenv("RATE_LIMIT_QUERY", "60/minute")
 
 
 def _ingest_guard_provider(cfg: Dict[str, Any]):
@@ -85,11 +87,28 @@ def _allowed_groups(user: User) -> Optional[List[str]]:
     与数据层 acl 约定配套（文档 metadata.acl 为 ``*`` 或单分组名）；
     返回 None 表示该用户不做 ACL 过滤（仅当配置关闭 acl_filter 时生效）。
     """
+    from src.security import effective_role
+
+    if effective_role(user) == "admin":
+        return None
     groups = {"*"}
     dept = str(getattr(user, "department", "") or "").strip()
     if dept:
         groups.add(dept)
     return sorted(groups)
+
+
+def _document_allowed(user: User, record: DocumentRecord) -> bool:
+    """文档台账级 ACL；admin 与文档所有者直接通过，其余按 ACL 组判定。"""
+    from src.security import effective_role
+
+    if effective_role(user) == "admin" or record.user_id == user.id:
+        return True
+    groups = _allowed_groups(user)
+    if groups is None:
+        return True
+    acl = {part.strip() for part in str(record.acl or "").split(",") if part.strip()}
+    return bool(acl.intersection(groups))
 
 
 def _safe_filename(filename: Optional[str]) -> str:
@@ -250,18 +269,33 @@ def _commit_ingestion_metadata(
 # =========================== Documents ===========================
 @router.get("/api/v1/documents", tags=["文档"])
 async def list_documents(
+    kb_id: Optional[str] = None,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
     """列出已入库文档（按 source 聚合，合并数据层台账的状态/权限/更新时间）。需要认证。"""
     user: User = current_user
     try:
+        from src.kb_service import get_accessible_kb, list_accessible_kbs
+
+        if kb_id:
+            accessible_kbs = [get_accessible_kb(db, user, kb_id, "read")]
+        else:
+            accessible_kbs = list_accessible_kbs(db, user)
+        kb_ids = [kb.id for kb in accessible_kbs]
+        owner_ids = {kb.user_id for kb in accessible_kbs}
+        if not kb_ids:
+            return {"documents": [], "total": 0, "total_chunks": 0}
         records = (
             db.query(DocumentRecord)
-            .filter(DocumentRecord.user_id == user.id)
+            .filter(
+                DocumentRecord.user_id.in_(owner_ids),
+                DocumentRecord.kb_id.in_(kb_ids),
+            )
             .order_by(DocumentRecord.source.asc(), DocumentRecord.kb_id.asc())
             .all()
         )
+        records = [record for record in records if _document_allowed(user, record)]
         documents = [
             {
                 "source": record.source,
@@ -295,6 +329,7 @@ async def get_document_chunks(
     limit: int = 50,
     kb_id: Optional[str] = None,
     current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
     """获取指定文档的分块内容。需要认证。
 
@@ -304,31 +339,36 @@ async def get_document_chunks(
     user: User = current_user
     try:
         cfg = get_runtime_config()
-        kb = _resolve_kb(user, cfg, kb_id)
+        kb = _resolve_kb(user, cfg, kb_id, "read")
+        record = (
+            db.query(DocumentRecord)
+            .filter(
+                DocumentRecord.user_id == kb["owner_id"],
+                DocumentRecord.kb_id == kb["id"],
+                DocumentRecord.source == doc_id,
+            )
+            .first()
+        )
+        if record is None or not _document_allowed(user, record):
+            raise HTTPException(status_code=404, detail="文档不存在或无权访问")
         store = TenantAwareFactory.get_chroma_store_by_name(kb["collection_name"], cfg)
 
-        def _fetch() -> Dict[str, Any]:
-            return store.collection.get(
-                where={"source": {"$eq": doc_id}},
-                include=["documents", "metadatas"],
-                limit=limit,
-            )
+        def _fetch() -> List[Any]:
+            return store.get_by_source(doc_id)[: max(1, int(limit))]
 
-        result = await run_in_threadpool(_fetch)
+        hits = await run_in_threadpool(_fetch)
         chunks: List[Dict[str, Any]] = []
-        for i, (doc, meta) in enumerate(
-            zip(result.get("documents", []), result.get("metadatas", []))
-        ):
+        for hit in hits:
             chunks.append(
                 {
-                    "id": result["ids"][i]
-                    if "ids" in result and i < len(result["ids"])
-                    else f"chunk_{i}",
-                    "text": doc,
-                    "metadata": meta,
+                    "id": hit.id,
+                    "text": hit.text,
+                    "metadata": hit.metadata,
                 }
             )
         return {"doc_id": doc_id, "chunks": chunks, "total": len(chunks)}
+    except HTTPException:
+        raise
     except Exception as exc:
         logger.error("获取分块失败: %s", exc)
         raise HTTPException(status_code=500, detail=str(exc))
@@ -346,6 +386,7 @@ async def update_document_chunk(
     body: ChunkUpdateBody,
     kb_id: Optional[str] = None,
     current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
     """更新单个分块文本并重嵌向量 + 同步 BM25。需要认证。
 
@@ -355,20 +396,33 @@ async def update_document_chunk(
     user: User = current_user
     try:
         cfg = get_runtime_config()
-        kb = _resolve_kb(user, cfg, kb_id)
+        kb = _resolve_kb(user, cfg, kb_id, "write")
         store = TenantAwareFactory.get_chroma_store_by_name(kb["collection_name"], cfg)
 
-        def _patch() -> Dict[str, Any]:
-            got = store.collection.get(ids=[chunk_id], include=["documents", "metadatas", "embeddings"])
-            ids = got.get("ids") or []
-            if not ids:
+        def _read_chunk() -> tuple[Dict[str, Any], str]:
+            hits = store.get_by_ids([chunk_id])
+            if not hits:
                 raise HTTPException(status_code=404, detail=f"分块不存在: {chunk_id}")
-            meta = (got.get("metadatas") or [{}])[0] or {}
+            return hits[0].metadata or {}, hits[0].id
+
+        meta, _chunk_id = await run_in_threadpool(_read_chunk)
+        source = str(meta.get("source") or "")
+        record = (
+            db.query(DocumentRecord)
+            .filter(
+                DocumentRecord.user_id == kb["owner_id"],
+                DocumentRecord.kb_id == kb["id"],
+                DocumentRecord.source == source,
+            )
+            .first()
+        )
+        if record is None or not _document_allowed(user, record):
+            raise HTTPException(status_code=404, detail="文档不存在或无权访问")
+
+        def _patch() -> Dict[str, Any]:
             new_text = body.text.strip()
             vec = store.embedding_model.encode([new_text], batch_size=1).tolist()[0]
-            store.collection.upsert(ids=[chunk_id], documents=[new_text], embeddings=[vec], metadatas=[meta])
-            if store._bm25 is not None:
-                store._bm25.upsert_documents([chunk_id], [new_text], [meta])
+            store.update_chunk(chunk_id, new_text, vec, meta)
             return {"id": chunk_id, "text": new_text, "metadata": meta}
 
         return await run_in_threadpool(_patch)
@@ -389,7 +443,7 @@ class SearchBody(BaseModel):
 
 
 @router.post("/api/v1/search", tags=["文档"])
-@limiter.limit("60/minute")
+@limiter.limit(_QUERY_RATE_LIMIT)
 async def search_documents(
     request: Request,
     body: SearchBody,
@@ -400,7 +454,7 @@ async def search_documents(
     start = time.perf_counter()
     try:
         cfg = get_runtime_config()
-        kb = _resolve_kb(user, cfg, body.kb_id)
+        kb = _resolve_kb(user, cfg, body.kb_id, "read")
         store = TenantAwareFactory.get_chroma_store_by_name(kb["collection_name"], cfg)
         retrieval_cfg = cfg.get("retrieval", {})
 
@@ -414,7 +468,13 @@ async def search_documents(
             hits = store.query(query_text=body.query, top_k=body.top_k, where=where)
             # 旧索引兼容回退（仅状态过滤；ACL 绝不回退）
             if not hits and where is not None and retrieval_cfg.get("status_filter_fallback", True):
-                hits = store.query(query_text=body.query, top_k=body.top_k)
+                acl_only = build_security_where(
+                    status_filter=False,
+                    acl_groups=_allowed_groups(user)
+                    if retrieval_cfg.get("acl_filter", True)
+                    else None,
+                )
+                hits = store.query(query_text=body.query, top_k=body.top_k, where=acl_only)
             return hits
 
         hits = await run_in_threadpool(_query)
@@ -435,6 +495,8 @@ async def search_documents(
             ],
             "total": len(hits),
         }
+    except HTTPException:
+        raise
     except Exception as exc:
         logger.error("检索失败: %s", exc)
         raise HTTPException(status_code=500, detail=str(exc))
@@ -451,7 +513,7 @@ class ChatRequest(BaseModel):
 
 
 @router.post("/api/v1/chat", tags=["问答"])
-@limiter.limit("60/minute")
+@limiter.limit(_QUERY_RATE_LIMIT)
 def chat_sync(
     request: Request,
     body: ChatRequest,
@@ -475,7 +537,10 @@ def chat_sync(
     try:
         # 指定知识库时在该库内检索，否则用默认库（行为与之前一致）
         kb = _resolve_kb(user, get_runtime_config(), body.kb_id) if body.kb_id else None
-        pipeline = get_runtime_pipeline(user_id=user.id, kb=kb)
+        pipeline = get_runtime_pipeline(
+            user_id=(kb or {}).get("owner_id", user.id),
+            kb=kb,
+        )
         session_id = (body.session_id or "").strip() or "default"
 
         # 长期记忆：显式"记住"指令先行落库（替身 pipeline / 存储缺失时静默跳过）
@@ -560,7 +625,12 @@ def chat_sync(
 
 
 # =========================== Ingest ===========================
-def _resolve_kb(user: User, cfg: Dict[str, Any], kb_id: Optional[str]) -> Dict[str, str]:
+def _resolve_kb(
+    user: User,
+    cfg: Dict[str, Any],
+    kb_id: Optional[str],
+    permission: str = "read",
+) -> Dict[str, str]:
     """解析本次写入的目标知识库。
 
     返回**脱离 ORM 会话的普通 dict**（id / name / collection_name）——
@@ -570,18 +640,23 @@ def _resolve_kb(user: User, cfg: Dict[str, Any], kb_id: Optional[str]) -> Dict[s
     ``kb_id`` 为空时落到默认知识库（保证老客户端行为不变）。
     """
     from src.db.database import SessionLocal
-    from src.kb_service import KBError, ensure_default_kb, get_kb
+    from src.kb_service import KBError, ensure_default_kb, get_accessible_kb
 
     db = SessionLocal()
     try:
         if kb_id:
             try:
-                kb = get_kb(db, user.id, kb_id)
+                kb = get_accessible_kb(db, user, kb_id, permission)
             except KBError as exc:
                 raise HTTPException(status_code=404, detail=str(exc)) from exc
         else:
             kb = ensure_default_kb(db, user.id, cfg)
-        return {"id": kb.id, "name": kb.name, "collection_name": kb.collection_name}
+        return {
+            "id": kb.id,
+            "name": kb.name,
+            "collection_name": kb.collection_name,
+            "owner_id": kb.user_id,
+        }
     finally:
         db.close()
 
@@ -615,7 +690,12 @@ def _maybe_trigger_kg_build(user_id: str, cfg: Dict[str, Any]) -> None:
         from src.ingest_jobs import create_job, submit as _submit_job
         from scripts.build_kg import build as _build_kg
 
-        job_id = create_job("kg_build", "知识图谱自动构建", {"dir": str(raw_dir)})
+        job_id = create_job(
+            "kg_build",
+            "知识图谱自动构建",
+            {"dir": str(raw_dir)},
+            owner_id=user_id,
+        )
 
         def _bg(reporter) -> Dict[str, Any]:
             reporter(0.05, "extract")
@@ -672,12 +752,20 @@ async def ingest_file(
         if background:
             from src.ingest_jobs import create_job, submit as _submit_job
 
-            _kb_early = _resolve_kb(user, cfg, kb_id)
-            _uid, _kbid, _cfg_snapshot = user.id, _kb_early["id"], dict(cfg)
+            _kb_early = _resolve_kb(user, cfg, kb_id, "write")
+            _uid, _kbid, _cfg_snapshot = (
+                _kb_early["owner_id"],
+                _kb_early["id"],
+                dict(cfg),
+            )
             _orig_name = file.filename
             _tmp = str(temp_path)
-            job_id = create_job("file", _orig_name or safe_name,
-                               {"kb_id": _kbid, "path": _tmp})
+            job_id = create_job(
+                "file",
+                _orig_name or safe_name,
+                {"kb_id": _kbid, "path": _tmp},
+                owner_id=user.id,
+            )
 
             def _bg_file(reporter) -> Dict[str, Any]:
                 from pathlib import Path as _P
@@ -778,7 +866,7 @@ async def ingest_file(
             raise HTTPException(status_code=400, detail="文件解析后没有可用内容")
 
         # 知识库隔离：写入目标知识库专属的 collection
-        kb = _resolve_kb(user, cfg, kb_id)
+        kb = _resolve_kb(user, cfg, kb_id, "write")
         for c in all_chunks:
             c.metadata["kb_id"] = kb["id"]
         store = TenantAwareFactory.get_chroma_store_by_name(kb["collection_name"], cfg)
@@ -795,7 +883,7 @@ async def ingest_file(
                 all_chunks,
                 sources,
                 on_commit=lambda: _commit_ingestion_metadata(
-                    user.id, all_chunks, report, kb["id"]
+                    kb["owner_id"], all_chunks, report, kb["id"]
                 ),
             )
 
@@ -804,11 +892,11 @@ async def ingest_file(
         # P1：入库成功后失效答案/检索缓存，避免旧答案残留
         try:
             from api.deps import get_runtime_pipeline as _grp_sync
-            _grp_sync(user_id=user.id).invalidate_answer_cache()
+            _grp_sync(user_id=kb["owner_id"]).invalidate_answer_cache()
         except Exception:
             pass
 
-        _maybe_trigger_kg_build(user.id, cfg)
+        _maybe_trigger_kg_build(kb["owner_id"], cfg)
 
         return {
             "filename": file.filename,
@@ -834,9 +922,10 @@ def ingest_job_status(
     P1 异步入库配套：``POST /api/v1/ingest?background=true`` 返回 job_id 后，
     前端轮询本接口拿进度，done 后 result 即同步入库同款返回体。
     """
-    from src.ingest_jobs import get_job
+    from src.ingest_jobs import get_job_for_user
+    from src.security import is_admin
 
-    job = get_job(job_id)
+    job = get_job_for_user(job_id, current_user.id, is_admin=is_admin(current_user))
     if job is None:
         raise HTTPException(status_code=404, detail=f"任务不存在: {job_id}")
     return job
@@ -876,12 +965,14 @@ async def ingest_url(
         if body.background:
             from src.ingest_jobs import create_job, submit as _submit_job
 
-            _kb_early = _resolve_kb(user, cfg, body.kb_id)
-            _uid, _kbid = user.id, _kb_early["id"]
+            _kb_early = _resolve_kb(user, cfg, body.kb_id, "write")
+            _uid, _kbid = _kb_early["owner_id"], _kb_early["id"]
             _cfg_snapshot = dict(cfg)
             _body_url, _body_title = body.url, body.title
             _body_timeout = body.timeout
-            job_id = create_job("url", _body_url, {"kb_id": _kbid})
+            job_id = create_job(
+                "url", _body_url, {"kb_id": _kbid}, owner_id=user.id
+            )
 
             def _bg_url(reporter) -> Dict[str, Any]:
                 from src.document_loader import Document as _Doc
@@ -986,7 +1077,7 @@ async def ingest_url(
             raise HTTPException(status_code=400, detail="网页正文为空，无法入库")
 
         # 知识库隔离：写入目标知识库专属的 collection
-        kb = _resolve_kb(user, cfg, body.kb_id)
+        kb = _resolve_kb(user, cfg, body.kb_id, "write")
         for c in chunks:
             c.metadata["kb_id"] = kb["id"]
         store = TenantAwareFactory.get_chroma_store_by_name(kb["collection_name"], cfg)
@@ -996,7 +1087,7 @@ async def ingest_url(
                 chunks,
                 [source],
                 on_commit=lambda: _commit_ingestion_metadata(
-                    user.id, chunks, report, kb["id"]
+                    kb["owner_id"], chunks, report, kb["id"]
                 ),
             )
 
@@ -1005,11 +1096,11 @@ async def ingest_url(
         # P1：入库成功后失效答案/检索缓存，避免旧答案残留
         try:
             from api.deps import get_runtime_pipeline as _grp_url
-            _grp_url(user_id=user.id).invalidate_answer_cache()
+            _grp_url(user_id=kb["owner_id"]).invalidate_answer_cache()
         except Exception:
             pass
 
-        _maybe_trigger_kg_build(user.id, cfg)
+        _maybe_trigger_kg_build(kb["owner_id"], cfg)
 
         return {
             "url": page["url"],
@@ -1034,7 +1125,7 @@ async def ingest_directory(
     recursive: bool = Form(True),
     kb_id: Optional[str] = Form(None),
     background: bool = Form(False, description="true=异步入库，立即返回job_id"),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_admin),
 ) -> Dict[str, Any]:
     """批量入库指定目录。需要认证。
 
@@ -1045,7 +1136,7 @@ async def ingest_directory(
     user: User = current_user
     try:
         cfg = get_runtime_config()
-        kb = _resolve_kb(user, cfg, kb_id)
+        kb = _resolve_kb(user, cfg, kb_id, "write")
 
         raw_root = resolve_path(cfg.get("paths", {}).get("raw_docs", "data/raw"))
         user_scope = raw_root / user.id[:8]
@@ -1058,9 +1149,11 @@ async def ingest_directory(
         if background:
             from src.ingest_jobs import create_job, submit as _submit_job
 
-            _kb_e, _uid, _cfg_s = kb, user.id, dict(cfg)
+            _kb_e, _uid, _cfg_s = kb, kb["owner_id"], dict(cfg)
             _tgt, _rec = str(target), bool(recursive)
-            job_id = create_job("dir", _tgt, {"kb_id": _kb_e["id"]})
+            job_id = create_job(
+                "dir", _tgt, {"kb_id": _kb_e["id"]}, owner_id=user.id
+            )
 
             def _bg_dir(reporter) -> Dict[str, Any]:
                 reporter(0.1, "parse")
@@ -1164,7 +1257,7 @@ async def ingest_directory(
                 all_chunks,
                 sources,
                 on_commit=lambda: _commit_ingestion_metadata(
-                    user.id, all_chunks, report, kb["id"]
+                    kb["owner_id"], all_chunks, report, kb["id"]
                 ),
             )
 
@@ -1173,11 +1266,11 @@ async def ingest_directory(
         # P1：入库成功后失效答案/检索缓存，避免旧答案残留
         try:
             from api.deps import get_runtime_pipeline as _grp_dir
-            _grp_dir(user_id=user.id).invalidate_answer_cache()
+            _grp_dir(user_id=kb["owner_id"]).invalidate_answer_cache()
         except Exception:
             pass
 
-        _maybe_trigger_kg_build(user.id, cfg)
+        _maybe_trigger_kg_build(kb["owner_id"], cfg)
 
         return {
             "dir": str(target),
@@ -1199,16 +1292,20 @@ async def ingest_directory(
 async def websocket_chat(websocket: WebSocket):
     """WebSocket 流式问答。
 
-    服务不需要登录：连接建立后直接绑定本地用户（见 :mod:`src.middleware.identity`）。
+    企业模式先完成会话认证；local 模式仅允许回环地址。
 
     P1.3：通过 ``LLMConcurrencyGate.semaphore`` 限制并发 LLM 调用，避免
     单实例下被并发 WS 流量击穿。
     """
-    from src.middleware.identity import get_local_user
+    from src.middleware.identity import authenticate_websocket
+    from src.security import AuthError
 
     db = SessionLocal()
     try:
-        ws_user = get_local_user(db)
+        try:
+            ws_user, _ = await authenticate_websocket(websocket, db)
+        except AuthError:
+            return
         user_id = ws_user.id
         await websocket.accept()
         while True:
@@ -1239,7 +1336,10 @@ async def websocket_chat(websocket: WebSocket):
 
             # 长期记忆：显式"记住"指令先行落库（失败/替身缺失均不影响问答）
             try:
-                pipeline_probe: RAGPipeline = get_runtime_pipeline(user_id=user_id, kb=kb)
+                pipeline_probe: RAGPipeline = get_runtime_pipeline(
+                    user_id=(kb or {}).get("owner_id", user_id),
+                    kb=kb,
+                )
                 lt_probe = getattr(pipeline_probe, "long_term_store", None)
                 if lt_probe is not None:
                     lt_probe.maybe_remember_from_message(user_id, query)
@@ -1258,7 +1358,10 @@ async def websocket_chat(websocket: WebSocket):
             # P1.3：semaphore 保护，避免并发 WS 流量击穿 LLM
             async def _run():
                 nonlocal ttft_ms, first_token_time
-                pipeline: RAGPipeline = get_runtime_pipeline(user_id=user_id, kb=kb)
+                pipeline: RAGPipeline = get_runtime_pipeline(
+                    user_id=(kb or {}).get("owner_id", user_id),
+                    kb=kb,
+                )
                 async for event in pipeline.astream_answer(
                     query,
                     top_k=top_k,

@@ -13,6 +13,8 @@ if str(ROOT) not in sys.path:
 # setdefault：需要验证预热本身的测试可以自行覆盖
 os.environ.setdefault("RAG_WARMUP", "0")
 os.environ.setdefault("RAG_PRELOAD_LLM", "0")
+os.environ.setdefault("AUTH_MODE", "local")
+os.environ.setdefault("AUTH_ALLOW_TESTCLIENT", "1")
 
 # 必须在导入 api.main / src.db.database 之前设置。此前测试直接连接
 # ``data/users.db`` 和 ``data/chroma_db``，历史损坏数据会让测试失败，测试

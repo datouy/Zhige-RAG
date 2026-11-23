@@ -65,7 +65,13 @@ def mock_store(tmp_path):
     splitter = ChineseTextSplitter(chunk_size=60, chunk_overlap=10)
     chunks = splitter.split_text(
         (tmp_path / "doc1.txt").read_text(encoding="utf-8"),
-        metadata={"source": "doc1.txt", "page": 1},
+        metadata={
+            "source": "doc1.txt",
+            "page": 1,
+            "doc_status": "active",
+            "acl": "*",
+            "department": "",
+        },
     )
     store = ChromaStore(
         persist_directory=str(tmp_path / "chroma"),

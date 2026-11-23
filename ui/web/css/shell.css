@@ -488,3 +488,39 @@ select.form-control { cursor: pointer; }
     outline: none;
     border-color: var(--primary);
 }
+
+/* ===== 企业登录 / 当前用户 ===== */
+.login-modal {
+    max-width: 440px;
+}
+.login-form {
+    display: flex;
+    flex-direction: column;
+    gap: 0.55rem;
+    margin-top: 1rem;
+}
+.login-form .btn {
+    margin-top: 0.75rem;
+}
+.login-error {
+    min-height: 1.3rem;
+    color: #b91c1c;
+    font-size: 0.85rem;
+}
+.user-badge {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
+    padding: 0.45rem 0.55rem;
+    margin-bottom: 0.55rem;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    font-size: 0.82rem;
+    color: var(--text-muted);
+}
+.user-badge span {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}

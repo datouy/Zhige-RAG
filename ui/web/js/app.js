@@ -2,7 +2,7 @@
  * 知阁 Web UI —— 本地知识库问答前端
  * 
  * 开箱即用设计：
- * - 无需登录：所有请求自动归属固定的本地用户
+ * - local 回环模式自动进入；enterprise 模式需要登录
  * - 首次使用引导
  * - 模型状态可视化
  * 
@@ -19,6 +19,7 @@ class ChatApp {
         this.connected = false;
         this.currentSources = [];
         this.topK = 8;
+        this.currentUser = null;
 
         this.knowledgeBases = [];
         this.currentKb = null;
@@ -40,11 +41,39 @@ class ChatApp {
         this.cacheElements();
         this.bindEvents();
 
-        // 显示首次使用引导
+        const authenticated = await this.restoreSession();
+        if (!authenticated) return;
+        this.afterAuthentication();
+    }
+
+    async restoreSession() {
+        try {
+            const response = await fetch('/api/v1/auth/me', {
+                credentials: 'same-origin',
+                headers: { Accept: 'application/json' },
+            });
+            if (!response.ok) {
+                this.showLogin(response.status === 403
+                    ? '本地模式仅允许从本机访问，请使用企业账号登录。'
+                    : '');
+                return false;
+            }
+            const data = await response.json();
+            this.currentUser = data.user;
+            this.applyUserUi();
+            this.hideLogin();
+            return true;
+        } catch (e) {
+            this.showLogin('无法连接后端服务，请确认服务已启动。');
+            return false;
+        }
+    }
+
+    afterAuthentication() {
         if (this.firstVisit) {
             this.showWelcome();
         } else {
-            await this.bootstrap();
+            this.bootstrap();
         }
     }
     
@@ -59,6 +88,10 @@ class ChatApp {
     async checkModelStatus() {
         const box = document.getElementById('model-status-content');
         if (!box) return;
+        if (!this.currentUser || this.currentUser.role !== 'admin') {
+            box.innerHTML = '<span class="muted">模型配置仅系统管理员可查看。</span>';
+            return;
+        }
         
         try {
             const s = await this.api('/settings/model');
@@ -128,11 +161,20 @@ class ChatApp {
             'emb-backend', 'emb-remote', 'emb-base-url', 'emb-model', 'emb-api-key', 'emb-test',
             // 文档管理
             'docs-modal', 'docs-content', 'docs-kb-name', 'docs-refresh', 'docs-back', 'docs-btn',
+            // 企业登录
+            'login-overlay', 'login-form', 'login-username', 'login-password',
+            'login-error', 'login-submit', 'logout-btn', 'user-name',
         ];
         ids.forEach((id) => { this.el[id] = document.getElementById(id); });
     }
 
     bindEvents() {
+        this.el['login-form']?.addEventListener('submit', (e) => {
+            e.preventDefault();
+            this.login();
+        });
+        this.el['logout-btn']?.addEventListener('click', () => this.logout());
+
         // ---- 首次使用引导 ----
         document.getElementById('welcome-start')?.addEventListener('click', () => {
             this.hideWelcome();
@@ -188,6 +230,7 @@ class ChatApp {
         const resp = await fetch(`/api/v1${path}`, {
             method,
             headers,
+            credentials: 'same-origin',
             body: body ? (raw ? body : JSON.stringify(body)) : undefined,
         });
 
@@ -196,10 +239,78 @@ class ChatApp {
         try { data = text ? JSON.parse(text) : null; } catch { data = text; }
 
         if (!resp.ok) {
+            if (resp.status === 401) {
+                this.currentUser = null;
+                if (this.ws) this.ws.close();
+                this.showLogin('登录已过期，请重新登录。');
+            }
+
             const msg = (data && (data.detail || data.message || data.error)) || text || `HTTP ${resp.status}`;
             throw new Error(typeof msg === 'string' ? msg : JSON.stringify(msg));
         }
         return data;
+    }
+
+    showLogin(message = '') {
+        this.el['app-layout'].hidden = true;
+        this.el['login-overlay'].classList.add('active');
+        this.el['login-error'].textContent = message;
+        this.el['login-password'].value = '';
+    }
+
+    hideLogin() {
+        this.el['login-overlay'].classList.remove('active');
+        this.el['login-error'].textContent = '';
+    }
+
+    applyUserUi() {
+        const user = this.currentUser || {};
+        this.el['user-name'].textContent = user.username
+            ? user.username + ' · ' + (user.role || 'member')
+            : '本地用户';
+        const isAdmin = user.role === 'admin';
+        if (this.el['settings-btn']) {
+            this.el['settings-btn'].hidden = !isAdmin;
+        }
+    }
+
+    async login() {
+        const username = this.el['login-username'].value.trim();
+        const password = this.el['login-password'].value;
+        if (!username || !password) {
+            this.el['login-error'].textContent = '请输入用户名和密码';
+            return;
+        }
+        this.el['login-submit'].disabled = true;
+        this.el['login-submit'].textContent = '登录中…';
+        try {
+            const data = await this.api('/auth/login', {
+                method: 'POST',
+                body: { username, password },
+            });
+            this.currentUser = data.user;
+            this.applyUserUi();
+            this.hideLogin();
+            this.afterAuthentication();
+        } catch (e) {
+            this.el['login-error'].textContent = e.message;
+        } finally {
+            this.el['login-submit'].disabled = false;
+            this.el['login-submit'].textContent = '登录';
+        }
+    }
+
+    async logout() {
+        try {
+            await this.api('/auth/logout', { method: 'POST' });
+        } catch (e) {
+            // 会话已经失效时也要回到登录页。
+        }
+        this.currentUser = null;
+        this.connected = false;
+        if (this.ws) this.ws.close();
+        this.el['app-layout'].hidden = true;
+        this.showLogin('');
     }
 
     /** 进入主界面：拉知识库、会话，并建立 WS */
@@ -240,7 +351,7 @@ class ChatApp {
                     ${kb.is_default ? '🏠' : '📁'} ${this.esc(kb.name)}
                 </span>
                 <span class="item-meta">${kb.doc_count}</span>
-                ${kb.is_default ? '' : `<button class="item-del" data-del-kb="${kb.id}" title="删除知识库" type="button">×</button>`}
+                ${(!kb.is_default && kb.can_manage) ? `<button class="item-del" data-del-kb="${kb.id}" title="删除知识库" type="button">×</button>` : ''}
             </li>
         `).join('');
 
@@ -261,6 +372,14 @@ class ChatApp {
         this.el['current-kb-name'].textContent = this.currentKb.name;
         this.el['kb-meta'].textContent =
             `${this.currentKb.doc_count} 文档 / ${this.currentKb.chunk_count} 分块`;
+        const canWrite = this.currentKb.can_write !== false;
+        ['upload-btn', 'url-btn'].forEach((id) => {
+            const button = document.getElementById(id);
+            if (button) {
+                button.disabled = !canWrite;
+                button.title = canWrite ? '' : '当前知识库为只读权限';
+            }
+        });
     }
 
     async selectKb(kbId) {
@@ -425,6 +544,11 @@ class ChatApp {
         };
         this.ws.onclose = (ev) => {
             this.connected = false;
+            if (ev.code === 4401 || ev.code === 4403) {
+                this.currentUser = null;
+                this.showLogin('登录已失效，请重新登录。');
+                return;
+            }
             this.updateStatus('已断开，重连中…', false);
             setTimeout(() => this.connectWebSocket(), 3000);
         };
@@ -906,7 +1030,7 @@ class ChatApp {
                 </ul>
                 
                 <h4>数据安全</h4>
-                <p>所有数据都保存在本地电脑上，不会上传到任何服务器。</p>
+                <p>本机模式数据保留在本机；企业模式的数据边界由部署和模型后端决定。</p>
             </div>
         `;
         this.openModal('使用指南', content);

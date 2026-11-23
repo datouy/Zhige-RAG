@@ -66,7 +66,8 @@ echo   API 文档：http://localhost:8000/docs
 echo.
 
 REM 使用后台启动并打开浏览器
+set AUTH_MODE=local
 start "" "http://localhost:8000"
-%PYTHON% -m uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
+%PYTHON% -m uvicorn api.main:app --host 127.0.0.1 --port 8000 --reload
 
 pause

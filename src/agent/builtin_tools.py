@@ -50,8 +50,13 @@ class SearchDocumentsTool(Tool):
         "required": ["query"],
     }
 
-    def __init__(self, vector_store: Optional[Any] = None) -> None:
+    def __init__(
+        self,
+        vector_store: Optional[Any] = None,
+        allowed_groups: Optional[List[str]] = None,
+    ) -> None:
         self.vector_store = vector_store
+        self.allowed_groups = allowed_groups
 
     def run(self, **kwargs) -> ToolResult:
         query: str = kwargs.get("query", "")
@@ -62,7 +67,12 @@ class SearchDocumentsTool(Tool):
             return ToolResult(success=False, content=None, error="未配置 vector_store，无法检索")
 
         try:
-            hits = self.vector_store.query(query_text=query, top_k=top_k)
+            from src.vector_store import build_security_where
+
+            where = build_security_where(
+                status_filter=True, acl_groups=self.allowed_groups
+            )
+            hits = self.vector_store.query(query_text=query, top_k=top_k, where=where)
         except Exception as exc:  # noqa: BLE001
             return ToolResult(success=False, content=None, error=f"检索失败: {exc}")
 
@@ -90,14 +100,24 @@ class ListDocumentsTool(Tool):
     description = "列出知识库中所有已入库的文档及其分块数。"
     parameters = {"type": "object", "properties": {}, "required": []}
 
-    def __init__(self, vector_store: Optional[Any] = None) -> None:
+    def __init__(
+        self,
+        vector_store: Optional[Any] = None,
+        allowed_groups: Optional[List[str]] = None,
+    ) -> None:
         self.vector_store = vector_store
+        self.allowed_groups = allowed_groups
 
     def run(self, **kwargs) -> ToolResult:
         if self.vector_store is None:
             return ToolResult(success=False, content=None, error="未配置 vector_store")
         try:
-            sources = self.vector_store.list_sources()
+            from src.vector_store import build_security_where
+
+            where = build_security_where(
+                status_filter=True, acl_groups=self.allowed_groups
+            )
+            sources = self.vector_store.list_sources(where=where)
         except Exception as exc:  # noqa: BLE001
             return ToolResult(success=False, content=None, error=str(exc))
         return ToolResult(
@@ -121,8 +141,13 @@ class GetDocumentChunksTool(Tool):
         "required": ["source"],
     }
 
-    def __init__(self, vector_store: Optional[Any] = None) -> None:
+    def __init__(
+        self,
+        vector_store: Optional[Any] = None,
+        allowed_groups: Optional[List[str]] = None,
+    ) -> None:
         self.vector_store = vector_store
+        self.allowed_groups = allowed_groups
 
     def run(self, **kwargs) -> ToolResult:
         source: str = kwargs.get("source", "")
@@ -132,23 +157,23 @@ class GetDocumentChunksTool(Tool):
         if self.vector_store is None:
             return ToolResult(success=False, content=None, error="未配置 vector_store")
         try:
-            res = self.vector_store.collection.get(
-                where={"source": {"$eq": source}},
-                include=["documents", "metadatas"],
-                limit=limit,
+            from src.vector_store import build_security_where
+
+            where = build_security_where(
+                status_filter=True, acl_groups=self.allowed_groups
             )
+            hits = self.vector_store.get_by_source(source, where=where)[
+                : max(1, min(limit, 100))
+            ]
         except Exception as exc:  # noqa: BLE001
             return ToolResult(success=False, content=None, error=str(exc))
         chunks: List[Dict[str, Any]] = []
-        ids = res.get("ids") or []
-        docs = res.get("documents") or []
-        metas = res.get("metadatas") or []
-        for i, doc in enumerate(docs):
+        for hit in hits:
             chunks.append(
                 {
-                    "id": ids[i] if i < len(ids) else f"chunk_{i}",
-                    "text": doc[:500],
-                    "metadata": metas[i] if i < len(metas) else {},
+                    "id": hit.id,
+                    "text": hit.text[:500],
+                    "metadata": hit.metadata,
                 }
             )
         return ToolResult(
@@ -594,6 +619,7 @@ class BuiltinTools:
     def create(
         vector_store: Optional[Any] = None,
         include: Optional[List[str]] = None,
+        allowed_groups: Optional[List[str]] = None,
     ) -> ToolRegistry:
         """构造一个包含所有（或子集）内置工具的 :class:`ToolRegistry`。
 
@@ -602,9 +628,9 @@ class BuiltinTools:
             include: 工具名白名单。``None`` 表示全部内置工具。
         """
         all_tools = {
-            "search_documents": SearchDocumentsTool(vector_store=vector_store),
-            "list_documents": ListDocumentsTool(vector_store=vector_store),
-            "get_document_chunks": GetDocumentChunksTool(vector_store=vector_store),
+            "search_documents": SearchDocumentsTool(vector_store, allowed_groups),
+            "list_documents": ListDocumentsTool(vector_store, allowed_groups),
+            "get_document_chunks": GetDocumentChunksTool(vector_store, allowed_groups),
             "calculator": CalculatorTool(),
             "get_current_time": GetCurrentTimeTool(),
             "text_stats": TextStatsTool(),

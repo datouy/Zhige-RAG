@@ -38,7 +38,7 @@ from pydantic import BaseModel, Field
 from api.deps import get_kg_extractor, get_runtime_config, get_runtime_pipeline
 from src.db.models import User
 from src.factories import TenantAwareFactory
-from src.middleware.identity import get_current_user
+from src.middleware.identity import get_current_user, require_admin
 from src.kg import GraphRAG, GraphRetriever
 from src.kg.cypher_guard import CypherValidationError, validate_readonly_cypher
 from src.utils import get_logger, resolve_path
@@ -245,7 +245,7 @@ class KGQueryBody(BaseModel):
 @router.post("/api/v1/kg/query", tags=["知识图谱"])
 async def kg_query(
     body: KGQueryBody,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_admin),
 ) -> Dict[str, Any]:
     """执行 Cypher 查询（仅允许 ``MATCH ... RETURN`` 形式的只读查询）。
 
@@ -261,7 +261,8 @@ async def kg_query(
 
     try:
         store = _get_user_kg_store(user.id)
-        results = store.query_cypher(validated.sanitized, body.params)
+        query_method = getattr(store, "query_cypher_admin", store.query_cypher)
+        results = query_method(validated.sanitized, body.params)
         # 防御性：再截一刀（即便 SQLite 后端可能没 LIMIT）
         if isinstance(results, list) and len(results) > validated.max_limit:
             results = results[: validated.max_limit]

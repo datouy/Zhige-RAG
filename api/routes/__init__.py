@@ -2,7 +2,7 @@
 
 每个子模块暴露一个 ``router``（``fastapi.APIRouter``）实例；``api/main.py``
 统一 ``include_router``。各端点用 ``Depends(get_current_user)`` 拿当前用户
-身份（本地单用户，无需登录）。
+身份（enterprise 登录 / local 回环模式）。
 
 模块清单
 --------
@@ -14,8 +14,10 @@
 - ``feedback``     : 反馈层（用户反馈 / 统计 / 差评导出评估集 / 长期记忆管理）
 - ``kb``           : 知识库（多库管理）与会话（列表 / 重命名 / 历史消息）
 - ``settings``     : 模型设置（界面上切换 local / ollama / openai，即时生效）
+- ``auth``         : 企业登录、会话、用户与角色管理
 """
 from .agent import router as agent_router
+from .auth import router as auth_router
 from .chat import router as chat_router
 from .eval import router as eval_router
 from .feedback import router as feedback_router
@@ -26,6 +28,7 @@ from .system import router as system_router
 
 __all__ = [
     "agent_router",
+    "auth_router",
     "chat_router",
     "eval_router",
     "feedback_router",

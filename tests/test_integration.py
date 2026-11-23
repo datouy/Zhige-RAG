@@ -70,9 +70,11 @@ def client() -> Generator[TestClient, None, None]:
 class TestNoLoginSurface:
     """登录 / 注册面已移除，业务端点直接可用。"""
 
-    def test_login_endpoint_gone(self, client: TestClient):
-        response = client.post("/api/v1/auth/login", json={"login": "x", "password": "y"})
-        assert response.status_code in (404, 405)
+    def test_login_endpoint_rejects_bad_credentials(self, client: TestClient):
+        response = client.post(
+            "/api/v1/auth/login", json={"username": "x", "password": "wrong-password"}
+        )
+        assert response.status_code == 401
 
     def test_register_endpoint_gone(self, client: TestClient):
         response = client.post(
