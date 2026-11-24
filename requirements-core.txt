@@ -39,6 +39,7 @@ numpy>=1.24.0,<2.0.0
 python-dotenv>=1.0.0
 tiktoken>=0.5.0
 filelock>=3.12.0          # scripts/preload_llm.py 单飞行锁
+cryptography>=41.0.0      # local_overrides.yaml 密钥加密（Fernet）
 
 # ---------- 本地 Embedding（CPU，无 torch / 无 LLM）----------
 onnxruntime>=1.17.0,<2.0.0

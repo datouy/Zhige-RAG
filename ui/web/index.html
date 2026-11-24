@@ -6,7 +6,7 @@
     <meta name="color-scheme" content="light dark">
     <title>知阁</title>
     <link rel="stylesheet" href="/css/main.css">
-    <link rel="stylesheet" href="/css/shell.css?v=20261124-3">
+    <link rel="stylesheet" href="/css/shell.css?v=20261124-4">
 </head>
 <body>
     <a class="skip-link" href="#chat-input">跳到提问</a>
@@ -405,7 +405,11 @@
                         <label class="form-label" for="llm-base-url">地址</label>
                         <input id="llm-base-url" class="form-control" placeholder="http://localhost:11434/v1">
                         <label class="form-label" for="llm-model">模型</label>
-                        <input id="llm-model" class="form-control" placeholder="deepseek-chat">
+                        <div class="model-picker">
+                            <input id="llm-model" class="form-control" list="llm-model-list" placeholder="deepseek-chat">
+                            <button id="llm-fetch-models" class="btn btn-ghost btn-sm" type="button">拉取模型</button>
+                        </div>
+                        <datalist id="llm-model-list"></datalist>
                         <label class="form-label" for="llm-api-key">密钥</label>
                         <input id="llm-api-key" class="form-control" type="password" placeholder="可选">
                     </div>
@@ -425,7 +429,11 @@
                         <label class="form-label" for="emb-base-url">地址</label>
                         <input id="emb-base-url" class="form-control" placeholder="http://localhost:11434/v1">
                         <label class="form-label" for="emb-model">模型</label>
-                        <input id="emb-model" class="form-control" placeholder="bge-m3">
+                        <div class="model-picker">
+                            <input id="emb-model" class="form-control" list="emb-model-list" placeholder="bge-m3">
+                            <button id="emb-fetch-models" class="btn btn-ghost btn-sm" type="button">拉取模型</button>
+                        </div>
+                        <datalist id="emb-model-list"></datalist>
                         <label class="form-label" for="emb-api-key">密钥</label>
                         <input id="emb-api-key" class="form-control" type="password" placeholder="可选">
                     </div>
@@ -511,6 +519,6 @@
         </div>
     </div>
 
-    <script src="/js/app.js?v=20261124-3"></script>
+    <script src="/js/app.js?v=20261124-4"></script>
 </body>
 </html>

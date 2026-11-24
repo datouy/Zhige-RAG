@@ -185,6 +185,15 @@ async def lifespan(app: FastAPI):
         logger.info("数据库初始化完成")
         _log_orphan_summary()
 
+        # 旧版本会把明文 API Key 写进 local_overrides.yaml；启动时一次性迁移为密文
+        try:
+            from src.settings_service import migrate_plaintext_secrets
+
+            if migrate_plaintext_secrets():
+                logger.info("已将 local_overrides.yaml 中的旧明文密钥迁移为密文")
+        except Exception as secret_err:  # noqa: BLE001
+            logger.warning("密钥明文迁移失败（继续启动）: %s", secret_err)
+
         # P1.2: 启动期预热配置缓存，避免首次请求再走 yaml.safe_load
         try:
             from api.deps import get_runtime_config

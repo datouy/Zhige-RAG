@@ -655,6 +655,17 @@ svg {
     padding-top: 6px;
 }
 
+.model-picker {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.model-picker .form-control {
+    flex: 1;
+    min-width: 0;
+}
+
 .message.user .message-content {
     border-bottom-right-radius: 5px;
     background: #eeefec;

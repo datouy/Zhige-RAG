@@ -43,6 +43,46 @@ def overrides_path() -> Path:
     return resolve_path(OVERRIDES_RELPATH)
 
 
+def _secret_field(name: str) -> bool:
+    key = str(name).lower()
+    if key == "api_key":
+        return True
+    return key.endswith(("_key", "_token", "_secret", "password"))
+
+
+def _encrypt_secrets(data: Any) -> Any:
+    """递归加密密钥字段；无法加密时丢弃该字段（绝不落盘明文）。"""
+    from src.secret_crypto import encrypt_secret
+
+    if isinstance(data, dict):
+        out: Dict[str, Any] = {}
+        for key, value in data.items():
+            if _secret_field(key) and isinstance(value, str):
+                encrypted = encrypt_secret(value)
+                if encrypted is None:
+                    continue  # 丢弃明文密钥
+                out[key] = encrypted
+            else:
+                out[key] = _encrypt_secrets(value)
+        return out
+    if isinstance(data, list):
+        return [_encrypt_secrets(item) for item in data]
+    return data
+
+
+def _decrypt_secrets(data: Any) -> Any:
+    """递归解密密文字段（明文 / 占位符原样返回）。"""
+    from src.secret_crypto import decrypt_secret
+
+    if isinstance(data, dict):
+        return {key: _decrypt_secrets(value) for key, value in data.items()}
+    if isinstance(data, list):
+        return [_decrypt_secrets(item) for item in data]
+    if isinstance(data, str):
+        return decrypt_secret(data)
+    return data
+
+
 def load_overrides() -> Dict[str, Any]:
     """读取覆盖文件；不存在或损坏时返回空 dict（不阻塞启动）。"""
     path = overrides_path()
@@ -52,7 +92,7 @@ def load_overrides() -> Dict[str, Any]:
         import yaml
 
         with open(path, "r", encoding="utf-8") as f:
-            return yaml.safe_load(f) or {}
+            return _decrypt_secrets(yaml.safe_load(f) or {})
     except Exception as exc:  # noqa: BLE001
         logger.warning("读取 %s 失败，已忽略：%s", path.name, exc)
         return {}
@@ -68,7 +108,10 @@ def save_overrides(data: Dict[str, Any]) -> None:
     with open(tmp, "w", encoding="utf-8") as f:
         f.write("# 由知阁「模型设置」界面写入，优先级高于 config.yaml\n")
         f.write("# 直接删除本文件即可恢复 config.yaml 的配置。\n\n")
-        yaml.safe_dump(data, f, allow_unicode=True, sort_keys=False, default_flow_style=False)
+        yaml.safe_dump(
+            _encrypt_secrets(data), f,
+            allow_unicode=True, sort_keys=False, default_flow_style=False,
+        )
     tmp.replace(path)
     logger.info("模型设置已写入 %s", path.name)
 
@@ -374,6 +417,92 @@ def test_model_connection(payload: Dict[str, Any]) -> Dict[str, Any]:
         return {"ok": False, "detail": f"连不上 {base_url}：{exc}。请检查地址、网络与代理。"}
 
 
+def fetch_remote_models(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """拉取远程 OpenAI 兼容服务的模型列表（供界面下拉选择，不写配置）。"""
+    import json
+    import urllib.error
+    import urllib.request
+
+    from src.http_client import build_headers, is_local_endpoint
+
+    base_url = str(payload.get("base_url") or "").strip().rstrip("/")
+    api_key = str(payload.get("api_key") or "").strip()
+    if not base_url:
+        return {"ok": False, "detail": "请先填写服务地址"}
+
+    url = f"{base_url}/models"
+    try:
+        opener = (
+            urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            if is_local_endpoint(url)
+            else urllib.request.build_opener()
+        )
+        request = urllib.request.Request(url, headers=build_headers(api_key), method="GET")
+        with opener.open(request, timeout=10.0) as resp:
+            data = json.loads(resp.read().decode("utf-8", "ignore"))
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403):
+            return {"ok": False, "detail": f"鉴权失败（HTTP {exc.code}）：请检查 API Key"}
+        return {"ok": False, "detail": f"服务返回 HTTP {exc.code}：请检查地址"}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "detail": f"拉取模型列表失败：{exc}"}
+
+    models = [
+        {"id": str(m.get("id") or ""), "name": str(m.get("name") or m.get("id") or "")}
+        for m in (data.get("data") or [])
+        if m.get("id")
+    ]
+    if not models:
+        return {"ok": False, "detail": "服务未返回模型列表"}
+    return {"ok": True, "count": len(models), "models": models}
+
+
+def migrate_plaintext_secrets() -> bool:
+    """把 local_overrides.yaml 里旧的明文密钥一次性迁移为密文。"""
+    from src.secret_crypto import encrypt_secret, is_encrypted, is_placeholder
+
+    path = overrides_path()
+    if not path.exists():
+        return False
+    try:
+        import yaml
+
+        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("读取 %s 失败，跳过密钥迁移：%s", path.name, exc)
+        return False
+
+    changed = False
+
+    def _migrate(data: Any) -> None:
+        nonlocal changed
+        if isinstance(data, dict):
+            for key, value in list(data.items()):
+                if (
+                    _secret_field(key)
+                    and isinstance(value, str)
+                    and value
+                    and not is_placeholder(value)
+                    and not is_encrypted(value)
+                ):
+                    encrypted = encrypt_secret(value)
+                    if encrypted is None:
+                        continue
+                    data[key] = encrypted
+                    changed = True
+                else:
+                    _migrate(value)
+        elif isinstance(data, list):
+            for item in data:
+                _migrate(item)
+
+    _migrate(raw)
+    if changed:
+        save_overrides(raw)
+        logger.info("已将 local_overrides.yaml 中的明文密钥迁移为密文")
+    return changed
+
+
 __all__ = [
     "OVERRIDES_RELPATH",
     "SettingsError",
@@ -381,7 +510,9 @@ __all__ = [
     "effective_config",
     "get_model_settings",
     "load_overrides",
+    "migrate_plaintext_secrets",
     "save_overrides",
     "test_model_connection",
+    "fetch_remote_models",
     "update_model_settings",
 ]

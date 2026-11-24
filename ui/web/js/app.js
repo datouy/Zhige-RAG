@@ -184,6 +184,7 @@ class ChatApp {
         ["llm", "emb"].forEach((kind) => {
             document.getElementById(`${kind}-backend`)?.addEventListener("change", () => this.syncRemoteFields(kind));
             document.getElementById(`${kind}-test`)?.addEventListener("click", () => this.testModel(kind));
+            document.getElementById(`${kind}-fetch-models`)?.addEventListener("click", () => this.fetchModels(kind));
         });
         this.el["settings-save"]?.addEventListener("click", () => this.saveSettings());
         this.el["settings-reset"]?.addEventListener("click", () => this.resetSettings());
@@ -2723,6 +2724,43 @@ class ChatApp {
                 },
             });
             this.setSettingsResult(result.detail, result.ok ? "ok" : "err");
+        } catch (error) {
+            this.setSettingsResult(error.message, "err");
+        }
+    }
+
+    async fetchModels(kind) {
+        const backend = document.getElementById(kind + "-backend")?.value || "openai";
+        const baseUrl = document.getElementById(kind + "-base-url")?.value.trim() || "";
+        const apiKey = document.getElementById(kind + "-api-key")?.value.trim() || "";
+        if (!baseUrl) {
+            this.setSettingsResult("请先填写服务地址", "err");
+            return;
+        }
+        this.setSettingsResult("正在拉取模型…");
+        try {
+            const result = await this.api("/settings/models", {
+                method: "POST",
+                body: {
+                    kind: kind === "llm" ? "llm" : "embedding",
+                    backend,
+                    base_url: baseUrl,
+                    api_key: apiKey,
+                },
+            });
+            if (!result.ok) {
+                this.setSettingsResult(result.detail || "拉取失败", "err");
+                return;
+            }
+            const datalist = document.getElementById(kind + "-model-list");
+            if (datalist) {
+                datalist.innerHTML = (result.models || []).map((m) => {
+                    const id = m.id || "";
+                    const name = m.name || id;
+                    return '<option value="' + this.esc(id) + '">' + this.esc(name) + "</option>";
+                }).join("");
+            }
+            this.setSettingsResult("已拉取 " + result.count + " 个模型，可下拉选择", "ok");
         } catch (error) {
             this.setSettingsResult(error.message, "err");
         }

@@ -22,6 +22,7 @@ from pydantic import BaseModel, Field
 
 from src.db.models import User
 from src.middleware.identity import get_current_user
+from src.team_auth import require_admin_user
 from src.settings_service import (
     SettingsError,
     clear_overrides,
@@ -78,7 +79,7 @@ async def api_get_model_settings(
 @router.put("/api/v1/settings/model", tags=["设置"])
 async def api_update_model_settings(
     body: ModelSettingsBody,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_admin_user),
 ) -> Dict[str, Any]:
     """更新模型配置并**立即生效**（无需重启）。
 
@@ -98,7 +99,7 @@ async def api_update_model_settings(
 @router.post("/api/v1/settings/model/test", tags=["设置"])
 async def api_test_model(
     body: TestBody,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_admin_user),
 ) -> Dict[str, Any]:
     """测试连接。不写入任何配置，可以放心试。"""
     try:
@@ -108,9 +109,23 @@ async def api_test_model(
         raise HTTPException(status_code=500, detail=f"测试失败：{exc}") from exc
 
 
+@router.post("/api/v1/settings/models", tags=["设置"])
+async def api_fetch_remote_models(
+    body: TestBody,
+    current_user: User = Depends(require_admin_user),
+) -> Dict[str, Any]:
+    """从远程服务拉取模型列表（不写配置，供界面下拉选择）。"""
+    try:
+        from src.settings_service import fetch_remote_models
+        return fetch_remote_models(body.model_dump(exclude_none=True))
+    except Exception as exc:  # noqa: BLE001
+        logger.error("拉取模型列表失败: %s", exc)
+        raise HTTPException(status_code=500, detail=f"拉取模型列表失败：{exc}") from exc
+
+
 @router.delete("/api/v1/settings/model", tags=["设置"])
 async def api_clear_model_settings(
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_admin_user),
 ) -> Dict[str, Any]:
     """清除界面覆盖，恢复到 ``config/config.yaml`` 的配置。"""
     from api.deps import _reset_cached_config, reset_all_singletons

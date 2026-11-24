@@ -118,6 +118,9 @@ dist/
 # 界面写入的本地模型设置（个性化，不进仓库）
 config/local_overrides.yaml
 
+# 密钥加密主密钥（生成于本机，绝不进仓库）
+data/.secrets_key
+
 # Ingest task runtime persistence (generated, never commit)
 data/ingest_jobs.json
 data/ingest_jobs.json.tmp
