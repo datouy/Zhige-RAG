@@ -9,6 +9,11 @@ metadata:
     # 本项目默认无登录。这里只暴露集群内部域名；如需公网访问，必须先接入
     # 认证代理（OAuth2 Proxy / IAP 等）并完成多用户隔离。
     nginx.ingress.kubernetes.io/ssl-redirect: "false"
+    # 会话亲和：多副本（完成集中式存储迁移后）下让同一会话粘到同一 Pod，
+    # 避免会话级内存 / 长连接在副本间跳转。
+    nginx.ingress.kubernetes.io/affinity: "cookie"
+    nginx.ingress.kubernetes.io/session-cookie-name: "zhige-route"
+    nginx.ingress.kubernetes.io/session-cookie-hash: "sha1"
     nginx.ingress.kubernetes.io/proxy-body-size: "50m"
     nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
     nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
