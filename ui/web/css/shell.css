@@ -634,6 +634,13 @@ svg {
     white-space: pre-wrap;
 }
 
+.message-time {
+    margin-top: 4px;
+    font-size: 11px;
+    color: var(--text-faint);
+    font-variant-numeric: tabular-nums;
+}
+
 .message.user .message-content {
     border-bottom-right-radius: 5px;
     background: #eeefec;

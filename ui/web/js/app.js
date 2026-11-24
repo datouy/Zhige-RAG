@@ -671,18 +671,22 @@ class ChatApp {
             list.innerHTML = '<li class="list-empty">还没有对话</li>';
             return;
         }
-        list.innerHTML = this.sessions.map((session) => `
+        list.innerHTML = this.sessions.map((session) => {
+            const timeLabel = this.formatTime(session.last_message_at || session.created_at);
+            return `
             <li class="list-item ${this.currentSession?.id === session.id ? "active" : ""}" data-session-row="${this.esc(session.id)}">
                 <button class="item-select" type="button" data-session="${this.esc(session.id)}"
                         title="${this.esc(session.preview || session.title)}"
                         aria-label="${this.esc(session.title || "新对话")}"
                         ${this.currentSession?.id === session.id ? 'aria-current="true"' : ""}>
                     <span class="item-main">${this.esc(session.title || "新对话")}</span>
+                    ${timeLabel ? `<span class="item-meta">${this.esc(timeLabel)}</span>` : ""}
                 </button>
                 <button class="item-ren" data-ren="${this.esc(session.id)}" aria-label="重命名" type="button">✎</button>
                 <button class="item-del" data-del-session="${this.esc(session.id)}" aria-label="删除" type="button">×</button>
             </li>
-        `).join("");
+        `;
+        }).join("");
 
         list.querySelectorAll("[data-session]").forEach((button) => {
             button.addEventListener("click", () => this.openSession(button.dataset.session));
@@ -730,7 +734,7 @@ class ChatApp {
             let queryForAnswer = "";
             (data.messages || []).forEach((message) => {
                 if (message.role === "user") queryForAnswer = message.content;
-                const node = this.appendMessage(message.role, message.content);
+                const node = this.appendMessage(message.role, message.content, message.created_at);
                 if (message.role === "user") this.addUserActions(node, message.content);
                 if (message.role === "assistant") {
                     const sources = message.sources || [];
@@ -1061,7 +1065,7 @@ class ChatApp {
         this.lastAssistantMessage = null;
     }
 
-    appendMessage(role, content) {
+    appendMessage(role, content, timestamp) {
         this.el.messages.querySelector(".empty-state")?.remove();
         const wrap = document.createElement("div");
         wrap.className = `message ${role}`;
@@ -1070,6 +1074,10 @@ class ChatApp {
         if (role === "assistant") this.setRichText(body, content);
         else body.textContent = content;
         wrap.appendChild(body);
+        const time = document.createElement("div");
+        time.className = "message-time";
+        time.textContent = this.formatTime(timestamp) || this.formatTime(new Date().toISOString());
+        wrap.appendChild(time);
         this.el.messages.appendChild(wrap);
         this.scrollBottom();
         return wrap;
@@ -1083,6 +1091,10 @@ class ChatApp {
             const body = document.createElement("div");
             body.className = "message-content";
             message.appendChild(body);
+            const time = document.createElement("div");
+            time.className = "message-time";
+            time.textContent = this.formatTime(new Date().toISOString());
+            message.appendChild(time);
             this.el.messages.appendChild(message);
         }
         message.querySelector(".message-content").textContent += token;
@@ -2060,6 +2072,15 @@ class ChatApp {
         if (!value) return "—";
         const date = new Date(value);
         return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString("zh-CN", { hour12: false });
+    }
+
+    formatTime(value) {
+        if (!value) return "";
+        const date = new Date(value);
+        if (Number.isNaN(date.getTime())) return "";
+        return new Intl.DateTimeFormat("zh-CN", {
+            month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit",
+        }).format(date);
     }
 
     renderAdminOverview(data) {
