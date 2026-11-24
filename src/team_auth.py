@@ -10,13 +10,12 @@ import hashlib
 import hmac
 import os
 import secrets
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import Iterable, Optional
 
 from fastapi import Depends, HTTPException, Request, WebSocket
 from sqlalchemy.orm import Session
 
-from src.db.database import get_db
 from src.db.models import AuthSession, User
 from src.utils import get_logger
 
@@ -26,6 +25,8 @@ SESSION_COOKIE = "zhige_session"
 ROLE_LEVEL = {"viewer": 1, "editor": 2, "admin": 3}
 PBKDF2_ITERATIONS = int(os.getenv("ZHIGE_PASSWORD_ITERATIONS", "390000"))
 SESSION_DAYS = max(1, int(os.getenv("ZHIGE_SESSION_DAYS", "7")))
+LOGIN_MAX_ATTEMPTS = max(1, int(os.getenv("ZHIGE_LOGIN_MAX_ATTEMPTS", "5")))
+LOGIN_LOCKOUT_MINUTES = max(1, int(os.getenv("ZHIGE_LOGIN_LOCKOUT_MINUTES", "15")))
 
 
 def auth_mode() -> str:
@@ -164,11 +165,12 @@ def request_token(request: Request) -> Optional[str]:
     return request.cookies.get(SESSION_COOKIE)
 
 
-def authenticate_credentials(db: Session, login: str, password: str) -> Optional[User]:
+def find_active_user(db: Session, login: str) -> Optional[User]:
+    """按用户名或邮箱查找启用中的账号（不校验口令）。"""
     login = (login or "").strip()
-    if not login or not password:
+    if not login:
         return None
-    user = (
+    return (
         db.query(User)
         .filter(
             (User.username == login) | (User.email == login),
@@ -176,8 +178,58 @@ def authenticate_credentials(db: Session, login: str, password: str) -> Optional
         )
         .first()
     )
-    if user is None or not verify_password(password, user.password_hash):
+
+
+def account_locked(user: User) -> bool:
+    """账号是否处于登录失败锁定期内。"""
+    locked_until = getattr(user, "locked_until", None)
+    if locked_until is None:
+        return False
+    if locked_until.tzinfo is not None:
+        locked_until = locked_until.replace(tzinfo=None)
+    return datetime.utcnow() < locked_until
+
+
+def record_login_failure(db: Session, user: User) -> None:
+    """记录一次失败登录；达到阈值后锁定账号一段时间。"""
+    attempts = (getattr(user, "failed_login_attempts", 0) or 0) + 1
+    user.failed_login_attempts = attempts
+    if attempts >= LOGIN_MAX_ATTEMPTS:
+        user.locked_until = datetime.utcnow() + timedelta(minutes=LOGIN_LOCKOUT_MINUTES)
+        user.failed_login_attempts = 0
+        logger.warning(
+            "账号 %s 连续登录失败 %d 次，已锁定 %d 分钟",
+            user.username, LOGIN_MAX_ATTEMPTS, LOGIN_LOCKOUT_MINUTES,
+        )
+    db.commit()
+
+
+def record_login_success(db: Session, user: User) -> None:
+    """登录成功后清空失败计数与锁定状态。"""
+    user.failed_login_attempts = 0
+    user.locked_until = None
+    db.commit()
+
+
+def reset_login_lockout(user: User) -> None:
+    """管理员重置口令或重新启用账号时清空锁定状态。"""
+    user.failed_login_attempts = 0
+    user.locked_until = None
+
+
+def authenticate_credentials(db: Session, login: str, password: str) -> Optional[User]:
+    login = (login or "").strip()
+    if not login or not password:
         return None
+    user = find_active_user(db, login)
+    if user is None:
+        return None
+    if account_locked(user):
+        return None
+    if not verify_password(password, user.password_hash):
+        record_login_failure(db, user)
+        return None
+    record_login_success(db, user)
     return user
 
 

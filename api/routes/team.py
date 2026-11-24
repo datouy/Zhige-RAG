@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import os
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, Field
@@ -15,9 +15,12 @@ from src.middleware.audit import AuditAction, get_audit_logger
 from src.middleware.identity import get_current_user
 from src.team_auth import (
     SESSION_COOKIE,
+    account_locked,
     auth_mode,
     authenticate_credentials,
     create_auth_session,
+    find_active_user,
+    reset_login_lockout,
     effective_role,
     hash_password,
     normalize_role,
@@ -190,6 +193,9 @@ def login(
 ) -> Dict[str, Any]:
     if not team_mode():
         raise HTTPException(status_code=409, detail="当前为本地模式，无需登录")
+    existing = find_active_user(db, body.login)
+    if existing is not None and account_locked(existing):
+        raise HTTPException(status_code=423, detail="账号已锁定，请稍后再试")
     user = authenticate_credentials(db, body.login, body.password)
     if user is None:
         raise HTTPException(status_code=401, detail="账号或密码错误")
@@ -301,6 +307,8 @@ def update_team_user(
         user.is_active = body.is_active
     if body.password:
         user.password_hash = hash_password(body.password)
+    if body.password or body.is_active is True:
+        reset_login_lockout(user)
     revoke_credentials = bool(body.password) or body.is_active is False
     db.commit()
     if revoke_credentials:

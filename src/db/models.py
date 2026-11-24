@@ -41,6 +41,9 @@ class User(Base):
     # team 模式下为 admin/editor/viewer；本地模式固定按 admin 处理。
     role = Column(String(20), default="viewer", nullable=False)
     password_hash = Column(String(255), nullable=True)
+    # 登录失败锁定：连续失败达到阈值后锁定账号一段时间，防止口令爆破。
+    failed_login_attempts = Column(Integer, default=0, nullable=False)
+    locked_until = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 

@@ -70,6 +70,8 @@ _LIGHT_COLUMN_MIGRATIONS = {
         # 可选团队模式；本地用户仍由 is_admin 与固定身份判定。
         ("role", "VARCHAR(20) NOT NULL DEFAULT 'viewer'"),
         ("password_hash", "VARCHAR(255)"),
+        ("failed_login_attempts", "INTEGER NOT NULL DEFAULT 0"),
+        ("locked_until", "TIMESTAMP"),
     ],
     "document_records": [
         # 知识库概念层：文档归属到具体知识库；老数据留空 = 默认库
