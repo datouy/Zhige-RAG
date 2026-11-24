@@ -671,9 +671,17 @@ class ChatApp {
             list.innerHTML = '<li class="list-empty">还没有对话</li>';
             return;
         }
-        list.innerHTML = this.sessions.map((session) => {
-            const timeLabel = this.formatTime(session.last_message_at || session.created_at);
-            return `
+        const groups = new Map();
+        this.sessions.forEach((session) => {
+            const label = this.sessionGroup(session.last_message_at || session.created_at);
+            if (!groups.has(label)) groups.set(label, []);
+            groups.get(label).push(session);
+        });
+        list.innerHTML = Array.from(groups).map(([label, sessions]) => `
+            <li class="session-group-label" aria-hidden="true">${this.esc(label)}</li>
+            ${sessions.map((session) => {
+                const timeLabel = this.sessionTime(session.last_message_at || session.created_at);
+                return `
             <li class="list-item ${this.currentSession?.id === session.id ? "active" : ""}" data-session-row="${this.esc(session.id)}">
                 <button class="item-select" type="button" data-session="${this.esc(session.id)}"
                         title="${this.esc(session.preview || session.title)}"
@@ -685,8 +693,9 @@ class ChatApp {
                 <button class="item-ren" data-ren="${this.esc(session.id)}" aria-label="重命名" type="button">✎</button>
                 <button class="item-del" data-del-session="${this.esc(session.id)}" aria-label="删除" type="button">×</button>
             </li>
-        `;
-        }).join("");
+            `;
+            }).join("")}
+        `).join("");
 
         list.querySelectorAll("[data-session]").forEach((button) => {
             button.addEventListener("click", () => this.openSession(button.dataset.session));
@@ -2080,6 +2089,39 @@ class ChatApp {
         if (Number.isNaN(date.getTime())) return "";
         return new Intl.DateTimeFormat("zh-CN", {
             month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit",
+        }).format(date);
+    }
+
+    sessionGroup(value) {
+        if (!value) return "更早";
+        const date = new Date(value);
+        if (Number.isNaN(date.getTime())) return "更早";
+        const startOfDay = (item) => new Date(
+            item.getFullYear(), item.getMonth(), item.getDate()
+        ).getTime();
+        const diffDays = Math.floor((startOfDay(new Date()) - startOfDay(date)) / 86400000);
+        if (diffDays <= 0) return "今天";
+        if (diffDays === 1) return "昨天";
+        if (diffDays < 7) return "7 天内";
+        if (diffDays < 30) return "30 天内";
+        return "更早";
+    }
+
+    sessionTime(value) {
+        if (!value) return "";
+        const date = new Date(value);
+        if (Number.isNaN(date.getTime())) return "";
+        const now = new Date();
+        const sameDay = date.getFullYear() === now.getFullYear()
+            && date.getMonth() === now.getMonth()
+            && date.getDate() === now.getDate();
+        if (sameDay) {
+            return new Intl.DateTimeFormat("zh-CN", {
+                hour: "2-digit", minute: "2-digit",
+            }).format(date);
+        }
+        return new Intl.DateTimeFormat("zh-CN", {
+            month: "numeric", day: "numeric",
         }).format(date);
     }
 
