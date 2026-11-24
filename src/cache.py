@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, List, Optional
 
 # 本模块只依赖 vector_store.Hit 做序列化；RAGResult 在反序列化时惰性导入，
 # 避免与 rag_pipeline 形成模块级循环导入。

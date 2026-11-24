@@ -33,7 +33,6 @@ from src.db.models import (
     User,
 )
 from src.middleware.audit import AuditAction, get_audit_logger
-from src.middleware.identity import get_current_user
 from src.team_auth import require_admin_user
 from src.utils import get_logger, resolve_path
 

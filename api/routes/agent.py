@@ -18,7 +18,7 @@ from api.deps import get_llm_gate, get_runtime_config, get_runtime_pipeline
 from src.agent_profiles import SavedAgentError, saved_agent_runtime
 from src.db.database import get_db
 from src.db.models import MCPServer, User
-from src.kb_service import KBError, get_kb
+from src.kb_service import KBError
 from src.mcp_stdio import MCPTool, discover_mcp_tools, mcp_tool_name
 from src.middleware.identity import get_current_user
 from src.utils import get_logger

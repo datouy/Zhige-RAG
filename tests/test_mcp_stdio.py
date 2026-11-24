@@ -1,7 +1,6 @@
 """最小 MCP stdio 协议、命令白名单与工具调用。"""
 from __future__ import annotations
 
-import json
 import sys
 import textwrap
 
