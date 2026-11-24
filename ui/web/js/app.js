@@ -2089,7 +2089,7 @@ class ChatApp {
         const date = new Date(value);
         if (Number.isNaN(date.getTime())) return "";
         return new Intl.DateTimeFormat("zh-CN", {
-            month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit",
+            month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false,
         }).format(date);
     }
 
@@ -2118,7 +2118,7 @@ class ChatApp {
             && date.getDate() === now.getDate();
         if (sameDay) {
             return new Intl.DateTimeFormat("zh-CN", {
-                hour: "2-digit", minute: "2-digit",
+                hour: "2-digit", minute: "2-digit", hour12: false,
             }).format(date);
         }
         return new Intl.DateTimeFormat("zh-CN", {
@@ -2858,7 +2858,7 @@ class ChatApp {
         const date = new Date(Number(value || 0) * 1000);
         if (Number.isNaN(date.getTime())) return "";
         return new Intl.DateTimeFormat("zh-CN", {
-            month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit",
+            month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false,
         }).format(date);
     }
 
