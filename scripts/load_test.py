@@ -13,6 +13,7 @@
 - POST /api/v1/search    检索（走 embedding 编码 + Chroma）
 
 每个请求都记录耗时；最后输出 P50/P95/P99、错误率与吞吐。
+搜索接口有 ``60/minute`` 配额，429 会单列为限流率，不计为服务错误。
 """
 from __future__ import annotations
 
@@ -63,11 +64,25 @@ def _run_plan(base_url: str, plan: list[tuple[str, str, dict | None]], concurren
     elapsed = time.perf_counter() - started
 
     latencies = [r[0] for r in results]
-    errors = [r for r in results if r[2] or r[1] >= 400]
+    status_codes: dict[str, int] = {}
+    for _, status, _ in results:
+        key = str(status)
+        status_codes[key] = status_codes.get(key, 0) + 1
+    rate_limited = sum(1 for _, status, _ in results if status == 429)
+    # 429 是接口主动执行保护，不属于服务故障。仍单独给出限流率，避免把
+    # “超出配额”误解成“服务不可用”。
+    errors = [
+        r
+        for r in results
+        if r[1] != 429 and (r[2] or r[1] >= 400)
+    ]
     return {
         "requests": len(results),
         "elapsed_s": round(elapsed, 3),
         "throughput_rps": round(len(results) / elapsed, 2) if elapsed > 0 else 0.0,
+        "status_codes": status_codes,
+        "rate_limited": rate_limited,
+        "rate_limited_rate": round(rate_limited / len(results), 4) if results else 0.0,
         "error_rate": round(len(errors) / len(results), 4) if results else 0.0,
         "p50_ms": round(_percentile(latencies, 0.50), 2),
         "p95_ms": round(_percentile(latencies, 0.95), 2),
@@ -94,6 +109,8 @@ def main() -> int:
     ]
 
     print("压测目标：%s  并发=%d  总请求=%d" % (args.base_url, args.concurrency, args.requests))
+    if per_endpoint > 60:
+        print("提示：搜索接口限流为 60/minute，超出部分的 429 会记入 rate_limited_rate。")
     print("-" * 60)
 
     for method, path, body in plans:
