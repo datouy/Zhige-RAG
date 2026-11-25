@@ -106,3 +106,14 @@ def test_list_jobs_is_recent_first_and_filterable(monkeypatch):
     assert [job["job_id"] for job in ij.list_jobs(status="failed")] == [older]
     assert ij.list_jobs(limit=1)[0]["status"] == "done"
 
+
+def test_list_jobs_uses_insertion_order_when_timestamps_tie(monkeypatch):
+    monkeypatch.setattr(ij.time, "time", lambda: 1_700_000_000.0)
+
+    older = ij.create_job("file", "tie-older.txt")
+    newer = ij.create_job("file", "tie-newer.txt")
+    ij._update(older, status="done")
+    ij._update(newer, status="done")
+
+    assert [job["job_id"] for job in ij.list_jobs(limit=2)] == [newer, older]
+

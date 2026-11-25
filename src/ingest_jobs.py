@@ -140,17 +140,27 @@ def list_jobs(limit: int = 50, status: Optional[str] = None) -> List[Dict[str, A
     """返回最近任务快照，时间倒序；可按状态过滤。"""
     capped = max(1, min(int(limit), 200))
     with _JOBS_LOCK:
-        jobs = [dict(job) for job in _JOBS.values()]
+        # 保留插入序号作为稳定次级排序。Windows 的 time.time() 可能在同一
+        # 调度周期内返回相同值，仅靠时间戳会让两个新任务随机换序。
+        jobs = [
+            (index, dict(job))
+            for index, job in enumerate(_JOBS.values())
+        ]
     if status:
-        jobs = [job for job in jobs if job.get("status") == status]
+        jobs = [
+            (index, job)
+            for index, job in jobs
+            if job.get("status") == status
+        ]
     jobs.sort(
-        key=lambda job: (
-            float(job.get("created_at") or 0),
-            float(job.get("updated_at") or 0),
+        key=lambda item: (
+            float(item[1].get("created_at") or 0),
+            float(item[1].get("updated_at") or 0),
+            item[0],
         ),
         reverse=True,
     )
-    return jobs[:capped]
+    return [job for _, job in jobs[:capped]]
 
 
 def _update(job_id: str, **fields: Any) -> None:
