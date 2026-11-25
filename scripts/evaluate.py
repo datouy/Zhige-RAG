@@ -38,6 +38,7 @@ import sqlite3
 import sys
 import time
 import unicodedata
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -48,6 +49,7 @@ sys.path.insert(0, str(ROOT))
 
 from src.rag_pipeline import RAGPipeline
 from src.utils import ensure_dir, get_logger, resolve_path
+from src.verifier import is_refusal_answer
 
 logger = get_logger("evaluate")
 
@@ -75,6 +77,97 @@ def load_eval_dataset(path: Path) -> List[Dict[str, Any]]:
             items.append(json.loads(line))
     logger.info("加载评估集：%d 条", len(items))
     return items
+
+
+def item_expects_refusal(item: Dict[str, Any]) -> bool:
+    """Whether a dataset item intentionally asks the system to decline."""
+    return item.get("expect_refusal") is True
+
+
+def _result_is_refusal(result: Any) -> bool:
+    verification = getattr(result, "verification", None)
+    if isinstance(verification, dict) and bool(verification.get("refused")):
+        return True
+    if verification is not None and bool(getattr(verification, "refused", False)):
+        return True
+    return is_refusal_answer(str(getattr(result, "answer", "") or ""))
+
+
+def audit_eval_dataset(items: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    """Summarize coverage and structural defects before trusting a score.
+
+    A high HitRate on eight easy questions is not evidence of product quality.
+    The report surfaces difficulty, query type, duplicate IDs/questions and
+    answerable/refusal balance so CI can require a representative minimum.
+    """
+    difficulties = Counter(
+        str(item.get("difficulty") or "unspecified").strip().lower()
+        for item in items
+    )
+    query_types = Counter(
+        str(item.get("query_type") or "unspecified").strip()
+        for item in items
+    )
+    questions = [str(item.get("question") or "").strip() for item in items]
+    nonempty_questions = [question for question in questions if question]
+    ids = [str(item.get("id") or "").strip() for item in items]
+    nonempty_ids = [item_id for item_id in ids if item_id]
+    refusal_samples = sum(1 for item in items if item_expects_refusal(item))
+    answerable_samples = len(items) - refusal_samples
+
+    unscored: List[Dict[str, Any]] = []
+    invalid_refusals: List[Dict[str, Any]] = []
+    for index, item in enumerate(items, 1):
+        has_gold = bool(item.get("expected_sources")) or bool(
+            item.get("expected_evidence")
+        )
+        if item_expects_refusal(item):
+            if has_gold:
+                invalid_refusals.append(
+                    {
+                        "index": index,
+                        "question": item.get("question"),
+                        "reason": "refusal_item_has_expected_gold",
+                    }
+                )
+        elif not has_gold:
+            unscored.append(
+                {
+                    "index": index,
+                    "question": item.get("question"),
+                    "reason": "answerable_item_has_no_expected_sources_or_evidence",
+                }
+            )
+
+    duplicate_questions = sorted(
+        question for question, count in Counter(nonempty_questions).items() if count > 1
+    )
+    duplicate_ids = sorted(
+        item_id for item_id, count in Counter(nonempty_ids).items() if count > 1
+    )
+    missing_id = len(items) - len(nonempty_ids)
+    return {
+        "samples": len(items),
+        "answerable_samples": answerable_samples,
+        "refusal_samples": refusal_samples,
+        "difficulty": dict(difficulties),
+        "query_types": dict(query_types),
+        "missing_difficulty": difficulties.get("unspecified", 0),
+        "missing_question": sum(1 for question in questions if not question),
+        "missing_id": missing_id,
+        "duplicate_questions": duplicate_questions,
+        "duplicate_ids": duplicate_ids,
+        "unscored_answerable_samples": unscored,
+        "invalid_refusal_samples": invalid_refusals,
+        "valid": not (
+            any(not question for question in questions)
+            or missing_id
+            or len(set(nonempty_ids)) != len(nonempty_ids)
+            or duplicate_questions
+            or unscored
+            or invalid_refusals
+        ),
+    }
 
 
 def normalize_eval_text(value: Any) -> str:
@@ -126,7 +219,11 @@ def _relevant_evidence(item: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 
 def dataset_uses_evidence(items: Sequence[Dict[str, Any]]) -> bool:
-    return any(bool(item.get("expected_evidence")) for item in items)
+    return any(
+        bool(item.get("expected_evidence"))
+        for item in items
+        if not item_expects_refusal(item)
+    )
 
 
 def synthesize_demo_dataset(md_path: Path, out_path: Path, n: int = 5) -> List[Dict[str, Any]]:
@@ -658,12 +755,14 @@ def expected_source_coverage(
     expected = {
         str(source).replace("\\", "/")
         for item in items
+        if not item_expects_refusal(item)
         for source in (item.get("expected_sources") or [])
         if source
     }
     expected.update(
         evidence_anchor(evidence)[0]
         for item in items
+        if not item_expects_refusal(item)
         for evidence in _relevant_evidence(item)
         if evidence_anchor(evidence) is not None
     )
@@ -753,6 +852,11 @@ def evaluate(pipeline: RAGPipeline, items: List[Dict[str, Any]], llm_self_eval: 
     evidence_recalls_at_5: List[float] = []
     evidence_recalls_at_10: List[float] = []
     evidence_excluded = 0
+    retrieval_evaluable_samples = 0
+    expected_refusal_samples = 0
+    correct_refusal_samples = 0
+    answerable_samples = 0
+    answerable_refusals = 0
     # 可验证性聚合（核心指标：答案必须可回溯到上下文）
     verifications: List[Dict[str, Any]] = []
     details: List[Dict[str, Any]] = []
@@ -761,6 +865,7 @@ def evaluate(pipeline: RAGPipeline, items: List[Dict[str, Any]], llm_self_eval: 
         q = item["question"]
         expected_sources = item.get("expected_sources", []) or []
         keywords = item.get("expected_keywords", []) or []
+        expects_refusal = item_expects_refusal(item)
 
         t0 = time.perf_counter()
         try:
@@ -772,6 +877,19 @@ def evaluate(pipeline: RAGPipeline, items: List[Dict[str, Any]], llm_self_eval: 
         latency = (time.perf_counter() - t0) * 1000
         latencies.append(latency)
 
+        verification = getattr(result, "verification", None)
+        actual_refusal = _result_is_refusal(result)
+        refusal_correct: Optional[bool] = None
+        if expects_refusal:
+            expected_refusal_samples += 1
+            refusal_correct = actual_refusal
+            if actual_refusal:
+                correct_refusal_samples += 1
+        else:
+            answerable_samples += 1
+            if actual_refusal:
+                answerable_refusals += 1
+
         # 检索命中 + NDCG/MRR
         retrieval_items = list(getattr(result, "raw_hits", None) or result.sources or [])
         retrieved_sources = []
@@ -782,19 +900,26 @@ def evaluate(pipeline: RAGPipeline, items: List[Dict[str, Any]], llm_self_eval: 
                 retrieved_sources.append(
                     str((getattr(retrieval_item, "metadata", None) or {}).get("source") or "")
                 )
-        source_hit = 0
-        if expected_sources:
-            for src in retrieved_sources:
-                if any(es in src for es in expected_sources):
-                    source_hit = 1
-                    break
+        source_hit: Optional[bool]
+        if expects_refusal:
+            source_hit = None
+            ndcg = None
+            source_mrr = None
+            source_recall = None
         else:
-            source_hit = 1
-        retrieval_hits += source_hit
-
-        ndcg = ndcg_at_k(retrieved_sources, expected_sources, k=5)
-        source_mrr = mrr(retrieved_sources, expected_sources)
-        source_recall = recall_at_k(retrieved_sources, expected_sources, k=10)
+            retrieval_evaluable_samples += 1
+            source_hit = bool(
+                expected_sources
+                and any(
+                    any(es in src for es in expected_sources)
+                    for src in retrieved_sources
+                )
+            )
+            if source_hit:
+                retrieval_hits += 1
+            ndcg = ndcg_at_k(retrieved_sources, expected_sources, k=5)
+            source_mrr = mrr(retrieved_sources, expected_sources)
+            source_recall = recall_at_k(retrieved_sources, expected_sources, k=10)
         if ndcg is not None:
             ndcgs.append(ndcg)
         if source_mrr is not None:
@@ -809,7 +934,7 @@ def evaluate(pipeline: RAGPipeline, items: List[Dict[str, Any]], llm_self_eval: 
         evidence_recall_10: Optional[float] = None
         gold_groups: List[set[str]] = []
         missing_evidence: List[Dict[str, Any]] = []
-        if evidence_mode:
+        if evidence_mode and not expects_refusal:
             gold_groups, missing_evidence = evidence_gold_groups(item, evidence_map)
             if gold_groups and not missing_evidence:
                 hit_ids = _ranked_hit_ids(retrieval_items)
@@ -829,7 +954,11 @@ def evaluate(pipeline: RAGPipeline, items: List[Dict[str, Any]], llm_self_eval: 
             else:
                 evidence_excluded += 1
 
-        hit = evidence_hit if evidence_mode else source_hit
+        hit: Optional[float | bool]
+        if expects_refusal:
+            hit = None
+        else:
+            hit = evidence_hit if evidence_mode else source_hit
         mrr_val = evidence_mrr_10 if evidence_mode else source_mrr
         recall_val = evidence_recall_10 if evidence_mode else source_recall
 
@@ -856,7 +985,6 @@ def evaluate(pipeline: RAGPipeline, items: List[Dict[str, Any]], llm_self_eval: 
             tokens_per_sec_values.append(float(tps))
 
         # 可验证性（pipeline 侧规则校验结果）
-        verification = getattr(result, "verification", None)
         if verification:
             verifications.append(verification)
 
@@ -869,8 +997,11 @@ def evaluate(pipeline: RAGPipeline, items: List[Dict[str, Any]], llm_self_eval: 
                 "ttft_ms": round(ttft_ms, 2) if isinstance(ttft_ms, (int, float)) else None,
                 "tokens_generated": timings.get("tokens_generated"),
                 "tokens_per_sec": round(tps, 2) if isinstance(tps, (int, float)) else None,
-                "retrieval_hit": bool(hit),
-                "source_retrieval_hit": bool(source_hit),
+                "expect_refusal": expects_refusal,
+                "actual_refusal": actual_refusal,
+                "refusal_correct": refusal_correct,
+                "retrieval_hit": bool(hit) if hit is not None else None,
+                "source_retrieval_hit": bool(source_hit) if source_hit is not None else None,
                 "keyword_coverage": kw_cov,
                 "answer_similarity": round(_sim, 4) if _sim is not None else None,
                 "faithfulness": round(_faith, 4) if _faith is not None else None,
@@ -889,7 +1020,7 @@ def evaluate(pipeline: RAGPipeline, items: List[Dict[str, Any]], llm_self_eval: 
             "[%d/%d] 命中=%s 覆盖率=%s NDCG=%s MRR=%s 延迟=%.0fms TTFT=%sms",
             i,
             n,
-            bool(hit),
+            hit if hit is not None else "—",
             f"{kw_cov:.2f}" if kw_cov is not None else "—",
             f"{ndcg:.2f}" if ndcg is not None else "—",
             f"{mrr_val:.2f}" if mrr_val is not None else "—",
@@ -900,7 +1031,11 @@ def evaluate(pipeline: RAGPipeline, items: List[Dict[str, Any]], llm_self_eval: 
     # 可验证性汇总：verified 比例、平均引用覆盖率、编造事实计数
     answered = [v for v in verifications if not v.get("refused")]
     verified = [v for v in answered if v.get("status") == "verified"]
-    source_hit_rate = retrieval_hits / n if n else 0.0
+    source_hit_rate = (
+        retrieval_hits / retrieval_evaluable_samples
+        if retrieval_evaluable_samples
+        else None
+    )
     source_mrr_mean = sum(mrrs) / len(mrrs) if mrrs else None
     source_recall_mean = sum(recalls) / len(recalls) if recalls else None
     evidence_summary = {
@@ -953,6 +1088,25 @@ def evaluate(pipeline: RAGPipeline, items: List[Dict[str, Any]], llm_self_eval: 
         ),
         "hit_rate_at_10": evidence_summary["hit_rate_at_10"],
         "retrieval_evidence": evidence_summary,
+        "answer_behavior": {
+            "answerable_samples": answerable_samples,
+            "expected_refusal_samples": expected_refusal_samples,
+            "correct_refusal_samples": correct_refusal_samples,
+            "refusal_accuracy": (
+                correct_refusal_samples / expected_refusal_samples
+                if expected_refusal_samples
+                else None
+            ),
+            "answerable_refusals": answerable_refusals,
+            "answerable_refusal_rate": (
+                answerable_refusals / answerable_samples
+                if answerable_samples
+                else None
+            ),
+        },
+        "retrieval_evaluable_samples": retrieval_evaluable_samples,
+        "excluded_refusal_samples": expected_refusal_samples,
+        "dataset_audit": audit_eval_dataset(items),
         "source_retrieval": {
             "hit_rate": source_hit_rate,
             "mrr": source_mrr_mean,
@@ -1091,11 +1245,27 @@ def evaluate_retrieval(
     evidence_recalls_at_5: List[float] = []
     evidence_recalls_at_10: List[float] = []
     evidence_excluded = 0
+    retrieval_evaluable_samples = 0
+    refusal_samples_skipped = 0
     latencies: List[float] = []
     details: List[Dict[str, Any]] = []
     for i, item in enumerate(items, 1):
         q = item["question"]
         expected_sources = item.get("expected_sources", []) or []
+        if item_expects_refusal(item):
+            refusal_samples_skipped += 1
+            details.append(
+                {
+                    "index": i,
+                    "question": q,
+                    "expect_refusal": True,
+                    "skipped_reason": "retrieval_metrics_not_applicable_to_refusal_sample",
+                    "retrieval_hit": None,
+                    "source_retrieval_hit": None,
+                }
+            )
+            continue
+        retrieval_evaluable_samples += 1
         t0 = time.perf_counter()
         try:
             hits = pipeline.retrieve(q, top_k=top_k)
@@ -1181,7 +1351,11 @@ def evaluate_retrieval(
             latency,
         )
 
-    source_hit_rate = source_hits_total / n if n else 0.0
+    source_hit_rate = (
+        source_hits_total / retrieval_evaluable_samples
+        if retrieval_evaluable_samples
+        else None
+    )
     source_mrr_mean = sum(source_mrrs) / len(source_mrrs) if source_mrrs else None
     source_recall_mean = (
         sum(source_recalls) / len(source_recalls) if source_recalls else None
@@ -1230,6 +1404,9 @@ def evaluate_retrieval(
         ),
         "hit_rate_at_10": evidence_summary["hit_rate_at_10"],
         "retrieval_evidence": evidence_summary,
+        "dataset_audit": audit_eval_dataset(items),
+        "retrieval_evaluable_samples": retrieval_evaluable_samples,
+        "excluded_refusal_samples": refusal_samples_skipped,
         "source_retrieval": {
             "hit_rate": source_hit_rate,
             "mrr": source_mrr_mean,
@@ -1249,9 +1426,33 @@ def check_thresholds(summary: Dict[str, Any], args: argparse.Namespace) -> List[
     if args.min_samples and samples < args.min_samples:
         failures.append(f"samples {samples} < {args.min_samples}")
 
-    hit_rate = float(summary.get("retrieval_hit_rate", 0.0) or 0.0)
-    if args.min_hit_rate is not None and hit_rate < args.min_hit_rate:
-        failures.append(f"retrieval_hit_rate {hit_rate:.3f} < {args.min_hit_rate:.3f}")
+    audit = summary.get("dataset_audit") or {}
+    min_answerable_samples = getattr(args, "min_answerable_samples", None)
+    if min_answerable_samples is not None:
+        actual = int(audit.get("answerable_samples", 0) or 0)
+        if actual < min_answerable_samples:
+            failures.append(
+                f"answerable_samples {actual} < {min_answerable_samples}"
+            )
+
+    min_hard_samples = getattr(args, "min_hard_samples", None)
+    if min_hard_samples is not None:
+        actual = int((audit.get("difficulty") or {}).get("hard", 0) or 0)
+        if actual < min_hard_samples:
+            failures.append(f"hard_samples {actual} < {min_hard_samples}")
+
+    min_refusal_samples = getattr(args, "min_refusal_samples", None)
+    if min_refusal_samples is not None:
+        actual = int(audit.get("refusal_samples", 0) or 0)
+        if actual < min_refusal_samples:
+            failures.append(
+                f"refusal_samples {actual} < {min_refusal_samples}"
+            )
+
+    hit_rate = summary.get("retrieval_hit_rate")
+    if args.min_hit_rate is not None and float(hit_rate or 0.0) < args.min_hit_rate:
+        actual = float(hit_rate or 0.0)
+        failures.append(f"retrieval_hit_rate {actual:.3f} < {args.min_hit_rate:.3f}")
 
     ndcg_value = summary.get("ndcg_at_5")
     if args.min_ndcg is not None:
@@ -1371,6 +1572,24 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument("--min-samples", type=int, default=0, help="CI：最少样本数")
+    p.add_argument(
+        "--min-answerable-samples",
+        type=int,
+        default=None,
+        help="CI：最少可回答问题数（不含 expect_refusal）",
+    )
+    p.add_argument(
+        "--min-hard-samples",
+        type=int,
+        default=None,
+        help="CI：最少 hard 难度样本数",
+    )
+    p.add_argument(
+        "--min-refusal-samples",
+        type=int,
+        default=None,
+        help="CI：最少 expect_refusal 无答案样本数",
+    )
     p.add_argument("--min-hit-rate", type=float, default=None, help="CI：最低检索命中率")
     p.add_argument("--min-ndcg", type=float, default=None, help="CI：最低 NDCG@5")
     p.add_argument("--min-recall", type=float, default=None, help="CI：最低 Recall@10")
@@ -1510,6 +1729,22 @@ def main():
 
     print("\n========== 评估报告 ==========")
     print(f"样本数            : {summary['samples']}")
+    audit = summary.get("dataset_audit") or {}
+    if audit:
+        difficulty = audit.get("difficulty") or {}
+        print(
+            "难度分布          : "
+            f"easy={difficulty.get('easy', 0)} "
+            f"medium={difficulty.get('medium', 0)} "
+            f"hard={difficulty.get('hard', 0)}"
+        )
+        print(
+            "可回答 / 拒答     : "
+            f"{audit.get('answerable_samples', 0)} / "
+            f"{audit.get('refusal_samples', 0)}"
+        )
+        if not audit.get("valid", True):
+            print("数据集质量        : 存在结构问题，请查看 report.dataset_audit")
     source_coverage = (summary.get("dataset_source_coverage") or {}).get("coverage")
     print(
         f"评测源覆盖率      : {source_coverage:.2%}"
@@ -1569,12 +1804,17 @@ def main():
     cov = summary.get("avg_keyword_coverage")
     print(f"平均关键词覆盖率  : {cov:.2%}" if cov is not None else "平均关键词覆盖率  : —")
     v = summary.get("verifiability") or {}
+    behavior = summary.get("answer_behavior") or {}
     vr = v.get("verified_rate")
     print(f"可验证率          : {vr:.2%}" if vr is not None else "可验证率          : —")
     cr = v.get("avg_cited_sentence_ratio")
     print(f"平均引用覆盖率    : {cr:.2%}" if cr is not None else "平均引用覆盖率    : —")
     rr = v.get("refusal_rate")
     print(f"拒答率            : {rr:.2%}" if rr is not None else "拒答率            : —")
+    ra = behavior.get("refusal_accuracy")
+    print(f"无答案题正确拒答  : {ra:.2%}" if ra is not None else "无答案题正确拒答  : —")
+    arr = behavior.get("answerable_refusal_rate")
+    print(f"应答题误拒率      : {arr:.2%}" if arr is not None else "应答题误拒率      : —")
     print(f"编造事实/越界引用 : {v.get('unsupported_fact_total', 0)} / {v.get('invalid_citation_total', 0)}")
     lat = summary.get("avg_latency_ms")
     print(f"平均响应时间      : {lat:.0f} ms" if lat is not None else "平均响应时间      : —")

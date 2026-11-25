@@ -104,7 +104,9 @@ evidence 级 CI 门禁示例：
 ```bash
 python scripts/evaluate.py --retrieval-only \
   --dataset data/eval/templates/evidence_retrieval.jsonl --top-k 10 \
-  --min-samples 11 --min-evidence-coverage 1 \
+  --min-samples 20 --min-answerable-samples 12 \
+  --min-hard-samples 4 --min-refusal-samples 4 \
+  --min-evidence-coverage 1 \
   --min-recall-at-5 0.8 --min-recall-at-10 0.9 \
   --min-hit-rate-at-10 0.9 --min-mrr-at-10 0.7 \
   --max-p95-latency-ms 1500 --no-archive
@@ -112,6 +114,9 @@ python scripts/evaluate.py --retrieval-only \
 
 `--min-evidence-coverage 1` 会阻止过期标注集静默生成低分；引文无法映射时，
 该 query 会进入 `retrieval_evidence.excluded_samples`，不会被当成模型漏召。
+`expect_refusal: true` 的无答案题不进入检索命中率分母，生成式评估会单独输出
+正确拒答率和应答题误拒率。数据集审计同时检查重复 ID/问题、缺失难度、无金标
+可答题和错误标注的无答案题，并可用最少困难题/拒答题数量卡住发布门禁。
 生成式评估还可增加 `--min-verified-rate 0.8`。报告仍会完整写出，未达到阈值时
 进程以非零状态退出。
 

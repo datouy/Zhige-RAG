@@ -558,7 +558,9 @@ memory:
 evaluation:
   retrieval_top_k: 5
   judge_model: ""
-  dataset_path: "data/eval/eval_set.jsonl"
+  # 启动集只引用当前示例知识库真实存在的资料和原文引文。换生产语料时，
+  # 应复制此结构重新标注，不应继续使用与当前 collection 不匹配的旧评估集。
+  dataset_path: "data/eval/templates/evidence_retrieval.jsonl"
   output_path: "data/eval/results.json"
   report_path: "data/eval/report.json"
   metrics:

@@ -1,8 +1,8 @@
 # Evidence 检索标注模板
 
 `evidence_retrieval.jsonl` 是针对当前本地语料可直接运行的启动集。每行一个
-query，`expected_evidence` 至少要包含一条 `relevance >= 2` 的引文。生产门禁
-建议扩展到至少 20 条，稳定版本目标为 50 条以上。
+query；可回答问题必须带至少一条 `relevance >= 2` 的引文，无答案题使用
+`expect_refusal: true`。当前启动集不少于 20 条，生产稳定版本目标为 50 条以上。
 
 ## 字段
 
@@ -11,6 +11,8 @@ query，`expected_evidence` 至少要包含一条 `relevance >= 2` 的引文。�
 - `question`：用户真实问法。
 - `query_type`：例如 `proper_noun`、`numeric`、`multi_fact`、`section_lookup`。
 - `difficulty`：`easy`、`medium`、`hard`。
+- `expect_refusal`：无答案题设为 `true`。此类样本不进入检索命中率分母，单独
+  统计正确拒答率；不能填写 `expected_sources` 或 `expected_evidence`。
 - `expected_sources`：兼容旧文件级指标，也用于来源覆盖检查。
 - `expected_evidence`：evidence/chunk 级金标。
 - `expected_evidence[].source`：当前 collection metadata 中的来源文件名。
@@ -33,7 +35,10 @@ query，`expected_evidence` 至少要包含一条 `relevance >= 2` 的引文。�
 python scripts/evaluate.py `
   --retrieval-only `
   --dataset data/eval/templates/evidence_retrieval.jsonl `
-  --min-samples 11 `
+  --min-samples 20 `
+  --min-answerable-samples 12 `
+  --min-hard-samples 4 `
+  --min-refusal-samples 4 `
   --min-evidence-coverage 1 `
   --min-recall-at-5 0.8 `
   --min-recall-at-10 0.9 `

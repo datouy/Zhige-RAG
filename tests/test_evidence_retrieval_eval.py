@@ -13,6 +13,7 @@ import pytest
 
 from scripts.evaluate import (
     _build_arg_parser,
+    audit_eval_dataset,
     build_evidence_chunk_map,
     check_thresholds,
     evaluate,
@@ -95,6 +96,19 @@ class _AnswerPipeline(_FakePipeline):
             sources=[hit.to_dict() for hit in hits],
             timings={},
             verification=None,
+        )
+
+
+class _BehaviorPipeline(_FakePipeline):
+    def answer_with_timing(self, question: str):
+        hits = list(self.results.get(question, []))
+        refused = question == "知识库里有没有火星政策？"
+        return SimpleNamespace(
+            answer=("现有资料无法回答这个问题。" if refused else "500 元"),
+            raw_hits=hits,
+            sources=[hit.to_dict() for hit in hits],
+            timings={},
+            verification={"refused": refused, "status": "refused" if refused else "verified"},
         )
 
 
@@ -271,6 +285,77 @@ def test_legacy_expected_sources_dataset_remains_file_level():
     assert summary["mrr"] == 1.0
 
 
+def test_retrieval_eval_excludes_refusal_samples_from_hit_rate_denominator():
+    source = "员工手册.md"
+    answerable = {"question": "住宿上限是多少？", "expected_sources": [source]}
+    refusal = {"question": "知识库里有没有火星政策？", "expect_refusal": True}
+    store = _FakeStore({source: [_hit("gold", "住宿每晚不超过 500 元。", source)]})
+    pipeline = _FakePipeline(
+        store,
+        {answerable["question"]: [_hit("gold", "住宿每晚不超过 500 元。", source)]},
+    )
+
+    summary = evaluate_retrieval(pipeline, [answerable, refusal], top_k=10)
+
+    assert summary["samples"] == 2
+    assert summary["retrieval_evaluable_samples"] == 1
+    assert summary["excluded_refusal_samples"] == 1
+    assert summary["retrieval_hit_rate"] == pytest.approx(1.0)
+    assert summary["details"][1]["retrieval_hit"] is None
+    assert summary["dataset_audit"]["refusal_samples"] == 1
+
+
+def test_full_eval_scores_expected_refusal_separately():
+    source = "员工手册.md"
+    answerable = {
+        "question": "住宿上限是多少？",
+        "expected_sources": [source],
+    }
+    refusal = {"question": "知识库里有没有火星政策？", "expect_refusal": True}
+    gold = _hit("gold", "住宿每晚不超过 500 元。", source)
+    pipeline = _BehaviorPipeline(
+        _FakeStore({source: [gold]}),
+        {answerable["question"]: [gold], refusal["question"]: []},
+    )
+
+    summary = evaluate(pipeline, [answerable, refusal])
+
+    behavior = summary["answer_behavior"]
+    assert behavior["answerable_samples"] == 1
+    assert behavior["expected_refusal_samples"] == 1
+    assert behavior["correct_refusal_samples"] == 1
+    assert behavior["refusal_accuracy"] == pytest.approx(1.0)
+    assert behavior["answerable_refusal_rate"] == pytest.approx(0.0)
+    assert summary["retrieval_hit_rate"] == pytest.approx(1.0)
+
+
+def test_dataset_audit_exposes_easy_set_and_structural_errors():
+    audit = audit_eval_dataset(
+        [
+            {
+                "id": "q1",
+                "question": "同名问题",
+                "difficulty": "easy",
+                "expected_sources": ["a.md"],
+            },
+            {
+                "id": "q1",
+                "question": "同名问题",
+                "difficulty": "easy",
+                "expect_refusal": True,
+                "expected_sources": ["a.md"],
+            },
+        ]
+    )
+
+    assert audit["difficulty"] == {"easy": 2}
+    assert audit["refusal_samples"] == 1
+    assert audit["duplicate_questions"] == ["同名问题"]
+    assert audit["duplicate_ids"] == ["q1"]
+    assert audit["invalid_refusal_samples"]
+    assert audit["valid"] is False
+
+
 def test_full_evaluate_uses_same_evidence_metric_alias():
     source = "员工手册.md"
     item = {
@@ -312,6 +397,26 @@ def test_new_thresholds_and_evidence_coverage_fail_closed():
     assert len(failures) == 5
 
 
+def test_dataset_balance_thresholds_fail_closed():
+    failures = check_thresholds(
+        {
+            "samples": 5,
+            "retrieval_hit_rate": 1.0,
+            "dataset_audit": {
+                "answerable_samples": 4,
+                "refusal_samples": 1,
+                "difficulty": {"easy": 4, "hard": 0},
+            },
+        },
+        _threshold_args(
+            min_answerable_samples=10,
+            min_hard_samples=3,
+            min_refusal_samples=2,
+        ),
+    )
+    assert len(failures) == 3
+
+
 def test_evidence_coverage_gate_rejects_file_only_dataset():
     failures = check_thresholds(
         {
@@ -350,13 +455,20 @@ def test_checked_in_template_has_valid_unique_evidence_annotations():
     path = Path(__file__).resolve().parent.parent / "data/eval/templates/evidence_retrieval.jsonl"
     items = load_eval_dataset(path)
 
-    assert len(items) == 11
+    assert len(items) >= 20
     assert len({item["id"] for item in items}) == len(items)
-    assert all(item.get("expected_evidence") for item in items)
+    audit = audit_eval_dataset(items)
+    assert audit["valid"] is True
+    assert audit["answerable_samples"] >= 12
+    assert audit["refusal_samples"] >= 4
+    assert audit["difficulty"].get("hard", 0) >= 4
+    assert all(
+        item.get("expected_evidence") or item.get("expect_refusal") for item in items
+    )
     assert all(
         evidence.get("source")
         and evidence.get("quote")
         and evidence.get("relevance", 0) >= 2
         for item in items
-        for evidence in item["expected_evidence"]
+        for evidence in (item.get("expected_evidence") or [])
     )
