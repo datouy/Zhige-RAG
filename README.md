@@ -4,7 +4,9 @@
 
 **开箱即用的本地中文知识库 RAG 平台**
 
-上传文档 → 自然语言提问 → 得到**带原文引用**的答案。数据全程留在你自己的机器上。
+上传文档 → 自然语言提问 → 得到**带原文引用**的答案。
+
+[GitHub](https://github.com/datouy/Zhige-RAG) · [Gitee](https://gitee.com/tokyi/Zhige-RAG) · [架构](#架构) · [快速开始](#快速开始) · [质量与可观测性](#质量与可观测性)
 
 面向 **个人开发者** 与 **中小企业**。没有 GPU 也能跑。
 
@@ -12,9 +14,9 @@
 
 </div>
 
-> **本机优化预设**：i5-13400 / 32 GB RAM / GTX 1650 4 GB 使用
-> `extractive + ONNX`。混合检索和原文溯源留在本机，生成式 LLM 完全不参与；
-> Ollama、Qwen 权重、PyTorch/Transformers 与 3.2 GB 重排模型均已移除。
+> **轻量部署预设**：默认 `extractive + ONNX` 不需要生成式 LLM，也不依赖
+> PyTorch、CUDA 或重排权重。文档、向量和检索结果留在本机；只有显式切换到
+> `openai` 等远程后端时，选中的文本才会发送到对应服务。
 
 ---
 
@@ -57,7 +59,7 @@
 | **Agent** | 内置 ReAct 多步推理与工具调用 |
 | **多模型后端** | `local` / `ollama` / `openai`，LLM 与 Embedding 各自独立配置 |
 | **双界面** | Web 前端（`ui/web`）+ Streamlit 控制台（`ui/`），共用同一套 REST API |
-| **生产配套** | 限流、审计日志、配额、Prometheus 指标、k8s 清单 |
+| **生产配套** | 限流、审计日志、Prometheus 指标、健康/就绪探针与 k8s 清单 |
 
 ---
 
@@ -111,7 +113,9 @@
 ### 0. 准备环境
 
 ```bash
+# 二选一：GitHub 或 Gitee，代码内容保持同步
 git clone https://github.com/datouy/Zhige-RAG.git
+# git clone https://gitee.com/tokyi/Zhige-RAG.git
 cd Zhige-RAG
 
 python -m venv .venv
@@ -230,7 +234,7 @@ python scripts/start_all.py      # Windows 也可双击 start.bat
 | 入口 | 地址 |
 |------|------|
 | Web 前端 | http://localhost:8000 |
-| Streamlit 控制台 | http://localhost:8501 |
+| Streamlit 控制台（可选） | http://localhost:8501 |
 | API 文档（Swagger） | http://localhost:8000/docs |
 
 日志：`logs/backend.log`、`logs/frontend.log`
@@ -389,8 +393,46 @@ EMBEDDING_BACKEND=onnx             # 本地 CPU 向量
 - GET /api/health：全量体检（DB / Chroma / LLM 配置 / 磁盘 / 内存 / Redis / 存储），带 TTL 缓存。
 - GET /api/ready：就绪探针，只查 DB + Chroma，带 READY_TIMEOUT_SECONDS 硬超时。
 
-性能基线：启动服务后运行 python scripts/load_test.py --base-url http://localhost:8000，
-可得到 /api/health/live、/api/health、/api/v1/search 的 P50/P95/P99、错误率与吞吐。
+---
+
+## 质量与可观测性
+
+### 健康与就绪检查
+
+```bash
+curl http://127.0.0.1:8000/api/health/live   # 进程存活
+curl http://127.0.0.1:8000/api/health        # 完整依赖体检
+curl http://127.0.0.1:8000/api/ready         # DB + Chroma 就绪
+```
+
+`/api/health` 会根据实际后端展示 LLM 模型与地址，API Key 只返回是否配置；
+磁盘检查跟随工作区所在磁盘。存储层会单独报告孤儿 collection，清理前可先用
+`dry_run=true` 预览。
+
+### 检索与回答评估
+
+默认评估集覆盖 easy / medium / hard、多事实、比较、错误前提和无答案题：
+
+```bash
+# 检索指标：Recall、HitRate、NDCG、MRR、证据覆盖率
+python scripts/evaluate.py --retrieval-only --no-archive
+
+# 完整链路：同时调用当前回答后端并校验拒答与引用
+python scripts/evaluate.py --no-archive
+```
+
+门禁会检查可回答样本数、hard 样本数、拒答样本数、检索覆盖率、可验证率和
+应答题误拒率。当前 22 条样例集只服务于仓库内示例知识库；更换语料后应重新
+标注，而不是直接沿用旧结论。
+
+### 真实 HTTP 压测
+
+```bash
+python scripts/load_test.py --base-url http://localhost:8000 --requests 150
+```
+
+脚本输出状态码分布、P50/P95/P99、错误率与吞吐。搜索接口有 `60/minute`
+限流；提高请求量时，`429` 会单独计入 `rate_limited_rate`，不计入服务故障率。
 
 ---
 
@@ -528,6 +570,8 @@ Zhige-RAG/
 
 - 2026-11-23：新增首次体验示例库、证据卡、质量治理、团队角色、MCP 审批、
   Agent 模板、文档生命周期与安全备份恢复。
+- 2026-11-25：健康检查按真实后端展示；评估门禁加入无答案题与数据集审计；
+  对比题保留第二来源，拒答结果隐藏来源；入库任务稳定排序；压测区分限流与故障。
 
 ## 开发
 
@@ -540,6 +584,15 @@ python -m compileall -q src api scripts tests ui # 语法闸门
 ```
 
 提交前请确保以上三条通过。CI 配置见 `.github/workflows/ci.yml`。
+
+双远程同步：
+
+```bash
+git remote add origin https://github.com/datouy/Zhige-RAG.git   # 已存在可跳过
+git remote add gitee https://gitee.com/tokyi/Zhige-RAG.git
+git push origin main
+git push gitee main
+```
 
 ---
 
