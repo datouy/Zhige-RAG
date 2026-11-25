@@ -182,6 +182,7 @@ def test_refusal_hides_retrieved_sources():
     verification = verify_answer(answer, [{"index": 1, "content": "无关资料"}])
     assert verification.refused
     assert RAGPipeline._visible_citations(answer, cites, verification) == []
+    assert RAGPipeline._visible_citations(answer, cites, verification.to_dict()) == []
 
 
 def test_llm_rewrites_deictic_followup_for_retrieval():

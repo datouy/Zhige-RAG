@@ -53,6 +53,29 @@ _REFUSAL_PREFIX_RE = re.compile(
     r"|无法回答(?:该|这个)?问题"
     r")(?:[^。！？!?\n]{0,20})(?:[。！？!?\n]|——|$)"
 )
+_REFUSAL_EXPLANATION_RE = re.compile(
+    r"^(?:检索到的|当前|现有|手头)?(?:资料|材料|知识库)(?:中)?没有"
+    r"[^。！？!?\n]{0,80}(?:无法|不能)(?:回答|确定|核实|判断)"
+    r"(?:该|这个)?问题"
+)
+
+
+def is_refusal_answer(answer: str, fallback_answer: Optional[str] = None) -> bool:
+    """Return whether an answer explicitly declines to answer.
+
+    Evaluation, streaming and verification all need the same definition of a
+    refusal. Keeping the rule in one public helper prevents a dataset from
+    counting an empty answer as a successful retrieval or generation.
+    """
+    normalized = (answer or "").strip()
+    if not normalized:
+        return True
+    if fallback_answer and normalized == str(fallback_answer).strip():
+        return True
+    return bool(
+        _REFUSAL_PREFIX_RE.match(normalized)
+        or _REFUSAL_EXPLANATION_RE.match(normalized)
+    )
 
 # 提炼 / 判断句的标记词。
 #
@@ -128,6 +151,14 @@ class VerificationResult:
 
 def _split_sentences(body: str) -> List[str]:
     """把答案正文切成句子（保留引用标记所在句）。"""
+    # Models often put citations after the sentence-ending punctuation:
+    # ``金额为 500 元。[1]``. Splitting first would turn ``[1]`` into a
+    # standalone sentence and leave the factual sentence marked uncited.
+    body = re.sub(
+        r"([。！？!?；;])(\s*)((?:\[[0-9]{1,2}\]\s*)+)",
+        lambda match: f"{match.group(3).strip()}{match.group(1)}{match.group(2)}",
+        body,
+    )
     parts = _SENT_SPLIT_RE.split(body)
     return [p.strip() for p in parts if p and p.strip() and len(p.strip()) >= 4]
 
@@ -169,17 +200,9 @@ def verify_answer(
 
     res = VerificationResult()
     answer = (answer or "").strip()
-    if not answer:
-        res.status = "refused"
-        res.refused = True
-        return res
 
     # 0. 拒答识别
-    if fallback_answer and answer == str(fallback_answer).strip():
-        res.refused = True
-        res.status = "refused"
-        return res
-    if _REFUSAL_PREFIX_RE.match(answer):
+    if is_refusal_answer(answer, fallback_answer):
         res.refused = True
         res.status = "refused"
         return res

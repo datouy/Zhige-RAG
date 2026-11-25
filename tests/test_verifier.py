@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from src.verifier import verify_answer
+from src.verifier import is_refusal_answer, verify_answer
 
 
 CHUNKS = [
@@ -15,6 +15,24 @@ FALLBACK = "抱歉，知识库中未找到相关信息，无法回答该问题�
 
 
 class TestRefused:
+    def test_public_refusal_helper_matches_pipeline_rules(self):
+        assert is_refusal_answer("")
+        assert is_refusal_answer(FALLBACK, FALLBACK)
+        assert is_refusal_answer("现有资料无法回答这个问题。")
+        assert not is_refusal_answer("资料说明公司成立于 2021 年 [1]。")
+
+    def test_explanation_before_natural_refusal_is_detected(self):
+        answer = (
+            "检索到的资料中没有带薪年假天数的信息，无法回答这个问题。"
+            "片段只包含公司成立年份和差旅报销标准。"
+        )
+        assert is_refusal_answer(answer)
+        assert verify_answer(answer, CHUNKS).refused
+
+    def test_partial_answer_with_supported_findings_is_not_whole_refusal(self):
+        answer = "资料无法确定年假天数，但可以确定差旅上限是 5000 元 [2]。"
+        assert not is_refusal_answer(answer)
+
     def test_fallback_detected(self):
         res = verify_answer(FALLBACK, CHUNKS, fallback_answer=FALLBACK)
         assert res.refused
@@ -56,6 +74,12 @@ class TestCitations:
         # 参考资料中的编号不算正文引用
         assert res.invalid_citations == []
         assert res.cited_sentence_ratio == 1.0
+
+    def test_citation_after_sentence_end_belongs_to_factual_sentence(self):
+        answer = "差旅报销金额上限是 **5000 元**。[2]"
+        res = verify_answer(answer, CHUNKS)
+        assert res.cited_sentence_ratio == 1.0
+        assert res.status == "verified"
 
 
 class TestFacts:

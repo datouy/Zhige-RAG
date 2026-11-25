@@ -21,7 +21,7 @@ import unicodedata
 from collections import OrderedDict
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Generator, List, Optional
+from typing import Any, Dict, Generator, List, Optional, Tuple
 
 from .embeddings import EmbeddingModel
 from .extractive_answer import build_extractive_answer, iter_answer_chunks
@@ -107,6 +107,14 @@ _QUERY_FILLER_PREFIX_RE = re.compile(
     r"告诉我"
     r")[:：,，。\s]*"
 )
+
+# 对比/多实体问题即使重排器只留下一个来源，也保留一个初检阶段强相关的
+# 其他来源。交叉编码器对长比较句可能给出极低分，但混合检索名次仍然可靠。
+_CROSS_SOURCE_QUERY_RE = re.compile(
+    r"一致|相同|不同|区别|差异|对比|比较|分别|各自|两者|双方|"
+    r"与.{0,30}是否|和.{0,30}是否"
+)
+_SOURCE_DIVERSITY_MIN_RAW_RATIO = 0.85
 
 
 def _strip_breadcrumb(text: str) -> str:
@@ -1426,6 +1434,7 @@ class RAGPipeline:
     def _rerank(self, query: str, hits: List[Hit], top_n: int) -> List[Hit]:
         if self.reranker is None or not hits:
             return hits[:top_n]
+        raw_hits = list(hits)
         with Timer("rerank"):
             ranked = self.reranker.rerank(query, hits, top_n=top_n)
         # 重排后二次过滤（A2 硬护栏）：重排分是 0~1 的相关度，实测无关问题
@@ -1444,8 +1453,75 @@ class RAGPipeline:
                     query[:50],
                 )
                 return []
-            return kept
-        return ranked
+            return self._preserve_source_diversity(query, kept, ranked, raw_hits, top_n)
+        return self._preserve_source_diversity(query, ranked, ranked, raw_hits, top_n)
+
+    @staticmethod
+    def _preserve_source_diversity(
+        query: str,
+        ranked: List[Hit],
+        reranked_candidates: List[Hit],
+        raw_hits: List[Hit],
+        top_n: int,
+    ) -> List[Hit]:
+        """Keep one strong secondary source for comparison questions.
+
+        Cross-encoders can score an exact supporting passage near zero when a
+        comparison query contains several entities, causing the relevance gate
+        to leave only one source in context. The hybrid retriever's initial
+        ranking is kept as a conservative fallback. We only add a second
+        source when the query explicitly asks to compare or combine facts and
+        that source has at least 85% of the best initial score.
+        """
+        output = list(ranked[:top_n])
+        if not _CROSS_SOURCE_QUERY_RE.search(query or "") or len(output) >= top_n:
+            return output
+
+        sources = {
+            str((hit.metadata or {}).get("source") or "")
+            for hit in output
+            if (hit.metadata or {}).get("source")
+        }
+        if len(sources) >= 2 or not raw_hits:
+            return output
+
+        best_raw = max(float(hit.score or 0.0) for hit in raw_hits)
+        if best_raw <= 0:
+            return output
+        reranked_by_id = {hit.id: hit for hit in reranked_candidates}
+        candidates_by_source: Dict[str, Tuple[float, Hit]] = {}
+        for hit in raw_hits:
+            source = str((hit.metadata or {}).get("source") or "")
+            if not source or source in sources:
+                continue
+            ratio = float(hit.score or 0.0) / best_raw
+            if ratio >= _SOURCE_DIVERSITY_MIN_RAW_RATIO:
+                previous = candidates_by_source.get(source)
+                if previous is None or ratio > previous[0]:
+                    candidates_by_source[source] = (ratio, hit)
+
+        for _, raw_candidate in sorted(
+            candidates_by_source.values(), key=lambda item: -item[0]
+        ):
+            source = str((raw_candidate.metadata or {}).get("source") or "")
+            if not source or source in sources:
+                continue
+            candidate = reranked_by_id.get(raw_candidate.id, raw_candidate)
+            output.append(
+                Hit(
+                    id=candidate.id,
+                    text=candidate.text,
+                    score=float(candidate.score),
+                    metadata={
+                        **(candidate.metadata or {}),
+                        "_source_diversity_guard": True,
+                    },
+                )
+            )
+            sources.add(source)
+            if len(sources) >= 2:
+                break
+        return output[:top_n]
 
     def retrieve(
         self,
@@ -1942,7 +2018,12 @@ class RAGPipeline:
         """
         if not cites:
             return []
-        if verification is not None and bool(getattr(verification, "refused", False)):
+        refused = False
+        if isinstance(verification, dict):
+            refused = bool(verification.get("refused"))
+        elif verification is not None:
+            refused = bool(getattr(verification, "refused", False))
+        if refused:
             return []
         cited = {int(n) for n in re.findall(r"\[(\d{1,3})\]", answer or "")}
         if not cited:
