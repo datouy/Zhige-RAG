@@ -77,6 +77,50 @@ def _redact(value: Any) -> Any:
     return value
 
 
+def _llm_health_snapshot(cfg_llm: Dict[str, Any]) -> tuple[str, Dict[str, Any]]:
+    """Return configuration details for the selected LLM backend.
+
+    The previous health response always read ``llm.model_name``. That is the
+    local-model field, so an OpenAI-compatible deployment was reported as a
+    local Qwen model even when no local weights were used. Keep this helper
+    free of network calls and secrets: health checks describe what is
+    configured and never echo API keys or tokens.
+    """
+    backend = str(cfg_llm.get("backend") or "extractive").strip().lower()
+    details: Dict[str, Any] = {"backend": backend}
+    if backend == "extractive":
+        details["model"] = "none"
+        return "not_required", details
+
+    backend_cfg = cfg_llm.get(backend) if isinstance(cfg_llm.get(backend), dict) else {}
+    if backend in {"openai", "ollama"}:
+        details["model"] = backend_cfg.get("model") or "unknown"
+        if backend_cfg.get("base_url"):
+            details["base_url"] = backend_cfg["base_url"]
+        if backend == "openai":
+            details["api_key_configured"] = bool(backend_cfg.get("api_key"))
+    elif backend == "local":
+        details["model"] = (
+            cfg_llm.get("model_path")
+            or cfg_llm.get("model_name")
+            or "unknown"
+        )
+        cache_dir = cfg_llm.get("cache_dir")
+        if cache_dir:
+            cache_path = resolve_path(cache_dir)
+            details["cache_dir"] = str(cache_path)
+            details["cache_exists"] = cache_path.exists()
+    else:
+        details["model"] = "unknown"
+    return "available", details
+
+
+def _disk_anchor_for(path: Path) -> str:
+    """Return the filesystem mount used for the workspace data path."""
+    resolved = Path(path).resolve()
+    return resolved.anchor or "/"
+
+
 @router.get("/api/health")
 async def health_check():
     """健康检查（带 TTL 缓存，避免高频探针穿透）。
@@ -164,21 +208,7 @@ async def health_check():
             llm_status = "unknown"
             llm_details: Dict[str, Any] = {}
             try:
-                cfg_llm = cfg.get("llm", {})
-                backend = str(cfg_llm.get("backend") or "extractive").strip().lower()
-                llm_details["backend"] = backend
-                if backend == "extractive":
-                    llm_status = "not_required"
-                    llm_details["model"] = "none"
-                else:
-                    model_name = cfg_llm.get("model_name", "unknown")
-                    cache_dir = cfg_llm.get("cache_dir")
-                    if cache_dir:
-                        cache_path = resolve_path(cache_dir)
-                        llm_details["cache_dir"] = str(cache_path)
-                        llm_details["cache_exists"] = cache_path.exists()
-                    llm_status = "available"
-                    llm_details["model"] = model_name
+                llm_status, llm_details = _llm_health_snapshot(cfg.get("llm", {}))
             except Exception as e:
                 llm_status = "not_available"
                 llm_details = {"error": str(e)[:100]}
@@ -191,18 +221,14 @@ async def health_check():
                 if psutil is None:
                     disk_status = "unavailable"
                     disk_details = {"message": "psutil 未安装，磁盘检查不可用"}
-                elif os.name == "nt":
-                    disk = psutil.disk_usage("C:")
-                    disk_details = {
-                        "total_gb": round(disk.total / (1024**3), 2),
-                        "used_gb": round(disk.used / (1024**3), 2),
-                        "free_gb": round(disk.free / (1024**3), 2),
-                        "percent": disk.percent,
-                    }
-                    disk_status = "healthy" if disk.percent < 90 else "warning"
                 else:
-                    disk = psutil.disk_usage("/")
+                    raw_docs = cfg.get("paths", {}).get("raw_docs", "data/raw")
+                    disk_target = resolve_path(raw_docs)
+                    disk_anchor = _disk_anchor_for(disk_target)
+                    disk = psutil.disk_usage(disk_anchor)
                     disk_details = {
+                        "path": str(disk_target),
+                        "anchor": disk_anchor,
                         "total_gb": round(disk.total / (1024**3), 2),
                         "used_gb": round(disk.used / (1024**3), 2),
                         "free_gb": round(disk.free / (1024**3), 2),
