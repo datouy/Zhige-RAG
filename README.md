@@ -124,14 +124,12 @@ python -m venv .venv
 # macOS / Linux
 source .venv/bin/activate
 
-# 快速模式：服务 + PDF / Word / Markdown 解析，不含 torch
-pip install -r requirements-quick.txt
-pip install -r requirements-ocr.txt        # 需要处理扫描件（图片型 PDF）时，约 100~150 MB
+# 一次装齐：服务 + 文档解析（PDF/Word/Excel/PPT/MD/TXT）+ 扫描件 OCR，不含 torch
+pip install -r requirements.txt
 ```
 
-> 三组依赖是**可选叠加**的：只装 `core` 就能跑通全部问答流程；
-> 装上 `optional` 才能解析 PDF/Word；再装上 `ocr` 才能读扫描件。
-> 不确定缺什么就跑 `python scripts/doctor.py`，它会逐项告诉你。
+> 不确定缺什么就跑 python scripts/doctor.py，它会逐项告诉你。
+> 本地生成式大模型、GPU 量化、重排、d1 决策等可选能力见文末「可选能力安装」。
 
 ### 1. 当前默认：无 LLM 本地模式
 
@@ -189,8 +187,8 @@ embedding:
 #### 可选路线 B —— 生成式本地模型
 
 ```bash
-pip install -r requirements-local.txt     # 会安装 torch，约 2~3 GB
-pip install -r requirements-gpu.txt       # 仅 NVIDIA GPU 需要（4bit 量化省显存）
+pip install "torch>=2.0,<2.5" "transformers>=4.40,<4.46" sentence-transformers   # 本地生成式大模型，约 2~3 GB
+pip install bitsandbytes                                                         # 仅 NVIDIA GPU 4bit 量化
 ```
 
 ```yaml
@@ -278,7 +276,7 @@ ZHIGE_AUTH_MODE=team
 |------|------|----------|
 | `extractive` | **当前默认**，稳定、可核验 | 无（直接返回知识库原文） |
 | `onnx` | **当前默认向量后端**，CPU 推理 | 约 24 MB BGE 模型，无 torch |
-| `local` | 完全离线、数据不出内网 | 装 `requirements-local.txt`（含 torch）、下载权重 |
+| `local` | 完全离线、数据不出内网 | 装 torch / transformers、下载权重 |
 | `ollama` | 需要生成式回答且接受 Ollama | 安装 Ollama + 拉取模型（可选） |
 | `openai` | 用云端 API（DeepSeek / 通义 / 智谱 / vLLM…） | 一个 API Key |
 
@@ -309,7 +307,7 @@ ZHIGE_AUTH_MODE=team
 
 - `backend: "llm"`（默认）—— 用你现有的 LLM（本地 Qwen / Ollama / 云端）模拟，
   **不装 torch、不下载新权重**；
-- `backend: "d1"` —— 原生加载 `LiquidAI/d1-3B`（需 `requirements-d1.txt`），
+- `backend: "d1"` —— 原生加载 `LiquidAI/d1-3B`（需按「可选能力安装」装 d1 依赖），
   真正的单次前向，最快最稳。
 
 ```yaml
@@ -330,13 +328,22 @@ data_quality:
     action: "flag"      # flag=只打标；drop=拦截低质/可疑块
 ```
 
-> 详细设计、取舍与授权提醒见 `config/config.yaml` 的 `decision` 段与 `requirements-d1.txt`。
+> 详细设计、取舍与授权提醒见 `config/config.yaml` 的 `decision` 段。
 
 > **开启前值得知道的一点**：`backend: llm` 是用生成式模型**模拟**决策，它本身仍是
 > 一次自回归调用 —— 加一处决策就多一次生成的等待。所以默认全关是有意为之。
 > 想真正拿到 d1 的毫秒级收益，要么用 `backend: d1`（需自备权重），要么只开那些
 > **能省掉一次生成**的环节（`retrieval_sufficiency`、`query_route`）—— 这两处是
 > 「多花一次短决策、少花一次长生成」，净赚。
+
+## 可选能力安装
+
+默认 requirements.txt 已覆盖开箱即用能力（服务、文档解析、扫描件 OCR）。以下能力默认不装，需要时再单独安装：
+
+- 本地生成式大模型（llm.backend: local，完全离线）：pip install "torch>=2.0,<2.5" "transformers>=4.40,<4.46" sentence-transformers；NVIDIA 4bit 量化再加 pip install bitsandbytes。
+- 重排模型（reranker.backend: bge）：pip install FlagEmbedding。
+- d1 决策模型（decision.backend: d1）：pip install "torch>=2.0" "transformers>=5.14" accelerate safetensors（约 6 GB 权重，注意 Liquid AI 授权）。
+- Streamlit 调试控制台：pip install "streamlit>=1.32,<1.40"。
 
 ## 关键配置
 
@@ -498,13 +505,7 @@ Zhige-RAG/
 │   └── app.py               Streamlit 控制台
 ├── config/config.yaml       主配置
 ├── data/                    知识库、向量库、上传文件
-├── requirements-quick.txt   快速模式依赖（Ollama / API，开箱即用）
-├── requirements-core.txt    核心服务依赖（必装）
-├── requirements-local.txt   本地推理（torch，可选）
-├── requirements-optional.txt 文档解析 / UI（可选）
-├── requirements-ocr.txt     扫描件 OCR（可选）
-├── requirements-gpu.txt     NVIDIA 量化（可选）
-├── requirements-d1.txt      d1 决策模型（可选，仅 backend=d1 时需要）
+├── requirements.txt         开箱即用依赖（服务 + 文档解析 + OCR）
 └── tests/                   测试
 ```
 
@@ -531,10 +532,9 @@ Zhige-RAG/
 效果显著优于小参数量本地推理。
 
 **Q：上传 PDF 没反应**
-需要 Streamlit、重排器等可选能力：`pip install -r requirements-optional.txt`。
-若 PDF 是扫描件（图片型，提取不出文本），还需额外装 OCR 依赖：
-`pip install -r requirements-ocr.txt`，然后重新入库（OCR 只在入库时补文本，
-不会回头处理已入库的旧文件）。详见下方「已知限制」。
+上传 PDF / Word / Excel / PPT 的解析、扫描件 OCR 都已包含在 requirements.txt 里。
+若 PDF 仍是扫描件提取不出文本，说明依赖没装全，pip install -r requirements.txt
+后重新入库（OCR 只在入库时补文本，不会回头处理已入库的旧文件）。
 
 **Q：切换了 Embedding 模型后检索结果不对**
 向量维度变了。非 `local` 后端会自动使用带指纹的 collection 名（如
@@ -545,8 +545,7 @@ Zhige-RAG/
 
 ## 已知限制
 
-- **OCR 需额外安装**：扫描件能力依赖 `requirements-ocr.txt`（约 100~150 MB）。
-  未安装时图片型 PDF 提不出文本，其它格式不受影响。
+- **扫描件依赖 OCR**：图片型 PDF 的文本提取需要 OCR（已包含在 requirements.txt 中）。
 - **网页导入只覆盖静态 HTML**：纯前端渲染（SPA）的页面抓不到正文。
 - **向量库仅 ChromaDB**：单机 / 中小规模够用，未接入 pgvector、Milvus 等。
   索引检查、备份、隔离与恢复见 [docs/OPERATIONS.md](docs/OPERATIONS.md)。
@@ -566,8 +565,6 @@ Zhige-RAG/
 
 ## 最近更新
 
-详细变更记录见 [CHANGELOG.md](./CHANGELOG.md)。
-
 - 2026-11-23：新增首次体验示例库、证据卡、质量治理、团队角色、MCP 审批、
   Agent 模板、文档生命周期与安全备份恢复。
 - 2026-11-25：健康检查按真实后端展示；评估门禁加入无答案题与数据集审计；
@@ -576,11 +573,11 @@ Zhige-RAG/
 ## 开发
 
 ```bash
-pip install -r requirements-core.txt -r requirements-dev.txt
+pip install -r requirements.txt
+pip install ruff
 
-pytest tests/ -v                                 # 测试
-ruff check src/ api/                             # 代码检查
-python -m compileall -q src api scripts tests ui # 语法闸门
+ruff check src/ api/ scripts/ ui/                # 代码检查
+python -m compileall -q src api scripts ui       # 语法闸门
 ```
 
 提交前请确保以上三条通过。CI 配置见 `.github/workflows/ci.yml`。

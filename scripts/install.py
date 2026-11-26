@@ -148,7 +148,7 @@ def main() -> int:
         req = ROOT / "requirements.txt"
     elif args.ollama:
         install_mode = "ollama"
-        req = ROOT / "requirements-quick.txt"
+        req = ROOT / "requirements.txt"
     elif has_cuda:
         # 有 GPU 但没指定模式，询问用户
         install_mode = "full"
@@ -157,7 +157,7 @@ def main() -> int:
     else:
         # 无 GPU 或无虚拟环境，默认快速模式
         install_mode = "quick"
-        req = ROOT / "requirements-quick.txt"
+        req = ROOT / "requirements.txt"
         print("  [i] 自动选择快速安装模式（使用 Ollama，无需 GPU）")
 
     # 安装依赖
@@ -169,7 +169,7 @@ def main() -> int:
         extra_files = []
     else:
         # 完整安装
-        extra_files = [str(ROOT / "requirements.txt")]
+        extra_files = []
 
     if install_mode == "full":
         # Keep the local-inference toolchain aligned only for full installs.

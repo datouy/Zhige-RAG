@@ -146,14 +146,14 @@ def check_deps(interpreter: Path, auto_install: bool, assume_yes: bool) -> bool:
     if not auto_install:
         say("  ", "处理方式：")
         say("  ", "  ① 自动安装：python scripts\\quickstart.py --install")
-        say("  ", "  ② 手动安装：pip install -r requirements-core.txt")
+        say("  ", "  ② 手动安装：pip install -r requirements.txt")
         return False
 
     if not assume_yes and not _confirm("现在自动安装核心依赖？（不含 torch，通常几分钟）"):
         return False
 
     say("  ", "开始安装核心依赖 ...")
-    ok = install_requirements([ROOT / "requirements-core.txt"])
+    ok = install_requirements([ROOT / "requirements.txt"])
     if ok:
         say(OK, "核心依赖安装完成")
     else:
@@ -428,7 +428,7 @@ def show_recommendations():
     print("     - 通义千问: https://dashscope.console.aliyun.com/")
     print("     - 设置环境变量 OPENAI_API_KEY 后启动")
     print("  3. 可选生成式本地模型（需要 torch；本机已移除）")
-    print("     - 安装：pip install -r requirements-core.txt -r requirements-local.txt")
+    print("     - 安装：pip install -r requirements.txt")
 
 
 def main() -> int:

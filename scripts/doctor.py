@@ -123,9 +123,9 @@ def check_dep_group(title: str, deps: List[Tuple[str, str, str]], blocker: bool)
         level,
         f"{title}：缺少 {len(missing)}/{len(deps)} 项 —— " + "、".join(missing),
         (
-            "安装：pip install -r requirements-core.txt"
+            "安装：pip install -r requirements.txt"
             if blocker
-            else "安装（可选能力）：pip install -r requirements-optional.txt"
+            else "安装：pip install -r requirements.txt"
         ),
     )
 
@@ -410,7 +410,7 @@ def check_reranker(cfg):
 
     if backend in ("bge", "auto"):
         if not (has_module("FlagEmbedding") or has_module("sentence_transformers")):
-            add(WARN, "bge 重排缺少依赖（FlagEmbedding / sentence-transformers）", "安装：pip install -r requirements-local.txt")
+            add(WARN, "bge 重排缺少依赖（FlagEmbedding / sentence-transformers）", "安装：pip install FlagEmbedding")
         model_name = str(rcfg.get("model_name") or "./models/bge-reranker-base")
         if _resolve(model_name).exists():
             add(OK, "本地重排模型已就位：" + model_name)
@@ -434,7 +434,7 @@ def check_bm25_tokenizer() -> None:
         add(
             WARN,
             "jieba 未安装，BM25 将回退到 unigram + bigram（中文检索质量会下降）",
-            "安装：pip install jieba（已包含在 requirements-core.txt 中）。",
+        "安装：pip install jieba（已包含在 requirements.txt 中）。",
         )
 
 
@@ -610,7 +610,7 @@ def check_doc_group(cfg: Dict[str, Any]) -> None:
             add(
                 WARN,
                 "未安装 OCR 依赖：图片型 PDF（扫描件/拍照件）无法提取文字",
-                "需要时安装：pip install -r requirements-ocr.txt "
+        "需要时安装：pip install -r requirements.txt "
                 "（约 100~150 MB，纯 CPU 可跑；不装不影响文本型 PDF 与 Word）。",
             )
     except Exception as exc:  # noqa: BLE001

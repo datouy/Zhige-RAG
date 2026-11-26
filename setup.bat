@@ -84,7 +84,7 @@ echo [OK] pip 已升级
 REM 安装核心依赖
 echo.
 echo [安装] 安装核心依赖（可能需要几分钟）...
-.venv\Scripts\python.exe -m pip install -r requirements-quick.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+.venv\Scripts\python.exe -m pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 if errorlevel 1 (
     echo [错误] 依赖安装失败
     echo.
@@ -149,7 +149,7 @@ echo [OK] pip 已升级
 REM 安装完整依赖
 echo.
 echo [安装] 安装完整依赖...
-.venv\Scripts\python.exe -m pip install -r requirements.txt -r requirements-ocr.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+.venv\Scripts\python.exe -m pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 echo [OK] 完整依赖安装完成
 
 echo.

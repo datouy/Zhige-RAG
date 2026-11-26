@@ -45,7 +45,7 @@ if errorlevel 1 (
         %PYTHON% -m pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
     ) else (
         echo 正在安装快速依赖...
-        %PYTHON% -m pip install -r requirements-quick.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+        %PYTHON% -m pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
     )
 )
 

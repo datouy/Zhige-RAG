@@ -42,8 +42,8 @@ jobs:
           pip install --upgrade pip
           # 只装核心 + 开发依赖。CI 跑的是单元测试，不需要 torch（2~3 GB）；
           # 项目对重依赖是惰性导入，装了只会显著拖慢流水线。
-          pip install -r requirements-core.txt
-          pip install -r requirements-dev.txt
+          pip install -r requirements.txt
+          pip install ruff
 
       - name: Run linter
         run: |

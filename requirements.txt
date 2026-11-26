@@ -1,34 +1,75 @@
-﻿# ============================================================
-# ChineseRAGKB 依赖总表
 # ============================================================
-# 本文件通过 -r 引用分组文件，是"全量安装"的入口。
-# 各分组才是依赖的唯一真实来源，避免同一份清单在多个文件里漂移。
+# 知阁 Zhige 依赖清单（开箱即用，单文件）
+# ============================================================
+# 装这一个文件即可跑通完整链路：
+#   PDF / Word / Excel / PPT / Markdown / TXT 上传解析 + 扫描件 OCR，
+#   BM25 + 向量混合检索 + 本地 ONNX Embedding + 可选云端 API 生成式回答。
+# 不含 torch。本地生成式大模型 / GPU 量化 / 重排模型等可选能力见 README。
 #
-# ⚠️ 不建议无脑全量安装 —— 光 torch 就有 2~3 GB。按需选择：
+#     pip install -r requirements.txt
 #
-#   【最快跑起来，完全不需要 GPU】用 Ollama 或云端 API 作为模型后端
-#       pip install -r requirements-core.txt
-#       pip install -r requirements-optional.txt     # 需要解析 PDF/Word 时
-#
-#   【无 LLM、完全本地检索/问答（当前默认）】
-#       pip install -r requirements-core.txt -r requirements-optional.txt
-#       运行 python scripts/setup_onnx_embedding.py 准备约 24 MB 的向量模型
-#
-#   【有 NVIDIA GPU，想用 4bit 量化省显存】
-#       pip install -r requirements-gpu.txt          # 单独装，见文件内说明
-#
-#   【开发与测试】
-#       pip install -r requirements-core.txt -r requirements-dev.txt
-#
-# 装完请执行环境自检，它会直接告诉你还缺什么、模型能不能用：
-#       python scripts/doctor.py
+# 装完运行：python scripts/doctor.py 自检。
 # ============================================================
 
--r requirements-core.txt
--r requirements-optional.txt
+# ---------- Web 服务 ----------
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+gunicorn>=21.2.0
+websockets>=12.0
+python-multipart>=0.0.9
+aiofiles>=23.3.0
 
-# 说明：requirements-gpu.txt（bitsandbytes）未纳入本文件 ——
-# 它只在 NVIDIA CUDA 环境可用，纳入后会让大量 CPU / Windows 机器安装失败，
-# 属于"开箱即用"的硬伤。需要时显式安装：pip install -r requirements-gpu.txt
-#
-# 开发依赖（pytest / ruff）同样不纳入：pip install -r requirements-dev.txt
+# ---------- 数据校验 / ORM ----------
+pydantic>=2.0.0
+sqlalchemy>=2.0.0
+psycopg[binary]>=3.2.0,<4.0.0   # PostgreSQL 同步驱动（Docker / K8s）
+
+# ---------- 数据库迁移 ----------
+alembic>=0.9.0
+
+# ---------- 向量库 ----------
+chromadb==1.5.0
+
+# ---------- 中文分词（BM25 混合检索）----------
+jieba>=0.42.1
+
+# ---------- 基础工具 ----------
+PyYAML>=6.0
+numpy>=1.24.0,<2.0.0
+python-dotenv>=1.0.0
+tiktoken>=0.5.0
+filelock>=3.12.0
+cryptography>=41.0.0      # local_overrides.yaml 密钥加密（Fernet）
+
+# ---------- 本地 Embedding（CPU，无 torch）----------
+onnxruntime>=1.17.0,<2.0.0
+tokenizers>=0.15.0,<1.0.0
+
+# ---------- 限流 / 健康检查 / 指标 ----------
+slowapi>=0.1.9
+psutil>=5.9.0
+prometheus-client>=0.19.0
+
+# ---------- 跨进程共享缓存 / 限流（Docker / K8s 多副本） ----------
+redis>=4.0,<6.0
+
+# ---------- 可选异步 HTTP 后端（ollama / openai 高并发） ----------
+httpx>=0.24,<0.29
+
+# ---------- 知识图谱 Neo4j 后端（默认 SQLite，仅集中式部署需要） ----------
+neo4j>=5.20.0
+
+# ---------- 文档解析 ----------
+pdfplumber>=0.10.0,<0.11.8
+pypdf>=4.0.0
+python-docx>=1.1.0
+python-pptx>=0.6.21
+openpyxl>=3.1.0
+markdown>=3.6
+beautifulsoup4>=4.12.0
+lxml>=4.9.0
+
+# ---------- 扫描件 OCR ----------
+pymupdf>=1.24.0,<2.0
+rapidocr-onnxruntime>=1.3.0
+opencv-python>=4.5.1.48,<4.12
