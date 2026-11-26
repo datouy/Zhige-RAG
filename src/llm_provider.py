@@ -186,6 +186,11 @@ class OpenAICompatLLM:
                 metrics_collector.record_llm_request(
                     "success", self.model_name, time.perf_counter() - start
                 )
+                usage = (data or {}).get("usage") or {}
+                prompt_tokens = int(usage.get("prompt_tokens") or 0)
+                completion_tokens = int(usage.get("completion_tokens") or 0)
+                if prompt_tokens or completion_tokens:
+                    metrics_collector.record_llm_tokens(prompt_tokens, completion_tokens)
             except Exception:  # noqa: BLE001 - 记录失败并原样抛出，由上层兜底
                 metrics_collector.record_llm_request(
                     "error", self.model_name, time.perf_counter() - start
@@ -354,6 +359,11 @@ class OpenAICompatLLM:
                 metrics_collector.record_llm_request(
                     "success", self.model_name, time.perf_counter() - start
                 )
+                usage = (data or {}).get("usage") or {}
+                prompt_tokens = int(usage.get("prompt_tokens") or 0)
+                completion_tokens = int(usage.get("completion_tokens") or 0)
+                if prompt_tokens or completion_tokens:
+                    metrics_collector.record_llm_tokens(prompt_tokens, completion_tokens)
             except Exception:  # noqa: BLE001
                 metrics_collector.record_llm_request(
                     "error", self.model_name, time.perf_counter() - start

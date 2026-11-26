@@ -58,6 +58,12 @@ if PROMETHEUS_AVAILABLE:
         buckets=(0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0, 120.0),
     )
 
+    llm_tokens_total = Counter(
+        "llm_tokens_total",
+        "LLM tokens consumed",
+        ["kind"],
+    )
+
     vector_search_duration_seconds = Histogram(
         "vector_search_duration_seconds",
         "Vector search latency in seconds",
@@ -159,6 +165,15 @@ class PrometheusMetrics:
             return
         llm_requests_total.labels(status=status).inc()
         llm_request_duration_seconds.labels(model=model).observe(duration_seconds)
+
+    def record_llm_tokens(self, prompt_tokens: int, completion_tokens: int):
+        """记录外部 LLM 的 token 消耗（用于成本计量）。"""
+        if not PROMETHEUS_AVAILABLE:
+            return
+        if prompt_tokens:
+            llm_tokens_total.labels(kind="prompt").inc(prompt_tokens)
+        if completion_tokens:
+            llm_tokens_total.labels(kind="completion").inc(completion_tokens)
 
     def record_vector_search(
         self,
