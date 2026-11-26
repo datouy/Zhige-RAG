@@ -35,6 +35,8 @@ services:
       - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-http://localhost:8000,http://127.0.0.1:8000}
       # Rate Limiting
       - RATE_LIMIT_STORAGE_URL=redis://redis:6379/0
+      # 单机多 worker：利用多核提升并发吞吐（Chroma 本地卷读多写少，默认 2 即可）。
+      - WEB_CONCURRENCY=${WEB_CONCURRENCY:-2}
       # Chroma
       - VECTOR_STORE_PERSIST_DIR=/app/data/chroma
       # Paths
