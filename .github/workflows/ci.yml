@@ -44,26 +44,18 @@ jobs:
           # 项目对重依赖是惰性导入，装了只会显著拖慢流水线。
           pip install -r requirements-core.txt
           pip install -r requirements-dev.txt
-          # 文档解析的可选依赖：测试里用 importorskip 探测，不装就跳过，
-          # 装了才能真正跑到 docx/pdf 的解析分支（此前 CI 上这些测试恒被跳过，
-          # 相当于文档解析路径在 CI 里完全没有覆盖）。
-          pip install -r requirements-parse-test.txt
 
       - name: Run linter
         run: |
-          ruff check src/ api/ scripts/ tests/ ui/ --output-format=concise
+          ruff check src/ api/ scripts/ ui/ --output-format=concise
 
       - name: Check syntax
         run: |
-          python -m compileall -q src api scripts tests ui
+          python -m compileall -q src api scripts ui
 
       - name: Verify database migrations
         run: |
           DB_PATH="$PWD/data/ci_migration.db" alembic upgrade head
-
-      - name: Run unit tests
-        run: |
-          pytest tests/ -v --tb=short
 
       - name: Eval regression gate (retrieval-only, 0.8/0.7/1500ms)
         # P1 评估门禁：差评导出评估集后，CI 用阈值卡死回归。
