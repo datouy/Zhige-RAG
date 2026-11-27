@@ -25,6 +25,7 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libgomp1 \
     libomp-dev \
+    postgresql-client \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --create-home --shell /bin/bash appuser
 

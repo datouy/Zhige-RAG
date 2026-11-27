@@ -24,7 +24,7 @@ def upgrade() -> None:
     """users 表补 department 列；新建四层架构所需的登记/反馈/记忆表。"""
     # 1. users.department（ACL 分组依据；已存在时跳过——SQLite 无 IF NOT EXISTS）
     conn = op.get_bind()
-    cols = [row[1] for row in conn.execute(sa.text("PRAGMA table_info(users)")).fetchall()]
+    cols = {column["name"] for column in sa.inspect(conn).get_columns("users")}
     if "department" not in cols:
         op.add_column("users", sa.Column("department", sa.String(100), nullable=False, server_default=""))
 
@@ -84,6 +84,6 @@ def downgrade() -> None:
     op.drop_table("feedback_records")
     op.drop_table("document_records")
     conn = op.get_bind()
-    cols = [row[1] for row in conn.execute(sa.text("PRAGMA table_info(users)")).fetchall()]
+    cols = {column["name"] for column in sa.inspect(conn).get_columns("users")}
     if "department" in cols:
         op.drop_column("users", "department")

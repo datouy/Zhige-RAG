@@ -18,6 +18,8 @@ data:
   # Vector store settings
   VECTOR_STORE_BACKEND: "chroma"
   VECTOR_STORE_PERSIST_DIR: "/data/chroma"
+  # 设置页写入 /data 持久卷，避免写入只读配置层。
+  ZHIGE_LOCAL_OVERRIDES_PATH: "/data/local_overrides.yaml"
 
   # Knowledge graph settings
   KG_ENABLED: "true"
@@ -28,6 +30,7 @@ data:
   EMBEDDING_BACKEND: "onnx"
 
   # Monitoring settings
+  PROMETHEUS_MULTIPROC_DIR: "/tmp/prometheus-multiprocess"
   OTEL_SERVICE_NAME: "ChineseRAGKB"
   OTEL_EXPORTER_TYPE: "otlp"
   OTEL_EXPORTER_ENDPOINT: "http://otel-collector:4317"
@@ -35,9 +38,33 @@ data:
   # CORS settings
   ALLOWED_ORIGINS: "https://app.example.com,https://admin.example.com"
 
+  # 必须替换为实际 Ingress Controller Pod 的 CIDR。过宽会允许同网段直连
+  # 客户端伪造 X-Forwarded-For，不配置则所有员工会共享 Ingress 的限流桶。
+  TRUSTED_PROXIES: "10.244.0.0/16"
+
   # Rate limiting
   RATE_LIMIT_QUERY: "60/minute"
   RATE_LIMIT_DEFAULT: "120/minute"
+
+  # Team authentication: complete /api/v1/team/bootstrap with the one-time
+  # ZHIGE_BOOTSTRAP_TOKEN from the Secret before exposing the Service.
+  ZHIGE_AUTH_MODE: "team"
+  ZHIGE_COOKIE_SECURE: "1"
+
+  # Parsing/OCR/embedding runs only in the isolated worker sidecar.
+  INGEST_EXECUTION_MODE: "worker"
+  INGEST_WORKERS: "1"
+  INGEST_MAX_PENDING: "100"
+
+  # Backups are authenticated and encrypted before leaving the process.
+  ZHIGE_BACKUP_ENCRYPTION: "required"
+  ZHIGE_TENANT_QUOTA_ENABLED: "true"
+  ZHIGE_QUOTA_SEARCH_MINUTE: "120"
+  ZHIGE_QUOTA_SEARCH_DAY: "100000"
+  ZHIGE_QUOTA_CHAT_MINUTE: "60"
+  ZHIGE_QUOTA_CHAT_DAY: "20000"
+  ZHIGE_QUOTA_INGEST_MINUTE: "20"
+  ZHIGE_QUOTA_INGEST_DAY: "2000"
 
   # Resource limits
   SLOW_REQUEST_THRESHOLD_MS: "1000"

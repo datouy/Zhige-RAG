@@ -857,6 +857,9 @@ def evaluate(pipeline: RAGPipeline, items: List[Dict[str, Any]], llm_self_eval: 
     correct_refusal_samples = 0
     answerable_samples = 0
     answerable_refusals = 0
+    fact_scored_samples = 0
+    fact_complete_samples = 0
+    answer_contract_pass_samples = 0
     # 可验证性聚合（核心指标：答案必须可回溯到上下文）
     verifications: List[Dict[str, Any]] = []
     details: List[Dict[str, Any]] = []
@@ -966,6 +969,18 @@ def evaluate(pipeline: RAGPipeline, items: List[Dict[str, Any]], llm_self_eval: 
         kw_cov = keyword_coverage(result.answer, keywords) if keywords else None
         if kw_cov is not None:
             keyword_scores.append(kw_cov)
+            if not expects_refusal:
+                fact_scored_samples += 1
+                if not actual_refusal and kw_cov >= 1.0:
+                    fact_complete_samples += 1
+        if not expects_refusal and not actual_refusal and kw_cov is not None:
+            vf = verification if isinstance(verification, dict) else {}
+            if (
+                kw_cov >= 1.0
+                and not vf.get("invalid_citations")
+                and not vf.get("unsupported_facts")
+            ):
+                answer_contract_pass_samples += 1
         _ref = str(item.get("reference_answer") or "")
         _sim = semantic_similarity(result.answer or "", _ref) if _ref else None
         if _sim is not None:
@@ -1031,6 +1046,21 @@ def evaluate(pipeline: RAGPipeline, items: List[Dict[str, Any]], llm_self_eval: 
     # 可验证性汇总：verified 比例、平均引用覆盖率、编造事实计数
     answered = [v for v in verifications if not v.get("refused")]
     verified = [v for v in answered if v.get("status") == "verified"]
+    citation_total = sum(int(v.get("citation_total", 0) or 0) for v in verifications)
+    valid_citation_total = sum(
+        int(v.get("valid_citation_total", 0) or 0) for v in verifications
+    )
+    sentence_total = sum(int(v.get("sentence_count", 0) or 0) for v in answered)
+    cited_sentence_total = sum(
+        int(v.get("cited_sentence_count", 0) or 0) for v in answered
+    )
+    unsupported_sentence_total = sum(
+        len(v.get("unsupported_sentences", []) or []) for v in answered
+    )
+    hard_fact_total = sum(int(v.get("hard_fact_total", 0) or 0) for v in answered)
+    unsupported_fact_total = sum(
+        len(v.get("unsupported_facts", []) or []) for v in answered
+    )
     source_hit_rate = (
         retrieval_hits / retrieval_evaluable_samples
         if retrieval_evaluable_samples
@@ -1103,6 +1133,17 @@ def evaluate(pipeline: RAGPipeline, items: List[Dict[str, Any]], llm_self_eval: 
                 if answerable_samples
                 else None
             ),
+            "fact_scored_samples": fact_scored_samples,
+            "required_fact_complete_rate": (
+                fact_complete_samples / fact_scored_samples
+                if fact_scored_samples
+                else None
+            ),
+            "answer_contract_pass_rate": (
+                answer_contract_pass_samples / fact_scored_samples
+                if fact_scored_samples
+                else None
+            ),
         },
         "retrieval_evaluable_samples": retrieval_evaluable_samples,
         "excluded_refusal_samples": expected_refusal_samples,
@@ -1129,6 +1170,25 @@ def evaluate(pipeline: RAGPipeline, items: List[Dict[str, Any]], llm_self_eval: 
             "refusal_rate": (len(verifications) - len(answered)) / len(verifications)
             if verifications
             else None,
+            "citation_total": citation_total,
+            "valid_citation_total": valid_citation_total,
+            "citation_precision": (
+                valid_citation_total / citation_total if citation_total else None
+            ),
+            "sentence_total": sentence_total,
+            "cited_sentence_total": cited_sentence_total,
+            "unsupported_sentence_total": unsupported_sentence_total,
+            "ungrounded_cited_sentence_rate": (
+                unsupported_sentence_total / cited_sentence_total
+                if cited_sentence_total
+                else None
+            ),
+            "hard_fact_total": hard_fact_total,
+            "unsupported_fact_rate": (
+                unsupported_fact_total / hard_fact_total
+                if hard_fact_total
+                else None
+            ),
         },
         "details": details,
     }
@@ -1533,6 +1593,58 @@ def check_thresholds(summary: Dict[str, Any], args: argparse.Namespace) -> List[
                 f"verified_rate {actual:.3f} < {args.min_verified_rate:.3f}"
             )
 
+    answer_behavior = summary.get("answer_behavior") or {}
+    verifiability = summary.get("verifiability") or {}
+    threshold_checks = [
+        (
+            "required_fact_complete_rate",
+            answer_behavior.get("required_fact_complete_rate"),
+            getattr(args, "min_required_fact_complete_rate", None),
+            "min",
+        ),
+        (
+            "answer_contract_pass_rate",
+            answer_behavior.get("answer_contract_pass_rate"),
+            getattr(args, "min_answer_contract_pass_rate", None),
+            "min",
+        ),
+        (
+            "refusal_accuracy",
+            answer_behavior.get("refusal_accuracy"),
+            getattr(args, "min_correct_refusal_rate", None),
+            "min",
+        ),
+        (
+            "answerable_refusal_rate",
+            answer_behavior.get("answerable_refusal_rate"),
+            getattr(args, "max_false_refusal_rate", None),
+            "max",
+        ),
+        (
+            "citation_precision",
+            verifiability.get("citation_precision"),
+            getattr(args, "min_citation_precision", None),
+            "min",
+        ),
+        (
+            "unsupported_fact_rate",
+            verifiability.get("unsupported_fact_rate"),
+            getattr(args, "max_unsupported_fact_rate", None),
+            "max",
+        ),
+    ]
+    for name, value, limit, direction in threshold_checks:
+        if limit is None:
+            continue
+        if value is None:
+            failures.append(f"{name} unavailable")
+            continue
+        actual = float(value)
+        if direction == "min" and actual < limit:
+            failures.append(f"{name} {actual:.3f} < {limit:.3f}")
+        if direction == "max" and actual > limit:
+            failures.append(f"{name} {actual:.3f} > {limit:.3f}")
+
     if args.max_p95_latency_ms is not None:
         latency_value = summary.get("p95_latency_ms")
         if latency_value is None:
@@ -1552,6 +1664,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--output", default="data/eval/report.json", help="报告输出路径")
     p.add_argument("--llm-self-eval", action="store_true", help="启用 LLM 自评")
     p.add_argument("--retrieval-only", action="store_true", help="只评估检索（不加载 LLM/GPU，CPU 可跑）")
+    p.add_argument(
+        "--disable-reranker",
+        action="store_true",
+        help="覆盖 config/local_overrides.yaml，关闭重排，用于同库前后对照",
+    )
     p.add_argument("--top-k", type=int, default=None, help="覆盖 retrieval.top_k")
     p.add_argument("--collection", default="", help="评测 collection；默认取本地用户的默认知识库")
     p.add_argument("--kb-id", default="", help="按知识库 ID 选择评测 collection")
@@ -1630,6 +1747,42 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="CI：评估集期望文件在当前知识库中的最低覆盖率",
     )
     p.add_argument("--min-verified-rate", type=float, default=None, help="CI：最低可验证率")
+    p.add_argument(
+        "--min-required-fact-complete-rate",
+        type=float,
+        default=None,
+        help="CI：全部期望关键事实均出现的可回答样本最低比例",
+    )
+    p.add_argument(
+        "--min-answer-contract-pass-rate",
+        type=float,
+        default=None,
+        help="CI：关键事实完整、引用有效且无未接地硬事实的最低比例",
+    )
+    p.add_argument(
+        "--min-correct-refusal-rate",
+        type=float,
+        default=None,
+        help="CI：应拒答样本的实际拒答率",
+    )
+    p.add_argument(
+        "--max-false-refusal-rate",
+        type=float,
+        default=None,
+        help="CI：可回答样本被错误拒答的最高比例",
+    )
+    p.add_argument(
+        "--min-citation-precision",
+        type=float,
+        default=None,
+        help="CI：引用编号有效性最低比例",
+    )
+    p.add_argument(
+        "--max-unsupported-fact-rate",
+        type=float,
+        default=None,
+        help="CI：数字/日期/金额等硬事实未接地比例上限",
+    )
     p.add_argument("--max-p95-latency-ms", type=float, default=None, help="CI：P95 延迟上限")
     return p
 
@@ -1638,6 +1791,8 @@ def main():
     args = _build_arg_parser().parse_args()
 
     cfg = load_eval_config(args.config)
+    if args.disable_reranker:
+        cfg.setdefault("reranker", {})["enabled"] = False
     if args.top_k:
         # 只写 retrieval.top_k —— top_k 的唯一真值来源。
         # 此前还会写 rag.top_k，而该字段既从未被读取、也已从 config.yaml 删除
@@ -1689,6 +1844,11 @@ def main():
         summary["effective_config"] = {
             "collection": collection or pipeline.vector_store.collection_name,
             "reranker_enabled": getattr(pipeline, "reranker", None) is not None,
+            "llm_backend": (cfg.get("llm", {}) or {}).get("backend"),
+            "llm_model": (
+                (cfg.get("llm", {}) or {}).get("openai", {}) or {}
+            ).get("model"),
+            "embedding_backend": (cfg.get("embedding", {}) or {}).get("backend"),
             "hybrid_enabled": bool(
                 (cfg.get("vector_store", {}).get("hybrid", {}) or {}).get(
                     "enabled", False
@@ -1697,7 +1857,10 @@ def main():
             "top_k": args.top_k or 10,
         }
     else:
-        pipeline = RAGPipeline.from_config(args.config, overrides=cfg)
+        # 全链路评估也保持懒加载：extractive 模式不应构造生成模型，
+        # 生成式后端则在首次 answer() 时加载。此前默认 eager 会让
+        # `llm.backend=extractive` 在评估入口直接报“未知后端”。
+        pipeline = RAGPipeline.from_config(args.config, overrides=cfg, lazy_llm=True)
         collection = resolve_eval_collection(args.collection, args.kb_id)
         if collection:
             from src.factories import TenantAwareFactory
@@ -1708,6 +1871,11 @@ def main():
         summary["effective_config"] = {
             "collection": collection or pipeline.vector_store.collection_name,
             "reranker_enabled": getattr(pipeline, "reranker", None) is not None,
+            "llm_backend": (cfg.get("llm", {}) or {}).get("backend"),
+            "llm_model": (
+                (cfg.get("llm", {}) or {}).get("openai", {}) or {}
+            ).get("model"),
+            "embedding_backend": (cfg.get("embedding", {}) or {}).get("backend"),
             "hybrid_enabled": bool((cfg.get("vector_store", {}).get("hybrid", {}) or {}).get("enabled", False)),
         }
 

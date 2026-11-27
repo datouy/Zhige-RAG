@@ -1,0 +1,80 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: chineseragkb-backup
+  namespace: chineseragkb
+spec:
+  schedule: "15 * * * *"
+  timeZone: Asia/Shanghai
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 900
+  successfulJobsHistoryLimit: 7
+  failedJobsHistoryLimit: 7
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      activeDeadlineSeconds: 7200
+      template:
+        metadata:
+          labels:
+            app: chineseragkb
+            component: backup
+        spec:
+          restartPolicy: OnFailure
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            fsGroup: 1000
+          containers:
+            - name: backup
+              image: chineseragkb/api:0.3.0
+              imagePullPolicy: Always
+              command:
+                - python
+                - scripts/backup_scheduler.py
+                - --once
+                - --retention-days
+                - "14"
+                - --remote-dir
+                - /backup-offsite
+              env:
+                - name: DATABASE_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: chineseragkb-secrets
+                      key: DATABASE_URL
+                - name: ZHIGE_BACKUP_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: chineseragkb-secrets
+                      key: ZHIGE_BACKUP_KEY
+                - name: ZHIGE_BACKUP_ENCRYPTION
+                  value: "required"
+                - name: ZHIGE_BACKUP_REMOTE_DIR
+                  value: /backup-offsite
+              envFrom:
+                - configMapRef:
+                    name: chineseragkb-config
+              volumeMounts:
+                - name: data
+                  mountPath: /data
+                - name: offsite
+                  mountPath: /backup-offsite
+              resources:
+                requests:
+                  cpu: 250m
+                  memory: 256Mi
+                limits:
+                  cpu: "2"
+                  memory: 2Gi
+          volumes:
+            - name: data
+              persistentVolumeClaim:
+                claimName: chineseragkb-data
+            # Must be a separately administered RWX volume or object-storage
+            # CSI mount in another failure domain. A subPath on the primary
+            # data volume is not an offsite copy.
+            - name: offsite
+              persistentVolumeClaim:
+                claimName: chineseragkb-backup-offsite

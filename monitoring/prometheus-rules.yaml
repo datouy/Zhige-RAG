@@ -1,0 +1,78 @@
+groups:
+  - name: zhige-core
+    interval: 30s
+    rules:
+      - alert: ZhigeTargetDown
+        expr: up{job="zhige-api"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "知阁 API 目标不可抓取"
+          runbook: "检查 Pod/容器、Ingress、探针与进程日志；确认单点数据卷没有阻塞重启。"
+
+      - alert: ZhigeCoreDependencyDown
+        expr: dependency_up{component=~"database|vector_store|rate_limit|ingest_worker"} == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "知阁核心依赖 {{ $labels.component }} 不可用"
+          runbook: "查看 /api/ready 的安全检查结果，按数据库、向量库、Redis、入库 worker 分别止损。"
+
+      - alert: ZhigeSearchP95High
+        expr: histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket{endpoint="/api/v1/search"}[5m]))) > 1.5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "知识库检索 P95 超过 1.5 秒"
+          runbook: "检查 Chroma/BM25、Embedding 冷启动、锁等待和 CPU；先减少重排或暂停入库。"
+
+      - alert: ZhigeChatP95High
+        expr: histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket{endpoint="/api/v1/chat"}[10m]))) > 10
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: "同步问答 P95 超过 10 秒"
+          runbook: "检查生成槽位、模型 TPM/RPM、排队超时和上下文压缩；必要时切摘录模式。"
+
+      - alert: ZhigeServerErrorRateHigh
+        expr: |
+          sum(rate(http_requests_total{status_code=~"5.."}[5m]))
+          /
+          clamp_min(sum(rate(http_requests_total[5m])), 0.001) > 0.02
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "知阁 5xx 比例超过 2%"
+          runbook: "按 endpoint 和 error_type 拆分，确认是数据库、向量库、模型还是配额/限流实现错误。"
+
+      - alert: ZhigeIngestBacklog
+        expr: ingest_queue_jobs{status="queued"} > 80 or ingest_queue_jobs{status="running"} > 8
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "异步入库积压"
+          runbook: "检查 worker 心跳、OCR/Embedding CPU、失败任务与解析大文件；扩容前先确认 Chroma 单写边界。"
+
+      - alert: ZhigeQuotaRejectionsSustained
+        expr: sum(rate(tenant_quota_rejections_total[15m])) > 1
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "租户配额持续拒绝请求"
+          runbook: "定位 quota scope/window 与对应租户容量；不要在未扩容验证前直接提高配额。"
+
+      - alert: ZhigeTokenBudgetBurn
+        expr: sum(increase(llm_tokens_total[1h])) > 200000000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "每小时 token 消耗超过 200M"
+          runbook: "检查长上下文、重试风暴、map-reduce 和异常租户；核对供应商账单和 TPM 限额。"

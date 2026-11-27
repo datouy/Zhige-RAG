@@ -1,12 +1,17 @@
 """可选团队模式：登录、成员角色、知识库共享与 MCP 审批。"""
 from __future__ import annotations
 
+import hmac
 import os
+from contextlib import contextmanager
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from filelock import FileLock
 from pydantic import BaseModel, Field
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from src.db.database import get_db
@@ -42,6 +47,34 @@ def _cookie_secure() -> bool:
     return os.getenv("ZHIGE_COOKIE_SECURE", "0").strip().lower() in ("1", "true", "yes", "on")
 
 
+def _token_response_enabled() -> bool:
+    """Keep browser sessions in HttpOnly cookies unless an explicit API integration opts in."""
+    return os.getenv("ZHIGE_TOKEN_RESPONSE_ENABLED", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _data_root() -> Path:
+    from src.utils import resolve_path
+
+    return resolve_path(os.getenv("RAG_DATA_DIR", "data"))
+
+
+@contextmanager
+def _bootstrap_lock(db: Session):
+    """Serialize first-admin creation across workers and database replicas."""
+    root = _data_root()
+    root.mkdir(parents=True, exist_ok=True)
+    with FileLock(str(root / ".team-bootstrap.lock"), timeout=30):
+        if db.get_bind().dialect.name == "postgresql":
+            # Transaction-scoped advisory lock also covers workers on different hosts.
+            db.execute(text("SELECT pg_advisory_xact_lock(748291160)"))
+        yield
+
+
 def _set_session_cookie(response: Response, token: str) -> None:
     max_age = max(1, int(os.getenv("ZHIGE_SESSION_DAYS", "7"))) * 86400
     response.set_cookie(
@@ -53,6 +86,7 @@ def _set_session_cookie(response: Response, token: str) -> None:
         samesite="lax",
         path="/",
     )
+    response.headers["Cache-Control"] = "no-store"
 
 
 class BootstrapBody(BaseModel):
@@ -141,33 +175,37 @@ def bootstrap_admin(
     if not team_mode():
         raise HTTPException(status_code=409, detail="当前为本地模式；请设置 ZHIGE_AUTH_MODE=team")
     required_token = os.getenv("ZHIGE_BOOTSTRAP_TOKEN", "").strip()
-    if required_token and body.bootstrap_token != required_token:
+    if not required_token:
+        raise HTTPException(status_code=503, detail="未配置一次性管理员初始化令牌")
+    if not hmac.compare_digest(body.bootstrap_token, required_token):
         raise HTTPException(status_code=403, detail="初始化令牌无效")
-    if db.query(User).filter(User.password_hash.isnot(None), User.password_hash != "").count():
-        raise HTTPException(status_code=409, detail="管理员已经初始化，请直接登录")
 
-    username = body.username.strip()
-    email = str(body.email).strip().lower()
-    # 首个管理员接管历史本地用户，继续看到原有知识库与文档。
-    user = db.query(User).filter(User.username == "local").first()
-    if user is None:
-        user = User(username=username, email=email)
-        db.add(user)
-    else:
-        conflict = db.query(User).filter(
-            User.id != user.id,
-            (User.username == username) | (User.email == email),
-        ).first()
-        if conflict is not None:
-            raise HTTPException(status_code=409, detail="用户名或邮箱已被其他账号使用")
-        user.username = username
-        user.email = email
-    user.password_hash = hash_password(body.password)
-    user.role = "admin"
-    user.is_admin = True
-    user.is_active = True
-    db.commit()
-    db.refresh(user)
+    with _bootstrap_lock(db):
+        if db.query(User).filter(User.password_hash.isnot(None), User.password_hash != "").count():
+            raise HTTPException(status_code=409, detail="管理员已经初始化，请直接登录")
+
+        username = body.username.strip()
+        email = str(body.email).strip().lower()
+        # 首个管理员接管历史本地用户，继续看到原有知识库与文档。
+        user = db.query(User).filter(User.username == "local").first()
+        if user is None:
+            user = User(username=username, email=email)
+            db.add(user)
+        else:
+            conflict = db.query(User).filter(
+                User.id != user.id,
+                (User.username == username) | (User.email == email),
+            ).first()
+            if conflict is not None:
+                raise HTTPException(status_code=409, detail="用户名或邮箱已被其他账号使用")
+            user.username = username
+            user.email = email
+        user.password_hash = hash_password(body.password)
+        user.role = "admin"
+        user.is_admin = True
+        user.is_active = True
+        db.commit()
+        db.refresh(user)
 
     token, _ = create_auth_session(db, user, user_agent=request.headers.get("user-agent"))
     _set_session_cookie(response, token)
@@ -181,7 +219,10 @@ def bootstrap_admin(
         )
     except Exception:
         logger.debug("初始化审计写入失败", exc_info=True)
-    return {"user": user_dict(user), "token": token, "expires_in": None}
+    payload = {"user": user_dict(user), "expires_in": None}
+    if _token_response_enabled():
+        payload["token"] = token
+    return payload
 
 
 @router.post("/api/v1/team/login", tags=["团队"])
@@ -201,7 +242,10 @@ def login(
         raise HTTPException(status_code=401, detail="账号或密码错误")
     token, _ = create_auth_session(db, user, user_agent=request.headers.get("user-agent"))
     _set_session_cookie(response, token)
-    return {"user": user_dict(user), "token": token}
+    payload = {"user": user_dict(user)}
+    if _token_response_enabled():
+        payload["token"] = token
+    return payload
 
 
 @router.post("/api/v1/team/logout", tags=["团队"])

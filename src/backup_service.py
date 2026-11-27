@@ -10,15 +10,22 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import base64
+import secrets
 import shutil
 import sqlite3
 import stat
 import subprocess
+import time
 import uuid
 import zipfile
+from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Dict, Iterable, List, Optional
+
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from filelock import FileLock
 
 from src.utils import get_logger, resolve_path
 
@@ -34,6 +41,8 @@ STATUS_FILE = DATA_ROOT / ".restore_status.json"
 MAX_ARCHIVE_BYTES = int(os.getenv("ZHIGE_BACKUP_MAX_MB", "2048")) * 1024 * 1024
 MAX_EXTRACTED_BYTES = int(os.getenv("ZHIGE_RESTORE_MAX_MB", "4096")) * 1024 * 1024
 MAX_ENTRIES = int(os.getenv("ZHIGE_RESTORE_MAX_ENTRIES", "200000"))
+_ENC_MAGIC = b"ZHIGE-AESGCM-V1\n"
+_ENC_CHUNK = 1024 * 1024
 
 
 class BackupError(ValueError):
@@ -50,6 +59,119 @@ def _sha256(path: Path) -> str:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _encryption_enabled() -> bool:
+    return os.getenv("ZHIGE_BACKUP_ENCRYPTION", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+        "required",
+    }
+
+
+def _load_backup_key(*, create_if_missing: bool = False) -> bytes:
+    encoded = os.getenv("ZHIGE_BACKUP_KEY", "").strip()
+    if encoded:
+        try:
+            key = base64.urlsafe_b64decode(encoded.encode("ascii"))
+        except Exception as exc:  # noqa: BLE001
+            raise BackupError("ZHIGE_BACKUP_KEY 不是有效的 base64url 密钥") from exc
+        if len(key) != 32:
+            raise BackupError("ZHIGE_BACKUP_KEY 解码后必须为 32 字节")
+        return key
+
+    configured_file = os.getenv("ZHIGE_BACKUP_KEY_FILE", "").strip()
+    key_path = resolve_path(configured_file) if configured_file else DATA_ROOT / ".backup-key"
+    if key_path.is_file():
+        try:
+            text = key_path.read_text(encoding="ascii").strip()
+            key = base64.urlsafe_b64decode(text.encode("ascii"))
+        except Exception as exc:  # noqa: BLE001
+            raise BackupError("备份密钥文件格式无效") from exc
+        if len(key) != 32:
+            raise BackupError("备份密钥必须为 32 字节")
+        return key
+
+    if not create_if_missing:
+        raise BackupError("未配置备份加密密钥")
+    key = secrets.token_bytes(32)
+    key_path.parent.mkdir(parents=True, exist_ok=True)
+    key_path.write_text(base64.urlsafe_b64encode(key).decode("ascii"), encoding="ascii")
+    try:
+        os.chmod(key_path, 0o600)
+    except OSError:
+        pass
+    logger.warning("已生成本地备份密钥，请立即迁移到 Secret 管理器并做独立保管")
+    return key
+
+
+def backup_key_id() -> str:
+    return hashlib.sha256(_load_backup_key(create_if_missing=True)).hexdigest()[:12]
+
+
+def encrypt_file(source: Path, destination: Path, key: Optional[bytes] = None) -> Dict[str, Any]:
+    """Encrypt a ZIP with chunked AES-256-GCM for bounded memory use."""
+    key = key or _load_backup_key(create_if_missing=True)
+    aead = AESGCM(key)
+    nonce_prefix = secrets.token_bytes(8)
+    partial = destination.with_name(destination.name + ".partial")
+    try:
+        with open(source, "rb") as src, open(partial, "wb") as dst:
+            dst.write(_ENC_MAGIC)
+            dst.write(nonce_prefix)
+            counter = 0
+            while True:
+                block = src.read(_ENC_CHUNK)
+                if not block:
+                    break
+                nonce = nonce_prefix + counter.to_bytes(4, "big")
+                aad = _ENC_MAGIC + counter.to_bytes(8, "big")
+                dst.write(aead.encrypt(nonce, block, aad))
+                counter += 1
+        os.replace(partial, destination)
+    except Exception:
+        partial.unlink(missing_ok=True)
+        raise
+    return {
+        "encrypted": True,
+        "algorithm": "AES-256-GCM",
+        "key_id": hashlib.sha256(key).hexdigest()[:12],
+        "chunk_bytes": _ENC_CHUNK,
+    }
+
+
+def decrypt_file(source: Path, destination: Path, key: Optional[bytes] = None) -> None:
+    """Authenticate and decrypt a chunked backup file."""
+    key = key or _load_backup_key(create_if_missing=False)
+    aead = AESGCM(key)
+    partial = destination.with_name(destination.name + ".partial")
+    try:
+        with open(source, "rb") as src:
+            magic = src.read(len(_ENC_MAGIC))
+            if magic != _ENC_MAGIC:
+                raise BackupError("不是受支持的知阁加密备份")
+            nonce_prefix = src.read(8)
+            if len(nonce_prefix) != 8:
+                raise BackupError("加密备份头部不完整")
+            with open(partial, "wb") as dst:
+                counter = 0
+                while True:
+                    encrypted = src.read(_ENC_CHUNK + 16)
+                    if not encrypted:
+                        break
+                    nonce = nonce_prefix + counter.to_bytes(4, "big")
+                    aad = _ENC_MAGIC + counter.to_bytes(8, "big")
+                    try:
+                        dst.write(aead.decrypt(nonce, encrypted, aad))
+                    except Exception as exc:  # noqa: BLE001
+                        raise BackupError("备份解密或完整性认证失败") from exc
+                    counter += 1
+        os.replace(partial, destination)
+    except Exception:
+        partial.unlink(missing_ok=True)
+        raise
 
 
 def _write_json(path: Path, payload: Dict[str, Any]) -> None:
@@ -74,7 +196,7 @@ def _database_url() -> str:
 
 
 def _database_is_postgres() -> bool:
-    return _database_url().startswith(("postgresql://", "postgres://"))
+    return _database_url().startswith(("postgresql", "postgres"))
 
 
 def _sqlite_path() -> Path:
@@ -90,8 +212,8 @@ def _snapshot_sqlite(destination: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     # Windows 的盘符路径不能可靠地放进 SQLite URI；普通连接配合只读式
     # ``backup`` API 仍是 SQLite 官方支持的一致性快照方式。
-    with sqlite3.connect(str(source), timeout=30) as src:
-        with sqlite3.connect(destination) as dst:
+    with closing(sqlite3.connect(str(source), timeout=30)) as src:
+        with closing(sqlite3.connect(destination)) as dst:
             src.backup(dst)
             dst.execute("PRAGMA wal_checkpoint(FULL)")
 
@@ -162,7 +284,9 @@ def _clean_secrets(value: Any) -> Any:
 
 
 def _safe_local_overrides(destination: Path) -> bool:
-    source = resolve_path("config/local_overrides.yaml")
+    from src.settings_service import overrides_path
+
+    source = overrides_path()
     if not source.exists():
         return False
     try:
@@ -211,19 +335,44 @@ def _iter_files(root: Path) -> Iterable[Path]:
         yield path
 
 
+def _write_zip_member(
+    archive: zipfile.ZipFile,
+    source: Path,
+    arcname: str,
+    *,
+    timeout: Optional[float] = None,
+) -> None:
+    """Add a file while tolerating brief Windows sharing locks from active readers."""
+    deadline = time.monotonic() + float(
+        timeout if timeout is not None else os.getenv("ZHIGE_BACKUP_READ_RETRY_SECONDS", "30")
+    )
+    while True:
+        try:
+            archive.write(source, arcname)
+            return
+        except PermissionError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.1)
+
+
 def _add_tree(
     archive: zipfile.ZipFile,
     source: Path,
     arc_root: str,
     manifest_files: List[Dict[str, Any]],
+    *,
+    exclude_names: Optional[set[str]] = None,
 ) -> int:
     if not source.exists():
         return 0
     count = 0
     for path in _iter_files(source):
+        if exclude_names and path.name in exclude_names:
+            continue
         relative = path.relative_to(source).as_posix()
         arcname = f"{arc_root.rstrip('/')}/{relative}"
-        archive.write(path, arcname)
+        _write_zip_member(archive, path, arcname)
         manifest_files.append(
             {
                 "path": arcname,
@@ -235,12 +384,65 @@ def _add_tree(
     return count
 
 
+def _add_chroma_tree(
+    archive: zipfile.ZipFile,
+    source: Path,
+    manifest_files: List[Dict[str, Any]],
+) -> int:
+    """Copy the local Chroma directory while blocking application writes."""
+    if not source.exists():
+        return 0
+    lock = FileLock(
+        str(source / ".chroma-write.lock"),
+        timeout=float(os.getenv("ZHIGE_BACKUP_LOCK_TIMEOUT", "120") or 120),
+    )
+    with lock:
+        return _add_tree(
+            archive,
+            source,
+            "data/chroma_db",
+            manifest_files,
+            exclude_names={".chroma-write.lock"},
+        )
+
+
+def _add_sqlite_snapshot(
+    archive: zipfile.ZipFile,
+    source: Path,
+    arcname: str,
+    stage: Path,
+    manifest_files: List[Dict[str, Any]],
+) -> bool:
+    """Use SQLite's online backup API rather than copying WAL/SHM files."""
+    if not source.is_file():
+        return False
+    destination = stage / "sqlite" / Path(arcname).name
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(str(source), timeout=30) as src:
+        with sqlite3.connect(destination) as dst:
+            src.backup(dst)
+    archive.write(destination, arcname)
+    manifest_files.append(
+        {
+            "path": arcname,
+            "size": destination.stat().st_size,
+            "sha256": _sha256(destination),
+        }
+    )
+    return True
+
+
 def create_backup(*, output_dir: Optional[Path] = None) -> Dict[str, Any]:
     """创建一致性 ZIP；返回可下载路径与摘要。"""
     output_dir = (output_dir or BACKUP_ROOT).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output = output_dir / f"zhige-backup-{timestamp}-{uuid.uuid4().hex[:6]}.zip"
+    encrypted = _encryption_enabled()
+    suffix = ".zip.enc" if encrypted else ".zip"
+    output = output_dir / f"zhige-backup-{timestamp}-{uuid.uuid4().hex[:6]}{suffix}"
+    plain_partial = output.with_name(
+        f".{output.stem}.plain-{uuid.uuid4().hex}.zip.partial"
+    )
     partial = output.with_name(output.name + ".partial")
     stage = output_dir / f".backup-stage-{uuid.uuid4().hex}"
     stage.mkdir(parents=True, exist_ok=False)
@@ -249,6 +451,7 @@ def create_backup(*, output_dir: Optional[Path] = None) -> Dict[str, Any]:
         database_meta: Dict[str, Any]
         if _database_is_postgres():
             database_file = stage / "database" / "postgres.dump"
+            database_file.parent.mkdir(parents=True, exist_ok=True)
             _snapshot_postgres(database_file)
             database_meta = {
                 "kind": "postgresql",
@@ -257,6 +460,7 @@ def create_backup(*, output_dir: Optional[Path] = None) -> Dict[str, Any]:
             }
         else:
             database_file = stage / "database" / "users.db"
+            database_file.parent.mkdir(parents=True, exist_ok=True)
             _snapshot_sqlite(database_file)
             database_meta = {
                 "kind": "sqlite",
@@ -295,9 +499,10 @@ def create_backup(*, output_dir: Optional[Path] = None) -> Dict[str, Any]:
             "files": files,
         }
 
-        with zipfile.ZipFile(partial, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+        with zipfile.ZipFile(plain_partial, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
             archive.write(database_file, database_meta["path"])
-            for logical, source in (("data/chroma_db", runtime["chroma"]), ("data/raw", runtime["raw"]), ("data/eval", runtime["eval"])):
+            _add_chroma_tree(archive, runtime["chroma"], files)
+            for logical, source in (("data/raw", runtime["raw"]), ("data/eval", runtime["eval"])):
                 _add_tree(archive, source, logical, files)
 
             jobs_file = DATA_ROOT / "ingest_jobs.json"
@@ -305,11 +510,14 @@ def create_backup(*, output_dir: Optional[Path] = None) -> Dict[str, Any]:
                 archive.write(jobs_file, "data/ingest_jobs.json")
                 files.append({"path": "data/ingest_jobs.json", "size": jobs_file.stat().st_size, "sha256": _sha256(jobs_file)})
 
-            for kg_file in sorted(DATA_ROOT.glob("kg_*.db*")):
-                if kg_file.is_file():
-                    arcname = f"data/{kg_file.name}"
-                    archive.write(kg_file, arcname)
-                    files.append({"path": arcname, "size": kg_file.stat().st_size, "sha256": _sha256(kg_file)})
+            for kg_file in sorted(DATA_ROOT.glob("kg_*.db")):
+                _add_sqlite_snapshot(
+                    archive,
+                    kg_file,
+                    f"data/{kg_file.name}",
+                    stage,
+                    files,
+                )
 
             if overrides_included:
                 archive.write(overrides_file, "config/local_overrides.yaml")
@@ -329,15 +537,28 @@ def create_backup(*, output_dir: Optional[Path] = None) -> Dict[str, Any]:
             )
     except Exception:
         partial.unlink(missing_ok=True)
+        plain_partial.unlink(missing_ok=True)
         raise
     finally:
         shutil.rmtree(stage, ignore_errors=True)
 
-    size = partial.stat().st_size
+    size = plain_partial.stat().st_size
     if size > MAX_ARCHIVE_BYTES:
         partial.unlink(missing_ok=True)
+        plain_partial.unlink(missing_ok=True)
         raise BackupError("备份包超过允许大小，请调低数据量或调整 ZHIGE_BACKUP_MAX_MB")
-    os.replace(partial, output)
+    encryption_meta: Dict[str, Any] = {"encrypted": False}
+    try:
+        if encrypted:
+            encryption_meta = encrypt_file(plain_partial, partial)
+            plain_partial.unlink(missing_ok=True)
+            os.replace(partial, output)
+        else:
+            os.replace(plain_partial, output)
+    except Exception:
+        partial.unlink(missing_ok=True)
+        plain_partial.unlink(missing_ok=True)
+        raise
     size = output.stat().st_size
     logger.info("备份完成：%s（%.1f MB）", output, size / 1024 / 1024)
     return {
@@ -347,6 +568,7 @@ def create_backup(*, output_dir: Optional[Path] = None) -> Dict[str, Any]:
         "sha256": _sha256(output),
         "created_at": manifest["created_at"],
         "file_count": int(manifest["file_count"]),
+        "encryption": encryption_meta,
     }
 
 
@@ -468,8 +690,18 @@ def stage_restore(upload_path: Path, original_name: str = "backup.zip") -> Dict[
     size = upload_path.stat().st_size
     if size <= 0 or size > MAX_ARCHIVE_BYTES:
         raise BackupError("恢复包为空或超过大小上限")
+    inspection_path = upload_path
+    decrypted_path: Optional[Path] = None
     try:
-        with zipfile.ZipFile(upload_path) as archive:
+        with open(upload_path, "rb") as probe:
+            is_encrypted = probe.read(len(_ENC_MAGIC)) == _ENC_MAGIC
+        if is_encrypted:
+            decrypted_path = upload_path.with_name(
+                f".{upload_path.name}.decrypted-{uuid.uuid4().hex}.zip"
+            )
+            decrypt_file(upload_path, decrypted_path)
+            inspection_path = decrypted_path
+        with zipfile.ZipFile(inspection_path) as archive:
             manifest = _inspect_archive(archive)
     except zipfile.BadZipFile as exc:
         raise BackupError("上传文件不是有效的 ZIP 恢复包") from exc
@@ -479,7 +711,7 @@ def stage_restore(upload_path: Path, original_name: str = "backup.zip") -> Dict[
     payload = staging / "payload"
     payload.mkdir(parents=True, exist_ok=False)
     try:
-        with zipfile.ZipFile(upload_path) as archive:
+        with zipfile.ZipFile(inspection_path) as archive:
             for info in archive.infolist():
                 if info.is_dir():
                     (payload / info.filename).mkdir(parents=True, exist_ok=True)
@@ -496,6 +728,7 @@ def stage_restore(upload_path: Path, original_name: str = "backup.zip") -> Dict[
             "original_name": Path(original_name).name,
             "created_at": _now(),
             "manifest": manifest,
+            "encrypted": bool(is_encrypted),
         }
         _write_json(PENDING_FILE, pending)
         return pending
@@ -504,6 +737,32 @@ def stage_restore(upload_path: Path, original_name: str = "backup.zip") -> Dict[
         raise
     finally:
         upload_path.unlink(missing_ok=True)
+        if decrypted_path is not None:
+            decrypted_path.unlink(missing_ok=True)
+
+
+def verify_backup(path: Path) -> Dict[str, Any]:
+    """Verify ZIP structure, manifest and encrypted authentication."""
+    path = Path(path).resolve()
+    if not path.is_file():
+        raise BackupError("备份文件不存在")
+    if path.stat().st_size <= 0 or path.stat().st_size > MAX_ARCHIVE_BYTES:
+        raise BackupError("备份文件为空或超过大小上限")
+    encrypted = path.name.endswith(".enc")
+    inspect_path = path
+    temporary: Optional[Path] = None
+    try:
+        if encrypted:
+            temporary = path.with_name(f".{path.name}.verify-{uuid.uuid4().hex}.zip")
+            decrypt_file(path, temporary)
+            inspect_path = temporary
+        with zipfile.ZipFile(inspect_path) as archive:
+            return _inspect_archive(archive)
+    except zipfile.BadZipFile as exc:
+        raise BackupError("备份包不是有效 ZIP") from exc
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def cancel_pending_restore() -> bool:
@@ -521,7 +780,22 @@ def _replace_file(source: Path, target: Path) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
     tmp = target.with_name(f".{target.name}.restore-{uuid.uuid4().hex}")
     shutil.copy2(source, tmp)
-    os.replace(tmp, target)
+    _replace_with_retry(tmp, target)
+
+
+def _replace_with_retry(source: Path, target: Path) -> None:
+    """Retry brief Windows locks without weakening the final replacement."""
+    deadline = time.monotonic() + float(
+        os.getenv("ZHIGE_RESTORE_REPLACE_RETRY_SECONDS", "30") or 30
+    )
+    while True:
+        try:
+            os.replace(source, target)
+            return
+        except PermissionError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.1)
 
 
 def _replace_dir(source: Path, target: Path) -> None:
@@ -530,12 +804,12 @@ def _replace_dir(source: Path, target: Path) -> None:
     previous = target.with_name(f".{target.name}.restore-old-{uuid.uuid4().hex}")
     shutil.copytree(source, tmp)
     if target.exists():
-        os.replace(target, previous)
+        _replace_with_retry(target, previous)
     try:
-        os.replace(tmp, target)
+        _replace_with_retry(tmp, target)
     except Exception:
         if previous.exists() and not target.exists():
-            os.replace(previous, target)
+            _replace_with_retry(previous, target)
         shutil.rmtree(tmp, ignore_errors=True)
         raise
     shutil.rmtree(previous, ignore_errors=True)
@@ -567,62 +841,93 @@ def _restore_postgres(dump_file: Path) -> None:
         raise BackupError(f"pg_restore 失败：{(completed.stderr or completed.stdout)[-1000:]}")
 
 
-def apply_pending_restore() -> Optional[Dict[str, Any]]:
-    """启动时应用待恢复包；成功后保留当前状态备份。"""
+def _apply_payload(payload: Path, manifest: Dict[str, Any]) -> None:
+    """Apply an already authenticated and extracted backup payload."""
+    database = manifest.get("database") or {}
+    database_path = payload / str(database.get("path") or "")
+    expected_hash = str(database.get("sha256") or "")
+    if not database_path.is_file() or (
+        expected_hash and _sha256(database_path) != expected_hash
+    ):
+        raise BackupError("恢复包数据库校验失败")
+
+    if database.get("kind") == "sqlite":
+        from src.db import database as database_module
+
+        database_module.engine.dispose()
+        target = _sqlite_path()
+        for suffix in ("-wal", "-shm"):
+            Path(str(target) + suffix).unlink(missing_ok=True)
+        _replace_file(database_path, target)
+    elif database.get("kind") == "postgresql":
+        _restore_postgres(database_path)
+    else:
+        raise BackupError("恢复包数据库类型不受支持")
+
+    runtime = _runtime_paths()
+    for logical, target in (
+        ("data/chroma_db", runtime["chroma"]),
+        ("data/raw", runtime["raw"]),
+        ("data/eval", runtime["eval"]),
+    ):
+        source = payload / logical
+        if source.is_dir():
+            _replace_dir(source, target)
+
+    jobs_source = payload / "data/ingest_jobs.json"
+    if jobs_source.is_file():
+        _replace_file(jobs_source, DATA_ROOT / "ingest_jobs.json")
+    for source in sorted((payload / "data").glob("kg_*.db*")):
+        if source.is_file():
+            _replace_file(source, DATA_ROOT / source.name)
+
+    overrides_source = payload / "config/local_overrides.yaml"
+    from src.settings_service import overrides_path
+
+    overrides_target = overrides_path()
+    if overrides_source.is_file():
+        _replace_file(overrides_source, overrides_target)
+    audit_source = payload / "logs/audit.jsonl"
+    if audit_source.is_file():
+        _replace_file(audit_source, runtime["logs"] / "audit.jsonl")
+
+
+def _rollback_to_safety(safety_path: Path) -> Dict[str, Any]:
+    """Restore the pre-restore safety archive after a partial failure."""
+    if not safety_path.is_file():
+        raise BackupError("恢复前安全备份不存在")
+    rollback_upload = DATA_ROOT / ".restore_rollback" / (
+        f"safety-{uuid.uuid4().hex}.zip.enc"
+    )
+    rollback_upload.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(safety_path, rollback_upload)
+    PENDING_FILE.unlink(missing_ok=True)
+    try:
+        stage_restore(rollback_upload, safety_path.name)
+        result = _apply_pending_restore(allow_rollback=False)
+        if result is None:
+            raise BackupError("恢复前安全备份未能进入待应用状态")
+        return result
+    finally:
+        rollback_upload.unlink(missing_ok=True)
+
+
+def _apply_pending_restore(*, allow_rollback: bool) -> Optional[Dict[str, Any]]:
     pending = pending_restore()
     if pending is None:
         return None
+    if pending.get("blocked"):
+        raise BackupError("最近一次恢复失败且自动回滚未完成，请检查状态后取消待恢复包")
     staging = Path(str(pending.get("staging") or "")).resolve()
     if not staging.is_relative_to(RESTORE_ROOT.resolve()) or not staging.is_dir():
         raise BackupError("待恢复包暂存路径无效")
     payload = staging / "payload"
     manifest = pending.get("manifest") or {}
-    database = manifest.get("database") or {}
-    database_path = payload / str(database.get("path") or "")
-    expected_hash = str(database.get("sha256") or "")
-    if not database_path.is_file() or (expected_hash and _sha256(database_path) != expected_hash):
-        raise BackupError("恢复包数据库校验失败")
 
     safety: Optional[Dict[str, Any]] = None
     try:
         safety = create_backup(output_dir=DATA_ROOT / ".restore_safety")
-        if database.get("kind") == "sqlite":
-            from src.db import database as database_module
-
-            database_module.engine.dispose()
-            target = _sqlite_path()
-            for suffix in ("-wal", "-shm"):
-                Path(str(target) + suffix).unlink(missing_ok=True)
-            _replace_file(database_path, target)
-        elif database.get("kind") == "postgresql":
-            _restore_postgres(database_path)
-        else:
-            raise BackupError("恢复包数据库类型不受支持")
-
-        runtime = _runtime_paths()
-        for logical, target in (
-            ("data/chroma_db", runtime["chroma"]),
-            ("data/raw", runtime["raw"]),
-            ("data/eval", runtime["eval"]),
-        ):
-            source = payload / logical
-            if source.is_dir():
-                _replace_dir(source, target)
-
-        jobs_source = payload / "data/ingest_jobs.json"
-        if jobs_source.is_file():
-            _replace_file(jobs_source, DATA_ROOT / "ingest_jobs.json")
-        for source in sorted((payload / "data").glob("kg_*.db*")):
-            if source.is_file():
-                _replace_file(source, DATA_ROOT / source.name)
-
-        overrides_source = payload / "config/local_overrides.yaml"
-        overrides_target = resolve_path("config/local_overrides.yaml")
-        if overrides_source.is_file():
-            _replace_file(overrides_source, overrides_target)
-        audit_source = payload / "logs/audit.jsonl"
-        if audit_source.is_file():
-            _replace_file(audit_source, runtime["logs"] / "audit.jsonl")
+        _apply_payload(payload, manifest)
 
         status = {
             "status": "applied",
@@ -636,6 +941,20 @@ def apply_pending_restore() -> Optional[Dict[str, Any]]:
         logger.info("恢复包已应用：%s，恢复前备份：%s", pending.get("original_name"), safety["path"])
         return status
     except Exception as exc:
+        rollback: Dict[str, Any] = {"status": "not_attempted"}
+        if allow_rollback and safety is not None:
+            try:
+                _rollback_to_safety(Path(str(safety["path"])))
+                rollback = {"status": "succeeded"}
+                shutil.rmtree(staging, ignore_errors=True)
+            except Exception as rollback_exc:  # noqa: BLE001
+                logger.exception("恢复失败后的自动回滚也失败")
+                rollback = {
+                    "status": "failed",
+                    "error": str(rollback_exc)[:2000],
+                }
+                blocked = {**pending, "blocked": True, "rollback": rollback}
+                _write_json(PENDING_FILE, blocked)
         _write_json(
             STATUS_FILE,
             {
@@ -644,17 +963,27 @@ def apply_pending_restore() -> Optional[Dict[str, Any]]:
                 "error": str(exc)[:2000],
                 "safety_backup": safety.get("path") if safety else None,
                 "original_name": pending.get("original_name"),
+                "rollback": rollback,
             },
         )
         raise
 
 
+def apply_pending_restore() -> Optional[Dict[str, Any]]:
+    """启动时原子化地应用恢复包；后续步骤失败时自动恢复安全备份。"""
+    return _apply_pending_restore(allow_rollback=True)
+
+
 __all__ = [
     "BackupError",
     "apply_pending_restore",
+    "backup_key_id",
     "cancel_pending_restore",
     "create_backup",
+    "decrypt_file",
+    "encrypt_file",
     "last_restore_status",
     "pending_restore",
     "stage_restore",
+    "verify_backup",
 ]

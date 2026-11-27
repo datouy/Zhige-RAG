@@ -19,6 +19,7 @@
 """
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -40,6 +41,9 @@ class SettingsError(ValueError):
 #  覆盖文件读写
 # ----------------------------------------------------------------------
 def overrides_path() -> Path:
+    configured = os.getenv("ZHIGE_LOCAL_OVERRIDES_PATH", "").strip()
+    if configured:
+        return Path(configured).expanduser().resolve()
     return resolve_path(OVERRIDES_RELPATH)
 
 

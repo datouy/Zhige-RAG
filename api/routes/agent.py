@@ -27,6 +27,14 @@ logger = get_logger("api.routes.agent")
 router = APIRouter()
 
 
+def _visible_groups(user: User) -> List[str]:
+    groups = {"*"}
+    department = str(getattr(user, "department", "") or "").strip()
+    if department:
+        groups.add(department)
+    return sorted(groups)
+
+
 # 缓存键始终包含用户、知识库集合与工具权限；保存 Agent 还包含版本。
 _agent_tools_cache: Dict[Any, Any] = {}
 _agent_cache: Dict[Any, Any] = {}
@@ -94,11 +102,13 @@ def _get_agent_tools(
     user_id: Optional[str] = None,
     kb: Optional[Dict[str, str]] = None,
     allowed_tools: Optional[List[str]] = None,
+    allowed_groups: Optional[List[str]] = None,
 ):
     """构造与用户、知识库和工具白名单严格绑定的工具集。"""
     kb_key = kb.get("collection_name") if kb else None
     allowed_key = None if allowed_tools is None else tuple(sorted(allowed_tools))
-    cache_key = (user_id or "__global__", kb_key, allowed_key)
+    groups_key = tuple(sorted(allowed_groups or ["*"]))
+    cache_key = (user_id or "__global__", kb_key, allowed_key, groups_key)
     if cache_key in _agent_tools_cache:
         return _agent_tools_cache[cache_key]
 
@@ -123,7 +133,11 @@ def _get_agent_tools(
         builtin_names = None
         if allowed_tools is not None:
             builtin_names = [name for name in allowed_tools if not name.startswith("mcp_")]
-        tools = BuiltinTools.create(vector_store=vector_store, include=builtin_names)
+        tools = BuiltinTools.create(
+            vector_store=vector_store,
+            include=builtin_names,
+            allowed_groups=list(groups_key),
+        )
         if user_id and allowed_tools is not None:
             for tool in _load_mcp_tools(user_id, allowed_tools).list_tools():
                 tools.register(tool)
@@ -135,7 +149,9 @@ def _get_agent(
     user_id: Optional[str] = None,
     kb: Optional[Dict[str, str]] = None,
     saved_agent: Optional[Dict[str, Any]] = None,
+    allowed_groups: Optional[List[str]] = None,
 ):
+    groups_key = tuple(sorted(allowed_groups or ["*"]))
     """按完整配置缓存 ReActAgent；LLM 仍由全局 Pipeline 共享。"""
     if saved_agent:
         kb = saved_agent.get("kb") or kb
@@ -150,6 +166,7 @@ def _get_agent(
             prompt_hash,
             tuple(sorted(allowed_tools)),
             int(saved_agent.get("max_steps") or 5),
+            groups_key,
         )
     else:
         allowed_tools = None
@@ -158,6 +175,7 @@ def _get_agent(
             user_id or "__global__",
             (kb or {}).get("collection_name"),
             None,
+            groups_key,
         )
 
     if cache_key in _agent_cache:
@@ -187,7 +205,12 @@ def _get_agent(
         cfg = get_runtime_config()
         default_steps = int((cfg.get("agent") or {}).get("max_steps", 5))
         max_steps = int((saved_agent or {}).get("max_steps") or default_steps)
-        tools = _get_agent_tools(user_id, kb=kb, allowed_tools=allowed_tools)
+        tools = _get_agent_tools(
+            user_id,
+            kb=kb,
+            allowed_tools=allowed_tools,
+            allowed_groups=list(groups_key),
+        )
         decision_provider = None
         if ((cfg.get("decision", {}) or {}).get("tool_select", {}) or {}).get("enabled"):
             decision_provider = pipeline._get_decision_provider()
@@ -260,7 +283,13 @@ async def list_agent_tools(
                 "owner_id": row.user_id,
                 "access_role": access_role,
             }
-        tools = await run_in_threadpool(_get_agent_tools, current_user.id, kb, None)
+        tools = await run_in_threadpool(
+            _get_agent_tools,
+            current_user.id,
+            kb,
+            None,
+            _visible_groups(current_user),
+        )
         items = [
             {"name": tool.name, "description": tool.description, "parameters": tool.parameters}
             for tool in tools.list_tools()
@@ -290,10 +319,15 @@ def agent_chat_sync(
         saved_agent = _resolve_saved_agent(current_user.id, body.agent_id)
         if saved_agent:
             agent = _get_agent(
-                current_user.id, kb=saved_agent["kb"], saved_agent=saved_agent
+                current_user.id,
+                kb=saved_agent["kb"],
+                saved_agent=saved_agent,
+                allowed_groups=_visible_groups(current_user),
             )
         else:
-            agent = _get_agent(current_user.id)
+            agent = _get_agent(
+                current_user.id, allowed_groups=_visible_groups(current_user)
+            )
         agent = _with_steps(agent, body.max_steps)
 
         events: List[Dict[str, Any]] = []
@@ -335,7 +369,9 @@ async def websocket_agent(websocket: WebSocket):
 
     with SessionLocal() as db:
         try:
-            user_id = websocket_user(websocket, db).id
+            ws_user = websocket_user(websocket, db)
+            user_id = ws_user.id
+            allowed_groups = _visible_groups(ws_user)
         except PermissionError as exc:
             await websocket.close(code=1008, reason=str(exc))
             return
@@ -387,10 +423,15 @@ async def websocket_agent(websocket: WebSocket):
             try:
                 if saved_agent:
                     agent = _get_agent(
-                        user_id, kb=saved_agent["kb"], saved_agent=saved_agent
+                        user_id,
+                        kb=saved_agent["kb"],
+                        saved_agent=saved_agent,
+                        allowed_groups=allowed_groups,
                     )
                 else:
-                    agent = _get_agent(user_id)
+                    agent = _get_agent(
+                        user_id, allowed_groups=allowed_groups
+                    )
                 agent = _with_steps(agent, max_steps)
                 for event in agent.run(query, stream=True):
                     if cancel_event.is_set():

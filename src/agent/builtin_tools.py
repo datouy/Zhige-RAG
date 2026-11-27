@@ -50,8 +50,14 @@ class SearchDocumentsTool(Tool):
         "required": ["query"],
     }
 
-    def __init__(self, vector_store: Optional[Any] = None) -> None:
+    def __init__(
+        self,
+        vector_store: Optional[Any] = None,
+        allowed_groups: Optional[List[str]] = None,
+    ) -> None:
         self.vector_store = vector_store
+        # None is treated as public-only, never as "disable ACL".
+        self.allowed_groups = list(allowed_groups or ["*"])
 
     def run(self, **kwargs) -> ToolResult:
         query: str = kwargs.get("query", "")
@@ -62,7 +68,13 @@ class SearchDocumentsTool(Tool):
             return ToolResult(success=False, content=None, error="未配置 vector_store，无法检索")
 
         try:
-            hits = self.vector_store.query(query_text=query, top_k=top_k)
+            from src.vector_store import build_security_where
+
+            hits = self.vector_store.query(
+                query_text=query,
+                top_k=top_k,
+                where=build_security_where(acl_groups=self.allowed_groups),
+            )
         except Exception as exc:  # noqa: BLE001
             return ToolResult(success=False, content=None, error=f"检索失败: {exc}")
 
@@ -90,14 +102,23 @@ class ListDocumentsTool(Tool):
     description = "列出知识库中所有已入库的文档及其分块数。"
     parameters = {"type": "object", "properties": {}, "required": []}
 
-    def __init__(self, vector_store: Optional[Any] = None) -> None:
+    def __init__(
+        self,
+        vector_store: Optional[Any] = None,
+        allowed_groups: Optional[List[str]] = None,
+    ) -> None:
         self.vector_store = vector_store
+        self.allowed_groups = list(allowed_groups or ["*"])
 
     def run(self, **kwargs) -> ToolResult:
         if self.vector_store is None:
             return ToolResult(success=False, content=None, error="未配置 vector_store")
         try:
-            sources = self.vector_store.list_sources()
+            from src.vector_store import build_security_where
+
+            sources = self.vector_store.list_sources(
+                where=build_security_where(acl_groups=self.allowed_groups)
+            )
         except Exception as exc:  # noqa: BLE001
             return ToolResult(success=False, content=None, error=str(exc))
         return ToolResult(
@@ -121,8 +142,13 @@ class GetDocumentChunksTool(Tool):
         "required": ["source"],
     }
 
-    def __init__(self, vector_store: Optional[Any] = None) -> None:
+    def __init__(
+        self,
+        vector_store: Optional[Any] = None,
+        allowed_groups: Optional[List[str]] = None,
+    ) -> None:
         self.vector_store = vector_store
+        self.allowed_groups = list(allowed_groups or ["*"])
 
     def run(self, **kwargs) -> ToolResult:
         source: str = kwargs.get("source", "")
@@ -132,8 +158,14 @@ class GetDocumentChunksTool(Tool):
         if self.vector_store is None:
             return ToolResult(success=False, content=None, error="未配置 vector_store")
         try:
+            from src.vector_store import build_security_where
+
+            security_where = build_security_where(
+                extra_where={"source": {"$eq": source}},
+                acl_groups=self.allowed_groups,
+            )
             res = self.vector_store.collection.get(
-                where={"source": {"$eq": source}},
+                where=security_where,
                 include=["documents", "metadatas"],
                 limit=limit,
             )
@@ -594,6 +626,7 @@ class BuiltinTools:
     def create(
         vector_store: Optional[Any] = None,
         include: Optional[List[str]] = None,
+        allowed_groups: Optional[List[str]] = None,
     ) -> ToolRegistry:
         """构造一个包含所有（或子集）内置工具的 :class:`ToolRegistry`。
 
@@ -602,9 +635,15 @@ class BuiltinTools:
             include: 工具名白名单。``None`` 表示全部内置工具。
         """
         all_tools = {
-            "search_documents": SearchDocumentsTool(vector_store=vector_store),
-            "list_documents": ListDocumentsTool(vector_store=vector_store),
-            "get_document_chunks": GetDocumentChunksTool(vector_store=vector_store),
+            "search_documents": SearchDocumentsTool(
+                vector_store=vector_store, allowed_groups=allowed_groups
+            ),
+            "list_documents": ListDocumentsTool(
+                vector_store=vector_store, allowed_groups=allowed_groups
+            ),
+            "get_document_chunks": GetDocumentChunksTool(
+                vector_store=vector_store, allowed_groups=allowed_groups
+            ),
             "calculator": CalculatorTool(),
             "get_current_time": GetCurrentTimeTool(),
             "text_stats": TextStatsTool(),

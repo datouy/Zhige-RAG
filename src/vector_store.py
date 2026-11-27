@@ -22,12 +22,19 @@ from __future__ import annotations
 import hashlib
 import logging
 import math
+import os
 import re
 import threading
+import time
+import uuid
 import weakref
 from collections import Counter
+from contextlib import contextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
+
+from filelock import FileLock
 
 from .embeddings import EmbeddingModel
 from .utils import Timer, get_logger, resolve_path
@@ -36,6 +43,42 @@ logger = get_logger("vector_store")
 
 _CHROMA_CLIENTS: Dict[str, Any] = {}
 _CHROMA_CLIENT_LOCK = threading.Lock()
+
+
+class _CrossProcessWriteLock:
+    """串行化同一持久化目录的 Chroma 写操作。
+
+    Chroma 的本机持久化目录只适合单写者。应用允许启动多个 worker，因此
+    每次写 collection 时同时持有进程内可重入锁和文件锁，避免两个 worker
+    同时 upsert/delete 造成 ``database is locked`` 或半写入状态。
+    """
+
+    def __init__(self, path: Any) -> None:
+        self._thread_lock = threading.RLock()
+        self._file_lock = FileLock(
+            str(path),
+            timeout=float(os.getenv("VECTOR_WRITE_LOCK_TIMEOUT", "120") or 120),
+        )
+
+    @contextmanager
+    def locked(self):
+        with self._thread_lock:
+            with self._file_lock:
+                yield
+
+
+_WRITE_LOCKS: Dict[str, _CrossProcessWriteLock] = {}
+_WRITE_LOCKS_GUARD = threading.Lock()
+
+
+def _write_lock_for(persist_directory: Path) -> _CrossProcessWriteLock:
+    key = str((persist_directory / ".chroma-write.lock").resolve())
+    with _WRITE_LOCKS_GUARD:
+        lock = _WRITE_LOCKS.get(key)
+        if lock is None:
+            lock = _CrossProcessWriteLock(key)
+            _WRITE_LOCKS[key] = lock
+        return lock
 
 
 def get_shared_chroma_client(persist_directory: str) -> Any:
@@ -218,6 +261,50 @@ _TOKENIZER_SIGNATURE_CACHE: Optional[str] = None
 _DICTIONARY_GENERATION = 0
 _ACTIVE_BM25_STORES: "weakref.WeakSet[ChromaStore]" = weakref.WeakSet()
 _ACTIVE_BM25_STORES_LOCK = threading.Lock()
+
+
+def _is_transient_chroma_error(exc: BaseException) -> bool:
+    """判断多进程持久化 Chroma 的已知短暂可见性/锁错误。"""
+    message = str(exc).lower()
+    markers = (
+        "error finding id",
+        "hnsw",
+        "database is locked",
+        "resource temporarily unavailable",
+        "segment not found",
+    )
+    return any(marker in message for marker in markers)
+
+
+def _query_chroma_with_retry(
+    collection: Any,
+    kwargs: Dict[str, Any],
+    *,
+    on_retry: Optional[Callable[[], Any]] = None,
+) -> Any:
+    """重试 Chroma 已知瞬态错误；确定性错误保持 fail-fast。"""
+    attempts = 3
+    current_collection = collection
+    for attempt in range(attempts):
+        try:
+            return current_collection.query(**kwargs)
+        except Exception as exc:
+            if attempt + 1 >= attempts or not _is_transient_chroma_error(exc):
+                raise
+            delay = 0.05 * (2 ** attempt)
+            logger.warning(
+                "Chroma 查询遇到瞬态错误，%.2fs 后重试 (%s/%s): %s",
+                delay,
+                attempt + 2,
+                attempts,
+                exc,
+            )
+            if on_retry is not None:
+                replacement = on_retry()
+                if replacement is not None:
+                    current_collection = replacement
+            time.sleep(delay)
+    raise AssertionError("unreachable")
 
 
 def _init_jieba_with_custom_dict() -> None:
@@ -860,6 +947,12 @@ class ChromaStore(BaseVectorStore):
         self.persist_directory = resolve_path(persist_directory)
         self.persist_directory.mkdir(parents=True, exist_ok=True)
         self.collection_name = collection_name
+        self._write_lock = _write_lock_for(self.persist_directory)
+        self._reopen_lock = threading.Lock()
+        self._revision_path = self.persist_directory / (
+            f".{collection_name}.revision"
+        )
+        self._revision_token = self._read_revision_token()
 
         self.client = get_shared_chroma_client(str(self.persist_directory))
 
@@ -872,10 +965,11 @@ class ChromaStore(BaseVectorStore):
         distance_map = {"cosine": "cosine", "l2": "l2", "ip": "ip"}
         self.distance_fn = distance_map.get(distance_fn, "cosine")
         metadata_cfg = {"hnsw:space": self.distance_fn}
-        self.collection = self.client.get_or_create_collection(
-            name=collection_name,
-            metadata=metadata_cfg,
-        )
+        with self._write_lock.locked():
+            self.collection = self.client.get_or_create_collection(
+                name=collection_name,
+                metadata=metadata_cfg,
+            )
         logger.info("Chroma 集合已就绪：%s (当前 %d 条记录)", collection_name, self.collection.count())
 
         # count 缓存
@@ -892,6 +986,7 @@ class ChromaStore(BaseVectorStore):
         self.hybrid_bm25_weight = max(0.0, float(hybrid_bm25_weight))
         self._bm25: Optional[BM25Index] = None
         self._bm25_lock = threading.RLock()
+        self._bm25_force_rebuild = False
         # P1：BM25 磁盘持久化路径（与 collection 同目录，避免冷启全量 get+分词）
         self._bm25_path = self.persist_directory / f"bm25_{collection_name}.pkl"
         with _ACTIVE_BM25_STORES_LOCK:
@@ -901,6 +996,55 @@ class ChromaStore(BaseVectorStore):
     def lexical_signature(self) -> str:
         """当前词法算法与词典指纹，供检索缓存和 pickle 校验使用。"""
         return _tokenizer_signature()
+
+    def _read_revision_token(self) -> str:
+        try:
+            return self._revision_path.read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeError):
+            return ""
+
+    def _sync_revision(self) -> bool:
+        """同步其它 worker 发布的内容版本，避免 count/BM25 使用进程旧快照。"""
+        token = self._read_revision_token()
+        if not token or token == self._revision_token:
+            return False
+        self._mutation_version += 1
+        # 只替换 Collection 包装对象仍会复用 PersistentClient 内部的旧 segment
+        # 快照；跨 worker 新增或删除后可能表现为旧结果残留/Error finding id。
+        # 因而在版本变化时重建客户端，并让 BM25 从同一份新快照重建。
+        self._reopen_collection_after_transient_error()
+        return True
+
+    def _reopen_collection_after_transient_error(self) -> Any:
+        """丢弃 Chroma 客户端的陈旧 HNSW 句柄并重新打开集合。
+
+        多个 worker 各自持有 PersistentClient 时，写端完成 upsert 后，读端
+        可能短暂保留旧 segment 句柄，表现为 ``Error finding id``。重复调用
+        同一句柄不会自愈；必须在写锁内新建客户端和 Collection 对象。
+        """
+        key = str(self.persist_directory.resolve())
+        with self._reopen_lock:
+            with _CHROMA_CLIENT_LOCK:
+                if _CHROMA_CLIENTS.get(key) is self.client:
+                    _CHROMA_CLIENTS.pop(key, None)
+            self.client = get_shared_chroma_client(key)
+            self.collection = self.client.get_or_create_collection(
+                name=self.collection_name,
+                metadata={"hnsw:space": self.distance_fn},
+            )
+            self._revision_token = self._read_revision_token()
+            self._count_cache_valid = False
+            with self._bm25_lock:
+                self._bm25 = None
+                self._bm25_force_rebuild = True
+        logger.info("已重新打开 Chroma 集合句柄：%s", self.collection_name)
+        return self.collection
+
+    @property
+    def content_revision(self) -> str:
+        """返回跨进程稳定的内容版本，供答案缓存键使用。"""
+        self._sync_revision()
+        return self._revision_token
 
     def health_check(self, query_probe: bool = True) -> Dict[str, Any]:
         """执行不会写数据的一致性探测，失败时抛出明确异常。"""
@@ -970,26 +1114,28 @@ class ChromaStore(BaseVectorStore):
         self._bm25 = None
 
     def _ensure_bm25(self) -> BM25Index:
+        self._sync_revision()
         if self._bm25 is None:
             # 并发首查时只允许一个线程构建索引，避免重复全量读取和分词。
             with self._bm25_lock:
                 if self._bm25 is None:
                     # P1：优先读磁盘持久化，N 对不上再全量重建（万级以上冷启分钟级→秒级）
-                    try:
-                        cached = BM25Index.load(
-                            getattr(self, "_bm25_path", "bm25.pkl"),
-                            expected_signature=self.lexical_signature,
-                        )
-                        if cached is not None:
-                            try:
-                                cur_n = int(self.collection.count())
-                            except Exception:
-                                cur_n = -1
-                            if cur_n < 0 or int(cached.N) == cur_n:
-                                self._bm25 = cached
-                                return self._bm25
-                    except Exception:
-                        pass
+                    if not self._bm25_force_rebuild:
+                        try:
+                            cached = BM25Index.load(
+                                getattr(self, "_bm25_path", "bm25.pkl"),
+                                expected_signature=self.lexical_signature,
+                            )
+                            if cached is not None:
+                                try:
+                                    cur_n = int(self.collection.count())
+                                except Exception:
+                                    cur_n = -1
+                                if cur_n < 0 or int(cached.N) == cur_n:
+                                    self._bm25 = cached
+                                    return self._bm25
+                        except Exception:
+                            pass
                     got = self.collection.get(include=["documents", "metadatas"])
                     self._bm25 = BM25Index(
                         ids=got.get("ids") or [],
@@ -1001,6 +1147,7 @@ class ChromaStore(BaseVectorStore):
                         self._bm25.save(getattr(self, "_bm25_path", "bm25.pkl"))
                     except Exception:
                         pass
+                    self._bm25_force_rebuild = False
         return self._bm25
 
     def _fuse_hybrid(
@@ -1079,6 +1226,22 @@ class ChromaStore(BaseVectorStore):
         batch_size: int = 128,
     ) -> int:
         """批量写入分块。"""
+        with self._write_lock.locked():
+            return self._add_chunks_unlocked(
+                chunks,
+                embeddings=embeddings,
+                batch_size=batch_size,
+                publish_revision=True,
+            )
+
+    def _add_chunks_unlocked(
+        self,
+        chunks: Sequence[Any],
+        embeddings: Optional[Sequence[Sequence[float]]] = None,
+        batch_size: int = 128,
+        publish_revision: bool = True,
+    ) -> int:
+        """在持有跨进程写锁时执行分批写入。"""
         chunks = list(chunks)
         if not chunks:
             return 0
@@ -1131,10 +1294,15 @@ class ChromaStore(BaseVectorStore):
                 )
             if self._bm25 is not None:
                 self._bm25.upsert_documents(ids, texts, metadatas)
+            else:
+                self._invalidate_bm25(discard_disk=True)
             total += len(ids)
 
         self._invalidate_count_cache(invalidate_bm25=False)
-        self._bump_mutation()
+        if self._bm25 is not None:
+            self._bm25.save(self._bm25_path)
+        if publish_revision:
+            self._bump_mutation()
         logger.info("写入完成：%d 条", total)
         return total
 
@@ -1159,59 +1327,70 @@ class ChromaStore(BaseVectorStore):
         if not source_set:
             raise ValueError("replace_chunks_for_sources 需要至少一个 source")
 
-        where = {"source": {"$in": source_set}}
-        old = self.collection.get(
-            where=where,
-            include=["documents", "metadatas", "embeddings"],
-        )
-        old_ids = [str(chunk_id) for chunk_id in (old.get("ids") or [])]
-        old_id_set = set(old_ids)
+        with self._write_lock.locked():
+            where = {"source": {"$in": source_set}}
+            old = self.collection.get(
+                where=where,
+                include=["documents", "metadatas", "embeddings"],
+            )
+            old_ids = [str(chunk_id) for chunk_id in (old.get("ids") or [])]
+            old_id_set = set(old_ids)
 
-        new_ids: List[str] = []
-        for chunk in chunks:
-            metadata = dict(chunk.metadata or {})
-            source = str(metadata.get("source") or metadata.get("filepath") or "unknown")
-            page = int(metadata.get("page") or 1)
-            new_ids.append(_make_id(source, page, chunk.index))
-        new_id_set = set(new_ids)
-
-        def _restore_old() -> None:
-            new_only = list(new_id_set - old_id_set)
-            if new_only:
-                self.collection.delete(ids=new_only)
-            if old_ids:
-                self.collection.upsert(
-                    ids=old_ids,
-                    documents=old.get("documents") or [],
-                    metadatas=old.get("metadatas") or [],
-                    embeddings=[
-                        list(map(float, vector))
-                        for vector in (old.get("embeddings") or [])
-                    ],
+            new_ids: List[str] = []
+            for chunk in chunks:
+                metadata = dict(chunk.metadata or {})
+                source = str(
+                    metadata.get("source")
+                    or metadata.get("filepath")
+                    or "unknown"
                 )
-            self._invalidate_count_cache()
-            self._bump_mutation()
+                page = int(metadata.get("page") or 1)
+                new_ids.append(_make_id(source, page, chunk.index))
+            new_id_set = set(new_ids)
 
-        try:
-            inserted = self.add_chunks(chunks)
-            stale_ids = list(old_id_set - new_id_set)
-            if stale_ids:
-                self.collection.delete(ids=stale_ids)
-                if self._bm25 is not None:
-                    self._bm25.remove_ids(stale_ids)
-                self._invalidate_count_cache(invalidate_bm25=False)
-            if on_commit is not None:
-                on_commit()
-            return inserted
-        except Exception as exc:
+            def _restore_old() -> None:
+                new_only = list(new_id_set - old_id_set)
+                if new_only:
+                    self.collection.delete(ids=new_only)
+                if old_ids:
+                    self.collection.upsert(
+                        ids=old_ids,
+                        documents=old.get("documents") or [],
+                        metadatas=old.get("metadatas") or [],
+                        embeddings=[
+                            list(map(float, vector))
+                            for vector in (old.get("embeddings") or [])
+                        ],
+                    )
+                self._invalidate_count_cache()
+                self._bump_mutation()
+
             try:
-                _restore_old()
-            except Exception as rollback_exc:
-                raise RuntimeError(
-                    "分块写入失败，且旧数据恢复失败；请立即从 Chroma 备份恢复"
-                    f"（sources={source_set}, write_error={exc}, rollback_error={rollback_exc})"
-                ) from exc
-            raise
+                inserted = self._add_chunks_unlocked(
+                    chunks,
+                    publish_revision=False,
+                )
+                stale_ids = list(old_id_set - new_id_set)
+                if stale_ids:
+                    self.collection.delete(ids=stale_ids)
+                    if self._bm25 is not None:
+                        self._bm25.remove_ids(stale_ids)
+                        self._bm25.save(self._bm25_path)
+                    self._invalidate_count_cache(invalidate_bm25=False)
+                if on_commit is not None:
+                    on_commit()
+                self._bump_mutation()
+                return inserted
+            except Exception as exc:
+                try:
+                    _restore_old()
+                except Exception as rollback_exc:
+                    raise RuntimeError(
+                        "分块写入失败，且旧数据恢复失败；请立即从 Chroma 备份恢复"
+                        f"（sources={source_set}, write_error={exc}, "
+                        f"rollback_error={rollback_exc})"
+                    ) from exc
+                raise
 
     def get_by_sources(
         self,
@@ -1342,7 +1521,11 @@ class ChromaStore(BaseVectorStore):
             kwargs["where"] = where
 
         with Timer(f"chroma batch query x{len(query_texts)}"):
-            res = self.collection.query(**kwargs)
+            res = _query_chroma_with_retry(
+                self.collection,
+                kwargs,
+                on_retry=self._reopen_collection_after_transient_error,
+            )
 
         results: List[List[Hit]] = []
         for qi, query_text in enumerate(query_texts):
@@ -1385,6 +1568,19 @@ class ChromaStore(BaseVectorStore):
 
     def _bump_mutation(self) -> None:
         self._mutation_version += 1
+        token = (
+            f"{time.time_ns()}-{os.getpid()}-{threading.get_ident()}-"
+            f"{uuid.uuid4().hex[:8]}"
+        )
+        tmp = self._revision_path.with_name(
+            f"{self._revision_path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+        )
+        try:
+            tmp.write_text(token, encoding="utf-8")
+            os.replace(tmp, self._revision_path)
+            self._revision_token = token
+        except OSError as exc:
+            logger.warning("向量内容版本发布失败（其它 worker 可能短暂使用旧缓存）: %s", exc)
 
     def _invalidate_count_cache(self, invalidate_bm25: bool = True) -> None:
         """写入/删除后调用，使 count 缓存失效。"""
@@ -1396,15 +1592,19 @@ class ChromaStore(BaseVectorStore):
         """按 metadata 条件删除文档，返回删除条数。"""
         if not where:
             raise ValueError("where 条件不能为空，避免误删")
-        matching_ids = self._bm25.matching_ids(where) if self._bm25 is not None else []
-        before = self.collection.count()
-        self.collection.delete(where=where)
-        after = self.collection.count()
-        deleted = before - after
-        if self._bm25 is not None:
-            self._bm25.remove_ids(matching_ids)
-        self._invalidate_count_cache(invalidate_bm25=False)
-        self._bump_mutation()
+        with self._write_lock.locked():
+            matching_ids = self._bm25.matching_ids(where) if self._bm25 is not None else []
+            before = self.collection.count()
+            self.collection.delete(where=where)
+            after = self.collection.count()
+            deleted = before - after
+            if self._bm25 is not None:
+                self._bm25.remove_ids(matching_ids)
+                self._bm25.save(self._bm25_path)
+            else:
+                self._invalidate_bm25(discard_disk=True)
+            self._invalidate_count_cache(invalidate_bm25=False)
+            self._bump_mutation()
         logger.info("按 %s 删除 %d 条", where, deleted)
         return deleted
 
@@ -1412,38 +1612,48 @@ class ChromaStore(BaseVectorStore):
         """更新同一来源的全部分块元数据，供状态切换等生命周期操作使用。"""
         if not source or not patch:
             raise ValueError("source 与 patch 不能为空")
-        data = self.collection.get(
-            where={"source": {"$eq": source}}, include=["metadatas"]
-        )
-        ids = data.get("ids") or []
-        if not ids:
-            return 0
-        metadatas = []
-        for metadata in data.get("metadatas") or []:
-            metadatas.append({**dict(metadata or {}), **patch})
-        self.collection.update(ids=ids, metadatas=metadatas)
-        # BM25 缓存携带旧状态；丢弃磁盘缓存，下一次查询按新 metadata 重建。
-        self._invalidate_bm25(discard_disk=True)
-        self._bump_mutation()
-        return len(ids)
+        with self._write_lock.locked():
+            data = self.collection.get(
+                where={"source": {"$eq": source}}, include=["metadatas"]
+            )
+            ids = data.get("ids") or []
+            if not ids:
+                return 0
+            metadatas = []
+            for metadata in data.get("metadatas") or []:
+                metadatas.append({**dict(metadata or {}), **patch})
+            self.collection.update(ids=ids, metadatas=metadatas)
+            # BM25 缓存携带旧状态；丢弃磁盘缓存，下一次查询按新 metadata 重建。
+            self._invalidate_bm25(discard_disk=True)
+            self._bump_mutation()
+            return len(ids)
 
     def delete_by_ids(self, ids: Sequence[str]) -> int:
         if not ids:
             return 0
-        before = self.collection.count()
-        self.collection.delete(ids=list(ids))
-        after = self.collection.count()
-        if self._bm25 is not None:
-            self._bm25.remove_ids(ids)
-        self._invalidate_count_cache(invalidate_bm25=False)
-        self._bump_mutation()
-        return before - after
+        with self._write_lock.locked():
+            before = self.collection.count()
+            self.collection.delete(ids=list(ids))
+            after = self.collection.count()
+            if self._bm25 is not None:
+                self._bm25.remove_ids(ids)
+                self._bm25.save(self._bm25_path)
+            else:
+                self._invalidate_bm25(discard_disk=True)
+            self._invalidate_count_cache(invalidate_bm25=False)
+            self._bump_mutation()
+            return before - after
 
-    def list_sources(self) -> List[Dict[str, Any]]:
-        """列出所有来源文档及其分块数。"""
+    def list_sources(
+        self, where: Optional[Dict[str, Any]] = None
+    ) -> List[Dict[str, Any]]:
+        """列出满足安全条件的来源文档及其分块数。"""
         if self.count() == 0:
             return []
-        data = self.collection.get(include=["metadatas"])
+        kwargs: Dict[str, Any] = {"include": ["metadatas"]}
+        if where:
+            kwargs["where"] = where
+        data = self.collection.get(**kwargs)
         metas = data.get("metadatas") or []
         agg: Dict[str, Dict[str, Any]] = {}
         for m in metas:
@@ -1452,8 +1662,25 @@ class ChromaStore(BaseVectorStore):
             entry["chunks"] += 1
         return sorted(agg.values(), key=lambda x: -x["chunks"])
 
+    def has_doc_status_metadata(self) -> bool:
+        """集合是否含有新版文档状态元数据。
+
+        状态过滤回退只适用于完全没有 ``doc_status`` 的全部旧索引。只要集合
+        中存在任意新版状态，就不能在 0 命中时撤掉状态条件，否则草稿或过期
+        文档会在正常数据上重新可见。
+        """
+        if self.count() == 0:
+            return False
+        probe = self.collection.get(
+            where={"doc_status": {"$in": ["active", "draft", "expired"]}},
+            limit=1,
+            include=[],
+        )
+        return bool(probe.get("ids"))
+
     def count(self) -> int:
         """返回分块总数（带缓存）。"""
+        self._sync_revision()
         if self._count_cache_valid:
             return self._count_cache
         self._count_cache = self.collection.count()
@@ -1462,11 +1689,12 @@ class ChromaStore(BaseVectorStore):
 
     def reset(self) -> None:
         """清空当前集合（谨慎使用）。"""
-        self.client.delete_collection(self.collection_name)
-        self.collection = self.client.get_or_create_collection(
-            name=self.collection_name,
-            metadata={"hnsw:space": "cosine"},
-        )
-        self._invalidate_count_cache()
-        self._bump_mutation()
+        with self._write_lock.locked():
+            self.client.delete_collection(self.collection_name)
+            self.collection = self.client.get_or_create_collection(
+                name=self.collection_name,
+                metadata={"hnsw:space": "cosine"},
+            )
+            self._invalidate_count_cache()
+            self._bump_mutation()
         logger.warning("集合 %s 已重置", self.collection_name)

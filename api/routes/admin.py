@@ -362,15 +362,32 @@ def admin_evaluations(
 def backup_status(
     current_user: User = Depends(require_admin_user),
 ) -> Dict[str, Any]:
-    files = sorted(BACKUP_ROOT.glob("zhige-backup-*.zip"), key=lambda path: path.stat().st_mtime, reverse=True) if BACKUP_ROOT.exists() else []
+    files = sorted(
+        (
+            path
+            for pattern in ("zhige-backup-*.zip", "zhige-backup-*.zip.enc")
+            for path in BACKUP_ROOT.glob(pattern)
+        ),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    ) if BACKUP_ROOT.exists() else []
+    status_file = BACKUP_ROOT / "backup-status.json"
+    scheduler_status = None
+    if status_file.is_file():
+        try:
+            scheduler_status = _safe_json_preview(status_file)
+        except Exception:
+            scheduler_status = {"status": "invalid"}
     return {
         "pending": pending_restore(),
         "last": last_restore_status(),
+        "scheduler": scheduler_status,
         "backups": [
             {
                 "name": path.name,
                 "size": path.stat().st_size,
                 "created_at": datetime.fromtimestamp(path.stat().st_mtime).isoformat(),
+                "encrypted": path.name.endswith(".enc"),
                 "download_url": f"/api/v1/admin/backup/{path.name}",
             }
             for path in files[:20]
@@ -408,7 +425,10 @@ def download_workspace_backup(
     filename: str,
     current_user: User = Depends(require_admin_user),
 ) -> FileResponse:
-    if not filename.startswith("zhige-backup-") or not filename.endswith(".zip"):
+    allowed = filename.startswith("zhige-backup-") and (
+        filename.endswith(".zip") or filename.endswith(".zip.enc")
+    )
+    if not allowed:
         raise HTTPException(status_code=404, detail="备份不存在")
     path = (BACKUP_ROOT / Path(filename).name).resolve()
     if not path.is_relative_to(BACKUP_ROOT.resolve()) or not path.is_file():
@@ -416,7 +436,11 @@ def download_workspace_backup(
     return FileResponse(
         path,
         filename=path.name,
-        media_type="application/zip",
+        media_type=(
+            "application/octet-stream"
+            if path.name.endswith(".enc")
+            else "application/zip"
+        ),
         headers={"Cache-Control": "no-store"},
     )
 
@@ -449,8 +473,9 @@ async def stage_workspace_restore(
 ) -> Dict[str, Any]:
     if confirm.strip().upper() != "RESTORE":
         raise HTTPException(status_code=400, detail="请输入 RESTORE 确认恢复")
-    if not (file.filename or "").lower().endswith(".zip"):
-        raise HTTPException(status_code=400, detail="恢复包必须是 ZIP 文件")
+    backup_name = (file.filename or "").lower()
+    if not backup_name.endswith((".zip", ".zip.enc")):
+        raise HTTPException(status_code=400, detail="恢复包必须是 ZIP 或 .zip.enc 文件")
     from src.backup_service import MAX_ARCHIVE_BYTES
 
     temp_dir = resolve_path("data/.restore_upload")

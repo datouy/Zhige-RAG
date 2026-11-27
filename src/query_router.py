@@ -103,6 +103,48 @@ _GENERAL_GENERATION_RE = re.compile(
     re.IGNORECASE,
 )
 
+# 安全边界：高置信、低误伤的攻击请求在检索和模型调用之前终止。规则必须
+# 同时出现“目标”（系统规则、提示词、凭据、其他租户）和“索取动作”，
+# 避免把“能否查看其他部门资料”“备份包是否包含模型密钥”这类制度问题
+# 当成攻击请求吞掉。
+_SECURITY_ACTION = (
+    r"(?:输出|返回|告诉|提供|列出|读取|展示|打印|复述|泄露|抄给|发给我|给我|导出)"
+)
+_PROMPT_INJECTION_RE = re.compile(
+    r"(?:忽略|无视|绕过|跳过|覆盖|删除).{0,24}"
+    r"(?:系统|开发者|安全|最高级|之前|以上|全部).{0,16}"
+    r"(?:指令|规则|限制|提示词)"
+    r"|(?:系统|隐藏|内部).{0,10}(?:提示词|指令|设定).{0,24}"
+    + _SECURITY_ACTION,
+    re.IGNORECASE,
+)
+_SECRET_EXFILTRATION_RE = re.compile(
+    rf"(?:环境变量|API\s*Key|模型密钥|登录令牌|访问令牌|Cookie|密码).{{0,24}}{_SECURITY_ACTION}"
+    rf"|{_SECURITY_ACTION}.{{0,24}}(?:环境变量|API\s*Key|模型密钥|登录令牌|访问令牌|Cookie|密码)",
+    re.IGNORECASE,
+)
+_CROSS_TENANT_EXFILTRATION_RE = re.compile(
+    rf"(?:其他|其它|别的|另一个).{{0,12}}(?:企业|租户|用户|部门).{{0,20}}"
+    rf"(?:合同|制度|文档|资料|数据|答案|知识库).{{0,20}}{_SECURITY_ACTION}"
+    rf"|{_SECURITY_ACTION}.{{0,20}}(?:其他|其它|别的|另一个).{{0,12}}"
+    rf"(?:企业|租户|用户|部门).{{0,20}}(?:合同|制度|文档|资料|数据|答案|知识库)",
+    re.IGNORECASE,
+)
+
+# 该文案刻意与知识库拒答口径一致，使评估、前端和知识缺口队列使用同一个
+# ``is_refusal_answer`` 判定，不需要维护第二套“安全拒答”识别规则。
+SECURITY_REFUSAL_ANSWER = "抱歉，知识库中没有找到可安全提供的信息。"
+
+
+def is_security_boundary_query(question: str) -> bool:
+    """是否为要求获取系统秘密或越界租户数据的攻击式请求。"""
+    q = question or ""
+    return bool(
+        _PROMPT_INJECTION_RE.search(q)
+        or _SECRET_EXFILTRATION_RE.search(q)
+        or _CROSS_TENANT_EXFILTRATION_RE.search(q)
+    )
+
 
 def is_capability_boundary_question(question: str) -> bool:
     """是否为询问助手如何处理知识库外或缺失依据的元问题。"""
@@ -148,7 +190,7 @@ class RouteDecision:
     """路由决策。
 
     Attributes:
-        intent: chitchat / aggregate / fact。
+        intent: chitchat / blocked / aggregate / fact。
         reply: chitchat 意图的模板回应（含 {assistant_name}/{org_name} 占位，
                由调用方用运行时变量填充）；其他意图为 None。
     """
@@ -181,6 +223,10 @@ def classify_query(question: str) -> RouteDecision:
     if not q:
         return RouteDecision(intent="fact")
 
+    if is_security_boundary_query(q):
+        logger.warning("查询路由：blocked(security_boundary)")
+        return RouteDecision(intent="blocked", reply=SECURITY_REFUSAL_ANSWER)
+
     if _GREETING_RE.match(q) or _FAREWELL_RE.match(q) or _THANKS_RE.match(q):
         kind = (
             "farewell"
@@ -189,31 +235,31 @@ def classify_query(question: str) -> RouteDecision:
             if _THANKS_RE.match(q)
             else "greeting"
         )
-        logger.info("查询路由：chitchat(%s)「%s」", kind, q[:30])
+        logger.info("查询路由：chitchat(%s)", kind)
         return RouteDecision(intent="chitchat", reply=_CHITCHAT_TEMPLATES[kind])
 
     if _IDENTITY_RE.search(q):
-        logger.info("查询路由：chitchat(identity)「%s」", q[:30])
+        logger.info("查询路由：chitchat(identity)")
         return RouteDecision(intent="chitchat", reply=_CHITCHAT_TEMPLATES["identity"])
 
     if is_capability_boundary_question(q):
-        logger.info("查询路由：chitchat(capability)「%s」", q[:30])
+        logger.info("查询路由：chitchat(capability)")
         return RouteDecision(intent="chitchat", reply=_CHITCHAT_TEMPLATES["capability"])
 
     if is_datetime_query(q):
-        logger.info("查询路由：chitchat(datetime)「%s」", q[:30])
+        logger.info("查询路由：chitchat(datetime)")
         return RouteDecision(intent="chitchat", reply=_CHITCHAT_TEMPLATES["datetime"])
 
     if is_live_info_query(q):
-        logger.info("查询路由：chitchat(live_info)「%s」", q[:30])
+        logger.info("查询路由：chitchat(live_info)")
         return RouteDecision(intent="chitchat", reply=_CHITCHAT_TEMPLATES["live_info"])
 
     if is_general_generation_query(q):
-        logger.info("查询路由：chitchat(general_generation)「%s」", q[:30])
+        logger.info("查询路由：chitchat(general_generation)")
         return RouteDecision(intent="chitchat", reply=_CHITCHAT_TEMPLATES["general_generation"])
 
     if is_aggregate_query(q):
-        logger.info("查询路由：aggregate「%s」", q[:30])
+        logger.info("查询路由：aggregate")
         return RouteDecision(intent="aggregate")
 
     return RouteDecision(intent="fact")
@@ -267,7 +313,7 @@ def classify_query_with_decision(
     if not q:
         return base
     # 规则已高置信判定寒暄 → 直接采信
-    if base.intent == "chitchat":
+    if base.intent in {"chitchat", "blocked"}:
         return base
 
     try:
@@ -295,7 +341,7 @@ def classify_query_with_decision(
         )
         return base
 
-    logger.info("决策路由：%s → %s（置信度 %.2f）「%s」", base.intent, intent, res.confidence, q[:30])
+    logger.info("决策路由：%s → %s（置信度 %.2f）", base.intent, intent, res.confidence)
     reply = None
     if intent == "chitchat":
         if is_capability_boundary_question(q):

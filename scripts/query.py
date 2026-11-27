@@ -39,6 +39,8 @@ def main():
             data = ev.get("data")
             if ev_type == "token":
                 print(data, end="", flush=True)
+            elif ev_type == "replace":
+                print(f"\n[安全替换] {data}")
             elif ev_type == "hits":
                 pass  # 来源信息在 done 时打印
             elif ev_type == "done":

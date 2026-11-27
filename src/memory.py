@@ -233,7 +233,7 @@ class LongTermMemoryStore:
             if self.remember(user_id, key, value, source="user"):
                 written.append((key, value))
         if written:
-            logger.info("已写入长期记忆 %d 条（user=%s）: %s", len(written), user_id, written)
+            logger.info("已写入长期记忆 %d 条（user=%s）", len(written), user_id)
         return written
 
 
@@ -261,7 +261,7 @@ def rewrite_query_for_retrieval(query: str, history: List[Dict[str, str]]) -> st
     if not needs_context:
         return query
     rewritten = f"{last_user[:80]}；{query}"
-    logger.debug("检索查询改写：%r -> %r", query, rewritten)
+    logger.debug("检索查询改写完成：input_chars=%d output_chars=%d", len(query), len(rewritten))
     return rewritten
 
 

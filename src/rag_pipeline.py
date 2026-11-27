@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import inspect
+import math
 import re
 import threading
 import time
@@ -24,15 +25,28 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Generator, List, Optional, Tuple
 
 from .embeddings import EmbeddingModel
-from .extractive_answer import build_extractive_answer, iter_answer_chunks
+from .circuit_breaker import CircuitBreakerOpenError
+from .extractive_answer import (
+    assess_extractive_evidence,
+    build_extractive_answer,
+    iter_answer_chunks,
+)
 from .chinese_normalize import normalize_cjk
 from .llm import LocalLLM
+from .http_client import RemoteServiceError
+from .llm_concurrency import LLMConcurrencyLimitError, LLMConcurrencyTimeoutError
 from .memory import ContextAssembler, rewrite_query_for_retrieval
 from .prompt_template import PromptTemplate
-from .query_router import classify_query, is_aggregate_query
+from .query_router import (
+    SECURITY_REFUSAL_ANSWER,
+    classify_query,
+    is_aggregate_query,
+    is_security_boundary_query,
+)
 from .reranker import BgeReranker
 from .utils import Timer, get_logger, load_config, merge_dict
 from .vector_store import ChromaStore, Hit, hybrid_kwargs
+from .verifier import has_hard_verification_defect
 from .cache import (
     build_shared_cache,
     deserialize_hits,
@@ -65,6 +79,29 @@ FALLBACK_NO_HIT_ANSWER = "抱歉，根据当前知识库我没有找到相关信
 DEFAULT_LLM_TIMEOUT = 120.0
 # 最大重试次数
 DEFAULT_MAX_RETRIES = 2
+
+
+def _safe_stream_error(exc: BaseException) -> Dict[str, Any]:
+    """Build a retryable stream error without exposing endpoints or model names."""
+    if isinstance(exc, CircuitBreakerOpenError):
+        code = "generation_circuit_open"
+        message = "生成模型暂时不可用，请稍后重试或切换摘录模式"
+    elif isinstance(exc, LLMConcurrencyLimitError):
+        code = "generation_capacity_exhausted"
+        message = "生成服务当前繁忙，请稍后重试"
+    elif isinstance(exc, LLMConcurrencyTimeoutError):
+        code = "generation_queue_timeout"
+        message = "等待生成服务超时，请稍后重试"
+    elif isinstance(exc, TimeoutError):
+        code = "generation_timeout"
+        message = "生成请求超时，请稍后重试"
+    elif isinstance(exc, RemoteServiceError):
+        code = "generation_backend_unavailable"
+        message = "生成依赖暂时不可用，请稍后重试或切换摘录模式"
+    else:
+        code = "internal_error"
+        message = "问答处理失败，请稍后重试"
+    return {"event": "error", "data": message, "code": code}
 
 # 检索命中最低分兜底：向量相似度与 BM25 归一化分数不是同一量纲，固定高阈值会
 # 把混合检索中真实的弱语义/关键词命中误判为空。默认仅拦截极低分，是否可答由
@@ -494,7 +531,7 @@ class RAGPipeline:
         rewritten = rewritten.strip(" \t\"'“”‘’`")
         if len(rewritten) < 4 or len(rewritten) > 240:
             return heuristic
-        logger.info("LLM 检索改写：%r -> %r", question[:50], rewritten[:100])
+        logger.info("LLM 检索改写完成：input_chars=%d output_chars=%d", len(question), len(rewritten))
         return rewritten
 
     # ------------------------------------------------------------------
@@ -553,6 +590,17 @@ class RAGPipeline:
         if supports_keyword_query and keyword_query is not None:
             kwargs["keyword_query"] = keyword_query
         return query_fn(**kwargs)
+
+    def _legacy_status_index_only(self) -> bool:
+        """仅对完全没有状态元数据的旧集合允许状态过滤回退。"""
+        probe = getattr(self.vector_store, "has_doc_status_metadata", None)
+        if not callable(probe):
+            return False
+        try:
+            return not bool(probe())
+        except Exception as exc:  # noqa: BLE001 - 探测失败必须 fail-closed
+            logger.warning("无法确认文档状态元数据，禁用检索回退：%s", exc)
+            return False
 
     def _cached_vector_query(
         self,
@@ -619,7 +667,7 @@ class RAGPipeline:
                     keyword_query=keyword_query,
                 )
         except Exception as exc:  # noqa: BLE001 - Chroma 不可读时降级为未命中
-            logger.error("向量检索失败，已降级为未命中（查询：%s）: %s", query_text[:50], exc)
+            logger.error("向量检索失败，已降级为未命中：%s", exc)
             return []
 
         with lock:
@@ -686,6 +734,14 @@ class RAGPipeline:
         """
         try:
             store = self.vector_store
+            revision_getter = getattr(store, "content_revision", None)
+            if callable(revision_getter):
+                revision = str(revision_getter() or "")
+                n = store.count()
+                return (
+                    int(n) if n is not None else None,
+                    revision,
+                )
             n = store.count()
             mutation = getattr(store, "_mutation_version", 0)
             return (int(n) if n is not None else None, int(mutation or 0))
@@ -956,12 +1012,25 @@ class RAGPipeline:
             and security_where is not None
             and self.config.get("retrieval", {}).get("status_filter", True)
             and self.config.get("retrieval", {}).get("status_filter_fallback", True)
+            and self._legacy_status_index_only()
         ):
+            # 只回退 doc_status；ACL 在 fallback 中仍必须生效。旧分块若没有
+            # acl 元数据，应继续不可见，不能为了让旧索引“有结果”而串部门。
+            from .vector_store import build_security_where
+
+            acl_filter_enabled = bool(
+                self.config.get("retrieval", {}).get("acl_filter", True)
+            )
+            fallback_where = build_security_where(
+                extra_where=where,
+                status_filter=False,
+                acl_groups=allowed_groups if acl_filter_enabled else None,
+            )
             with Timer("retrieve_unfiltered_fallback"):
                 hits = self._query_vector_store(
                     query_text=self._apply_query_instruction(norm_query),
                     top_k=fetch_k,
-                    security_where=where,
+                    security_where=fallback_where,
                     score_threshold=self.config.get("retrieval", {}).get("score_threshold", 0.0),
                     keyword_query=norm_query,
                 )
@@ -1119,7 +1188,12 @@ class RAGPipeline:
         except Exception:
             return hits
 
-    def _verify(self, answer: str, context_chunks: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    def _verify(
+        self,
+        answer: str,
+        context_chunks: List[Dict[str, Any]],
+        question: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
         """可验证性校验（可经 rag.verification.enabled 关闭）。
 
         ``decision.verify.enabled`` 打开且决策 provider 可用时，叠加 d1 的
@@ -1149,6 +1223,7 @@ class RAGPipeline:
                 min_cited_ratio=min_ratio,
                 min_grounding=min_grounding,
                 synthesis_aware=synthesis_aware,
+                question=question,
             ).to_dict()
         return verify_answer(
             answer,
@@ -1157,6 +1232,7 @@ class RAGPipeline:
             min_cited_ratio=min_ratio,
             min_grounding=min_grounding,
             synthesis_aware=synthesis_aware,
+            question=question,
         ).to_dict()
 
     def _recall_long_term(self, user_id: Optional[str]) -> List[Dict[str, str]]:
@@ -1293,7 +1369,7 @@ class RAGPipeline:
         chunks = [{"index": 1, "title": f"{section}（共{n}条）", "content": best.text, "metadata": md}]
         result = RAGResult(answer=answer, sources=self._format_citations(chunks), raw_hits=[best])
         result.timings = {"llm_total_ms": 0.0, "ttft_ms": None, "tokens_generated": 0, "tokens_per_sec": None}
-        result.verification = self._verify(answer, chunks)
+        result.verification = self._verify(answer, chunks, question=question)
         return result
 
     # ------------------------------------------------------------------
@@ -1609,8 +1685,7 @@ class RAGPipeline:
                             gap_ok = top1.score >= top2.score * 1.2
                         if gap_ok:
                             triggered = True
-                            logger.info("全文扩展语义触发：top3同源占比 %.2f≥%.2f（问题：%s）",
-                                        ratio, conc, (question or "")[:40])
+                            logger.info("全文扩展语义触发：top3同源占比 %.2f≥%.2f", ratio, conc)
             except Exception:
                 pass
         if not triggered:
@@ -2050,21 +2125,58 @@ class RAGPipeline:
         extract_cfg = (self.config.get("rag") or {}).get("extractive") or {}
         max_chunks = max(1, int(extract_cfg.get("max_chunks", 3)))
         min_term_hits = max(0, int(extract_cfg.get("min_term_hits", 1)))
+        min_query_coverage = min(
+            1.0, max(0.0, float(extract_cfg.get("min_query_coverage", 0.22)))
+        )
+        semantic_threshold = min(
+            1.0,
+            max(-1.0, float(extract_cfg.get("semantic_rescue_threshold", 0.66))),
+        )
+        semantic_candidates = max(
+            1, int(extract_cfg.get("semantic_candidates", 8))
+        )
+        evidence = assess_extractive_evidence(
+            question,
+            context_chunks,
+            candidate_limit=semantic_candidates,
+        )
+        semantic_similarity: Optional[float] = None
+        sufficiency_reason = "lexical_coverage"
+        sufficient = (
+            bool(evidence.query_term_count)
+            and evidence.best_query_coverage >= min_query_coverage
+        )
+        if not sufficient and evidence.candidate_sentences:
+            semantic_similarity = self._extractive_semantic_similarity(
+                question, list(evidence.candidate_sentences)
+            )
+            if semantic_similarity is None:
+                sufficiency_reason = "semantic_rescue_unavailable"
+            elif semantic_similarity >= semantic_threshold:
+                sufficient = True
+                sufficiency_reason = "semantic_rescue"
+            else:
+                sufficiency_reason = "insufficient_evidence"
         # 传全部命中块给 build_extractive_answer：它内部按词面重叠重排后再截取
         # max_chunks，这样相关性兜底能看到所有检索结果，且选中的是「最相关」
         # 的块而不是「文档里排最前」的块。
-        answer = build_extractive_answer(
-            question,
-            context_chunks,
-            max_chunks=max_chunks,
-            max_sentences_per_chunk=int(
-                extract_cfg.get("max_sentences_per_chunk", 2)
-            ),
-            max_chars_per_passage=int(
-                extract_cfg.get("max_chars_per_passage", 260)
-            ),
-            min_term_hits=min_term_hits,
-        ).strip()
+        answer = ""
+        if sufficient:
+            answer = build_extractive_answer(
+                question,
+                context_chunks,
+                max_chunks=max_chunks,
+                max_sentences_per_chunk=int(
+                    extract_cfg.get("max_sentences_per_chunk", 2)
+                ),
+                max_chars_per_passage=int(
+                    extract_cfg.get("max_chars_per_passage", 260)
+                ),
+                min_term_hits=min_term_hits,
+                # 充分性已在上面统一判定；摘录阶段不再用另一套词面阈值，
+                # 否则语义救援通过的改写问题仍会被二次误拒。
+                min_query_coverage=0.0,
+            ).strip()
         fallback = (self.config.get("rag") or {}).get(
             "fallback_answer", FALLBACK_NO_HIT_ANSWER
         )
@@ -2085,10 +2197,83 @@ class RAGPipeline:
                 "tokens_generated": 0,
                 "tokens_per_sec": None,
                 "answer_mode": "extractive",
+                "extractive_query_terms": evidence.query_term_count,
+                "extractive_term_hits": evidence.best_term_hits,
+                "extractive_query_coverage": evidence.best_query_coverage,
+                "extractive_semantic_similarity": (
+                    round(semantic_similarity, 6)
+                    if semantic_similarity is not None
+                    else None
+                ),
+                "extractive_sufficiency": sufficiency_reason,
             },
         )
-        result.verification = self._verify(answer, answer_chunks)
+        result.verification = self._verify(answer, answer_chunks, question=question)
         return result
+
+    def _extractive_semantic_similarity(
+        self, question: str, candidate_sentences: List[str]
+    ) -> Optional[float]:
+        """Return the best cosine similarity for a bounded semantic rescue.
+
+        Semantic rescue runs only after lexical coverage is below the configured
+        floor, so the normal extractive path does not pay an extra embedding call
+        on every question.
+        """
+        if not candidate_sentences:
+            return None
+        try:
+            vectors = self.embedding.encode(
+                [question, *candidate_sentences],
+                batch_size=len(candidate_sentences) + 1,
+                show_progress=False,
+            )
+            if len(vectors) < 2:
+                return None
+
+            def _cosine(left: Any, right: Any) -> float:
+                left_values = [float(value) for value in left]
+                right_values = [float(value) for value in right]
+                if len(left_values) != len(right_values):
+                    raise ValueError("embedding dimension mismatch")
+                numerator = sum(a * b for a, b in zip(left_values, right_values))
+                left_norm = math.sqrt(sum(value * value for value in left_values))
+                right_norm = math.sqrt(sum(value * value for value in right_values))
+                if left_norm <= 0 or right_norm <= 0:
+                    return 0.0
+                return numerator / (left_norm * right_norm)
+
+            query_vector = vectors[0]
+            return max(_cosine(query_vector, vector) for vector in vectors[1:])
+        except Exception as exc:  # noqa: BLE001 - conservative fail-closed below
+            logger.warning("提取式语义补判失败，将保守拒答: %s", exc)
+            return None
+
+    def _enforce_answer_safety(
+        self, answer: str, verification: Optional[Dict[str, Any]]
+    ) -> Tuple[str, Optional[Dict[str, Any]], bool]:
+        """Replace an answer when its verification contains a hard defect."""
+        if not has_hard_verification_defect(verification):
+            return answer, verification, False
+        fallback = (self.config.get("rag") or {}).get(
+            "fallback_answer", FALLBACK_NO_HIT_ANSWER
+        )
+        safe_verification = self._verify(fallback, [])
+        source = verification or {}
+        replacement = {
+            "reason": "hard_verification_defect",
+            "original_status": source.get("status"),
+            "invalid_citations": list(source.get("invalid_citations") or []),
+            "unsupported_facts": list(source.get("unsupported_facts") or []),
+        }
+        if isinstance(safe_verification, dict):
+            safe_verification["replacement"] = replacement
+        logger.warning(
+            "答案触发硬缺陷门禁，已替换为拒答：invalid_count=%d unsupported_count=%d",
+            len(replacement["invalid_citations"]),
+            len(replacement["unsupported_facts"]),
+        )
+        return fallback, safe_verification, True
 
     @staticmethod
     def _cited_chunks(answer: str, context_chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -2127,6 +2312,30 @@ class RAGPipeline:
         rag_cfg = self.config.get("rag", {})
         history = history or []
 
+        # 直连模式同样不能让提示注入读取系统秘密。这里只跑零成本安全规则，
+        # 不触发知识库检索或决策模型。
+        if direct and is_security_boundary_query(question):
+            reply = SECURITY_REFUSAL_ANSWER
+            verification = self._verify(reply, [])
+            if stream:
+                def _blocked_gen(_r=reply, _v=verification):
+                    yield _r
+                    return RAGResult(
+                        answer=_r,
+                        sources=[],
+                        raw_hits=[],
+                        timings={"llm_total_ms": 0.0, "route": "blocked"},
+                        verification=_v,
+                    )
+                return _blocked_gen()
+            return RAGResult(
+                answer=reply,
+                sources=[],
+                raw_hits=[],
+                timings={"llm_total_ms": 0.0, "route": "blocked"},
+                verification=verification,
+            )
+
         # 直连通用问答：跳过意图路由与知识库检索，直接把问题发给生成式 LLM。
         # 仅生成式后端（openai/ollama/local）可用；extractive 模式无 LLM 会抛错。
         if direct:
@@ -2164,14 +2373,27 @@ class RAGPipeline:
 
         # 意图路由：寒暄/身份类直接模板回应，不花检索与生成资源（也无需加载 LLM）
         decision = self._classify(question)
-        if decision.intent == "chitchat" and not is_aggregate_query(question):
+        if decision.intent in {"chitchat", "blocked"} and not is_aggregate_query(question):
             reply = self._render_chitchat(decision.reply or "")
+            verification = self._verify(reply, []) if decision.intent == "blocked" else None
             if stream:
-                def _cc_gen(_r=reply):
+                def _cc_gen(_r=reply, _v=verification):
                     yield _r
-                    return RAGResult(answer=_r, sources=[], raw_hits=[], timings={"llm_total_ms": 0.0})
+                    return RAGResult(
+                        answer=_r,
+                        sources=[],
+                        raw_hits=[],
+                        timings={"llm_total_ms": 0.0, "route": decision.intent},
+                        verification=_v,
+                    )
                 return _cc_gen()
-            return RAGResult(answer=reply, sources=[], raw_hits=[], timings={"llm_total_ms": 0.0})
+            return RAGResult(
+                answer=reply,
+                sources=[],
+                raw_hits=[],
+                timings={"llm_total_ms": 0.0, "route": decision.intent},
+                verification=verification,
+            )
 
         retrieval_cfg = self.config.get("retrieval", {})
         k = top_k or retrieval_cfg.get("top_k", DEFAULT_TOP_K)
@@ -2293,7 +2515,10 @@ class RAGPipeline:
                 retries_used = max_retries  # 标记为已重试
             llm_total_ms = (time.perf_counter() - llm_start) * 1000
             answer_text = text.strip() if isinstance(text, str) else str(text)
-            verification = self._verify(answer_text, context_chunks)
+            verification = self._verify(answer_text, context_chunks, question=question)
+            answer_text, verification, _replaced = self._enforce_answer_safety(
+                answer_text, verification
+            )
             cites = self._visible_citations(
                 answer_text,
                 self._format_citations(context_chunks),
@@ -2320,27 +2545,30 @@ class RAGPipeline:
 
         def _stream():
             nonlocal ttft_ms, retries_used
-            buf = ""
+            pieces: List[str] = []
             try:
                 for piece in self.llm.chat(messages, gen_cfg, stream=True):
                     if ttft_ms is None:
                         # 首个 token 到达时刻
                         ttft_ms = (time.perf_counter() - llm_start) * 1000.0
-                    buf += piece
-                    yield piece
+                    pieces.append(piece)
             except Exception as stream_err:
                 logger.warning("流式生成中断: %s", stream_err)
                 # 保留已生成的部分，只补一句错误提示；避免把已有内容整体丢弃
-                partial = buf.strip()
+                partial = "".join(pieces).strip()
                 tail = rag_cfg.get("fallback_answer", FALLBACK_NO_HIT_ANSWER)
                 notice = f"\n\n（生成中断：{stream_err}）" if partial else tail
-                buf += notice
-                for piece in notice:
-                    yield piece
+                pieces.append(notice)
             # 收尾：与非流式路径一致地构造完整 RAGResult（verification / cites /
             # timings），通过 generator 的 return 协议交给调用方。
-            answer_text = buf.strip()
-            verification = self._verify(answer_text, context_chunks)
+            answer_text = "".join(pieces).strip()
+            verification = self._verify(answer_text, context_chunks, question=question)
+            answer_text, verification, replaced = self._enforce_answer_safety(
+                answer_text, verification
+            )
+            # 该低层字符串生成器无法撤回已经展示的 token，因此先完成校验再
+            # 输出。实际 Web/CLI 流式路径使用事件流，会在发现问题时发送 replace。
+            yield answer_text if replaced else "".join(pieces)
             cites = self._visible_citations(
                 answer_text,
                 self._format_citations(context_chunks),
@@ -2387,13 +2615,21 @@ class RAGPipeline:
 
         # 意图路由：寒暄/身份类直接模板回应（不加载 LLM，延迟≈0）
         decision = self._classify(question)
-        if decision.intent == "chitchat":
+        if decision.intent in {"chitchat", "blocked"}:
             reply = self._render_chitchat(decision.reply or "")
+            verification = self._verify(reply, []) if decision.intent == "blocked" else None
             return RAGResult(
                 answer=reply,
                 sources=[],
                 raw_hits=[],
-                timings={"llm_total_ms": 0.0, "ttft_ms": 0.0, "tokens_generated": 0, "tokens_per_sec": None},
+                timings={
+                    "llm_total_ms": 0.0,
+                    "ttft_ms": 0.0,
+                    "tokens_generated": 0,
+                    "tokens_per_sec": None,
+                    "route": decision.intent,
+                },
+                verification=verification,
             )
 
         k = top_k or retrieval_cfg.get("top_k", DEFAULT_TOP_K)
@@ -2501,7 +2737,10 @@ class RAGPipeline:
         else:
             tokens_per_sec = None
 
-        verification = self._verify(full_text, context_chunks)
+        verification = self._verify(full_text, context_chunks, question=question)
+        full_text, verification, _replaced = self._enforce_answer_safety(
+            full_text, verification
+        )
         visible_cites = self._visible_citations(full_text, cites, verification)
         result = RAGResult(
             answer=full_text,
@@ -2561,6 +2800,16 @@ class RAGPipeline:
 
         # 直连通用问答：跳过路由与检索，直接流式输出 LLM 答案
         if direct:
+            if is_security_boundary_query(question):
+                reply = SECURITY_REFUSAL_ANSWER
+                yield {"event": "hits", "data": []}
+                yield {"event": "token", "data": reply}
+                yield {
+                    "event": "done",
+                    "data": [],
+                    "verification": self._verify(reply, []),
+                }
+                return
             yield {"event": "hits", "data": []}
             self.ensure_llm()
             buf = ""
@@ -2571,18 +2820,19 @@ class RAGPipeline:
                     buf += piece
                     yield {"event": "token", "data": piece}
             except Exception as exc:
-                yield {"event": "error", "data": str(exc)}
+                yield _safe_stream_error(exc)
                 return
             yield {"event": "done", "data": [], "verification": None}
             return
 
         # 意图路由：寒暄/身份类直接模板回应（不加载 LLM）
         decision = self._classify(question)
-        if decision.intent == "chitchat":
+        if decision.intent in {"chitchat", "blocked"}:
             reply = self._render_chitchat(decision.reply or "")
+            verification = self._verify(reply, []) if decision.intent == "blocked" else None
             yield {"event": "hits", "data": []}
             yield {"event": "token", "data": reply}
-            yield {"event": "done", "data": [], "verification": None}
+            yield {"event": "done", "data": [], "verification": verification}
             return
 
         search_query = (
@@ -2624,6 +2874,36 @@ class RAGPipeline:
             question, hits, where=None, allowed_groups=allowed_groups
         )
 
+        # 先完成命中与充分性判定，再发送来源。否则拒答请求会先让前端看到
+        # 一批“引用”，与最终空来源自相矛盾。
+        if not hits:
+            fallback = self.config.get("rag", {}).get(
+                "fallback_answer",
+                FALLBACK_NO_HIT_ANSWER,
+            )
+            yield {"event": "hits", "data": []}
+            yield {"event": "token", "data": fallback}
+            yield {
+                "event": "done",
+                "data": [],
+                "verification": self._verify(fallback, []),
+            }
+            return
+
+        if self._assess_retrieval_sufficiency(question, hits) is False:
+            fallback = self.config.get("rag", {}).get(
+                "fallback_answer",
+                FALLBACK_NO_HIT_ANSWER,
+            )
+            yield {"event": "hits", "data": []}
+            yield {"event": "token", "data": fallback}
+            yield {
+                "event": "done",
+                "data": [],
+                "verification": self._verify(fallback, []),
+            }
+            return
+
         # 聚合统计类问题（条目数等）：结构化元数据直接作答，不依赖小模型数数
         structured = self._structured_count_answer(question, hits)
         if structured is not None:
@@ -2632,10 +2912,21 @@ class RAGPipeline:
             yield {"event": "done", "data": structured.sources, "verification": structured.verification}
             return
 
-        # 来源事件
         max_ctx = self.config.get("rag", {}).get("max_context_tokens", 2048)
         context_chunks, _ = self._build_context(hits, max_chars=max_ctx * 2)
         context_chunks = self._augment_with_graph(question, context_chunks)
+
+        if self._is_extractive_mode():
+            result = self._build_extractive_result(question, context_chunks, hits)
+            yield {"event": "hits", "data": result.sources}
+            for piece in iter_answer_chunks(result.answer):
+                yield {"event": "token", "data": piece}
+            yield {
+                "event": "done",
+                "data": result.sources,
+                "verification": result.verification,
+            }
+            return
 
         # 超长上下文先做 map-reduce 压缩，再算引用（压缩会重排编号，
         # cites 与 prompt 必须用同一套编号，否则引用会对不上）。
@@ -2647,36 +2938,6 @@ class RAGPipeline:
         cites = self._format_citations(context_chunks)
 
         yield {"event": "hits", "data": cites}
-
-        if not hits:
-            fallback = self.config.get("rag", {}).get(
-                "fallback_answer",
-                FALLBACK_NO_HIT_ANSWER,
-            )
-            yield {"event": "token", "data": fallback}
-            yield {"event": "done", "data": cites, "verification": self._verify(fallback, [])}
-            return
-
-        # 决策：检索充分性（与 answer() 保持一致）——片段明显答不了就跳过生成
-        if self._assess_retrieval_sufficiency(question, hits) is False:
-            fallback = self.config.get("rag", {}).get(
-                "fallback_answer",
-                FALLBACK_NO_HIT_ANSWER,
-            )
-            yield {"event": "token", "data": fallback}
-            yield {"event": "done", "data": cites, "verification": self._verify(fallback, [])}
-            return
-
-        if self._is_extractive_mode():
-            result = self._build_extractive_result(question, context_chunks, hits)
-            for piece in iter_answer_chunks(result.answer):
-                yield {"event": "token", "data": piece}
-            yield {
-                "event": "done",
-                "data": result.sources,
-                "verification": result.verification,
-            }
-            return
 
         self.ensure_llm()
         messages = self.context_assembler.build(
@@ -2697,6 +2958,7 @@ class RAGPipeline:
                 "cites": cites,
                 "context_chunks": context_chunks,
                 "ans_key": _ans_key,
+                "question": question,
             },
         }
         return
@@ -2730,7 +2992,12 @@ class RAGPipeline:
             if isinstance(ev, dict) and ev.get("event") == "__llm_ready__":
                 d = ev["data"]
                 yield from self._emit_llm_tail(
-                    d["messages"], d["hits"], d["cites"], d["context_chunks"], d["ans_key"]
+                    d["messages"],
+                    d["hits"],
+                    d["cites"],
+                    d["context_chunks"],
+                    d["ans_key"],
+                    d["question"],
                 )
             else:
                 yield ev
@@ -2742,6 +3009,7 @@ class RAGPipeline:
         cites: List[Dict[str, Any]],
         context_chunks: List[Dict[str, Any]],
         ans_key: Any,
+        question: Optional[str] = None,
     ):
         """同步流式生成尾部：LLM 生成 → 校验 → 引用 → 缓存 → done。"""
         buf = ""
@@ -2750,12 +3018,22 @@ class RAGPipeline:
                 buf += piece
                 yield {"event": "token", "data": piece}
         except Exception as exc:
-            yield {"event": "error", "data": str(exc)}
+            yield _safe_stream_error(exc)
             return
         answer_text = buf.strip()
-        verification = self._verify(answer_text, context_chunks)
+        verification = self._verify(answer_text, context_chunks, question=question)
+        answer_text, verification, replaced = self._enforce_answer_safety(
+            answer_text, verification
+        )
         visible_cites = self._visible_citations(answer_text, cites, verification)
-        if visible_cites != cites:
+        if replaced:
+            yield {"event": "hits", "data": []}
+            yield {
+                "event": "replace",
+                "data": answer_text,
+                "verification": verification,
+            }
+        elif visible_cites != cites:
             # Web UI 在 done 时才展示来源；先发送更新后的事件，避免把邻居
             # 回填块全部误显示为答案真正引用的资料。
             yield {"event": "hits", "data": visible_cites}
@@ -2782,6 +3060,7 @@ class RAGPipeline:
         cites: List[Dict[str, Any]],
         context_chunks: List[Dict[str, Any]],
         ans_key: Any,
+        question: Optional[str] = None,
     ):
         """异步流式生成尾部：``httpx`` 非阻塞 LLM 流，其余与同步尾部一致。"""
         buf = ""
@@ -2790,12 +3069,22 @@ class RAGPipeline:
                 buf += piece
                 yield {"event": "token", "data": piece}
         except Exception as exc:
-            yield {"event": "error", "data": str(exc)}
+            yield _safe_stream_error(exc)
             return
         answer_text = buf.strip()
-        verification = self._verify(answer_text, context_chunks)
+        verification = self._verify(answer_text, context_chunks, question=question)
+        answer_text, verification, replaced = self._enforce_answer_safety(
+            answer_text, verification
+        )
         visible_cites = self._visible_citations(answer_text, cites, verification)
-        if visible_cites != cites:
+        if replaced:
+            yield {"event": "hits", "data": []}
+            yield {
+                "event": "replace",
+                "data": answer_text,
+                "verification": verification,
+            }
+        elif visible_cites != cites:
             yield {"event": "hits", "data": visible_cites}
         try:
             if ans_key is not None:
@@ -2887,7 +3176,12 @@ class RAGPipeline:
                             return
                         # 同步后端：线程内直接流式生成（与旧行为一致）
                         for e in self._emit_llm_tail(
-                            d["messages"], d["hits"], d["cites"], d["context_chunks"], d["ans_key"]
+                            d["messages"],
+                            d["hits"],
+                            d["cites"],
+                            d["context_chunks"],
+                            d["ans_key"],
+                            d["question"],
                         ):
                             if not _post(e):
                                 return
@@ -2895,7 +3189,7 @@ class RAGPipeline:
                     if not _post(ev):
                         return
             except Exception as exc:  # noqa: BLE001
-                _post({"event": "error", "data": str(exc)})
+                _post(_safe_stream_error(exc))
             finally:
                 _post(_SENTINEL)
 
@@ -2910,7 +3204,12 @@ class RAGPipeline:
                 if isinstance(item, dict) and item.get("event") == "__llm_ready__":
                     d = item["data"]
                     async for e in self._emit_llm_tail_async(
-                        d["messages"], d["hits"], d["cites"], d["context_chunks"], d["ans_key"]
+                        d["messages"],
+                        d["hits"],
+                        d["cites"],
+                        d["context_chunks"],
+                        d["ans_key"],
+                        d["question"],
                     ):
                         yield e
                     continue

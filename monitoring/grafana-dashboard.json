@@ -1,0 +1,54 @@
+{
+  "annotations": {"list": []},
+  "editable": true,
+  "graphTooltip": 1,
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "Core dependency readiness",
+      "targets": [{"expr": "dependency_up{component=~\"database|vector_store|rate_limit|ingest_worker|tenant_quota\"}", "legendFormat": "{{component}}"}],
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+      "fieldConfig": {"defaults": {"min": 0, "max": 1, "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "green", "value": 1}]}}},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom", "showLegend": true}}
+    },
+    {
+      "type": "timeseries",
+      "title": "Request P95 by endpoint",
+      "targets": [{"expr": "histogram_quantile(0.95, sum by (le, endpoint) (rate(http_request_duration_seconds_bucket[5m])))", "legendFormat": "{{endpoint}}"}],
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+      "fieldConfig": {"defaults": {"unit": "s"},"overrides": []}
+    },
+    {
+      "type": "timeseries",
+      "title": "HTTP status rate",
+      "targets": [{"expr": "sum by (status_code) (rate(http_requests_total[5m]))", "legendFormat": "{{status_code}}"}],
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8}
+    },
+    {
+      "type": "timeseries",
+      "title": "Ingestion queue depth",
+      "targets": [{"expr": "ingest_queue_jobs", "legendFormat": "{{status}}"}],
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8}
+    },
+    {
+      "type": "timeseries",
+      "title": "LLM tokens per hour",
+      "targets": [{"expr": "sum by (kind) (increase(llm_tokens_total[1h]))", "legendFormat": "{{kind}}"}],
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 16}
+    },
+    {
+      "type": "timeseries",
+      "title": "Quota rejections",
+      "targets": [{"expr": "sum by (scope, window) (rate(tenant_quota_rejections_total[5m]))", "legendFormat": "{{scope}} / {{window}}"}],
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 16}
+    }
+  ],
+  "schemaVersion": 39,
+  "tags": ["zhige", "rag", "enterprise"],
+  "templating": {"list": []},
+  "time": {"from": "now-6h", "to": "now"},
+  "timezone": "browser",
+  "title": "Zhige Enterprise Operations",
+  "uid": "zhige-enterprise",
+  "version": 1
+}

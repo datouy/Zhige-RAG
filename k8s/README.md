@@ -3,7 +3,6 @@
 
 # Prerequisites
 # - Kubernetes 1.24+
-# - NVIDIA GPU Operator (for GPU support)
 # - NGINX Ingress Controller
 # - metrics-server
 # - PostgreSQL 15+ (external or via operator)
@@ -30,6 +29,10 @@ kubectl -n chineseragkb get ingress
 # 4. View logs
 kubectl -n chineseragkb logs -l app=chineseragkb -f
 
+# Local CPU deployment
+# 默认 ConfigMap 使用 extractive + ONNX CPU，不申请 NVIDIA GPU。只有明确切换
+# 到需要 GPU 的本地生成模型时，才单独增加 GPU resource 与节点调度配置。
+
 # Scaling
 # 当前 Chroma 与用户级知识图谱是本地单写文件库，必须保持 replicas=1。
 # 不要手动扩容，也不要提高 hpa.yaml 的 maxReplicas。
@@ -37,8 +40,16 @@ kubectl -n chineseragkb logs -l app=chineseragkb -f
 # 分布式存储，再同步修改 Deployment 与 HPA。
 
 # Update Strategy
-# Rolling update
+# Recreate update (brief downtime)
+# deployment.yaml uses Recreate because the local Chroma/SQLite volume is a
+# single-writer store. The command below replaces the only Pod and will cause
+# a short interruption until readiness succeeds.
 kubectl -n chineseragkb set image deployment/chineseragkb-api api=chineseragkb/api:0.4.0
+
+# The current PDB uses minAvailable=1 with one replica. This protects the
+# running Pod but intentionally blocks voluntary eviction. During planned node
+# maintenance, schedule the outage first and adjust the PDB through an approved
+# change record; do not delete it ad hoc.
 
 # Rollback
 kubectl -n chineseragkb rollout undo deployment/chineseragkb-api

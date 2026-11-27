@@ -57,6 +57,10 @@ jobs:
         run: |
           DB_PATH="$PWD/data/ci_migration.db" alembic upgrade head
 
+      - name: Regression tests
+        run: |
+          python -m pytest tests -q --disable-warnings --maxfail=1
+
       - name: Eval regression gate (retrieval-only, 0.8/0.7/1500ms)
         # P1 评估门禁：差评导出评估集后，CI 用阈值卡死回归。
         #

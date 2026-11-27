@@ -78,40 +78,32 @@ def _redact(value: Any) -> Any:
 
 
 def _llm_health_snapshot(cfg_llm: Dict[str, Any]) -> tuple[str, Dict[str, Any]]:
-    """Return configuration details for the selected LLM backend.
+    """Return operational status for the selected LLM backend.
 
     The previous health response always read ``llm.model_name``. That is the
     local-model field, so an OpenAI-compatible deployment was reported as a
-    local Qwen model even when no local weights were used. Keep this helper
-    free of network calls and secrets: health checks describe what is
-    configured and never echo API keys or tokens.
+    local Qwen model even when no local weights were used. ``/api/health`` is
+    unauthenticated, so this response must expose only operational state. It
+    must not disclose endpoint addresses, model identifiers, local filesystem
+    paths, API keys, or tokens.
     """
     backend = str(cfg_llm.get("backend") or "extractive").strip().lower()
     details: Dict[str, Any] = {"backend": backend}
     if backend == "extractive":
-        details["model"] = "none"
+        details["configured"] = True
         return "not_required", details
 
     backend_cfg = cfg_llm.get(backend) if isinstance(cfg_llm.get(backend), dict) else {}
     if backend in {"openai", "ollama"}:
-        details["model"] = backend_cfg.get("model") or "unknown"
-        if backend_cfg.get("base_url"):
-            details["base_url"] = backend_cfg["base_url"]
+        details["configured"] = bool(backend_cfg.get("model") and backend_cfg.get("base_url"))
         if backend == "openai":
             details["api_key_configured"] = bool(backend_cfg.get("api_key"))
     elif backend == "local":
-        details["model"] = (
-            cfg_llm.get("model_path")
-            or cfg_llm.get("model_name")
-            or "unknown"
-        )
-        cache_dir = cfg_llm.get("cache_dir")
-        if cache_dir:
-            cache_path = resolve_path(cache_dir)
-            details["cache_dir"] = str(cache_path)
-            details["cache_exists"] = cache_path.exists()
+        model_ref = cfg_llm.get("model_path") or cfg_llm.get("model_name")
+        details["configured"] = bool(model_ref)
+        details["weights_present"] = bool(model_ref and resolve_path(model_ref).exists())
     else:
-        details["model"] = "unknown"
+        details["configured"] = False
     return "available", details
 
 
@@ -119,6 +111,30 @@ def _disk_anchor_for(path: Path) -> str:
     """Return the filesystem mount used for the workspace data path."""
     resolved = Path(path).resolve()
     return resolved.anchor or "/"
+
+
+def _disk_health_details(disk: Any) -> Dict[str, Any]:
+    """Return public capacity data without disclosing local paths."""
+    return {
+        "total_gb": round(disk.total / (1024**3), 2),
+        "used_gb": round(disk.used / (1024**3), 2),
+        "free_gb": round(disk.free / (1024**3), 2),
+        "percent": disk.percent,
+    }
+
+
+def _storage_health_details(
+    all_names: list[str], active_names: set[str], kg_files: int
+) -> Dict[str, Any]:
+    """Describe storage consistency without exposing collection identifiers."""
+    orphaned = sorted(name for name in all_names if name and name not in active_names)
+    return {
+        "chroma_collections": len(all_names),
+        "chroma_collections_active": len(active_names),
+        "chroma_collections_orphaned": len(orphaned),
+        "kg_files": kg_files,
+        "cleanup_required": bool(orphaned or kg_files > 0),
+    }
 
 
 @router.get("/api/health")
@@ -172,7 +188,8 @@ async def health_check():
                 )
             except Exception as e:
                 db_status = "unhealthy"
-                db_details["error"] = str(e)[:100]
+                db_details["error_code"] = "database_check_failed"
+                logger.error("健康检查中的数据库探测失败: %s", e)
                 overall_healthy = False
             checks["database"] = {"status": db_status, "details": db_details}
 
@@ -211,7 +228,8 @@ async def health_check():
                 llm_status, llm_details = _llm_health_snapshot(cfg.get("llm", {}))
             except Exception as e:
                 llm_status = "not_available"
-                llm_details = {"error": str(e)[:100]}
+                llm_details = {"error_code": "llm_config_check_failed"}
+                logger.error("健康检查中的 LLM 配置探测失败: %s", e)
             checks["llm"] = {"status": llm_status, "details": llm_details}
 
             # ---- Disk ----
@@ -226,18 +244,12 @@ async def health_check():
                     disk_target = resolve_path(raw_docs)
                     disk_anchor = _disk_anchor_for(disk_target)
                     disk = psutil.disk_usage(disk_anchor)
-                    disk_details = {
-                        "path": str(disk_target),
-                        "anchor": disk_anchor,
-                        "total_gb": round(disk.total / (1024**3), 2),
-                        "used_gb": round(disk.used / (1024**3), 2),
-                        "free_gb": round(disk.free / (1024**3), 2),
-                        "percent": disk.percent,
-                    }
+                    disk_details = _disk_health_details(disk)
                     disk_status = "healthy" if disk.percent < 90 else "warning"
             except Exception as e:
                 disk_status = "error"
-                disk_details = {"error": str(e)[:100]}
+                disk_details = {"error_code": "disk_check_failed"}
+                logger.error("健康检查中的磁盘探测失败: %s", e)
             checks["disk"] = {"status": disk_status, "details": disk_details}
 
             # ---- Memory ----
@@ -257,7 +269,8 @@ async def health_check():
                     memory_status = "healthy" if mem.percent < 90 else "warning"
             except Exception as e:
                 memory_status = "error"
-                memory_details = {"error": str(e)[:100]}
+                memory_details = {"error_code": "memory_check_failed"}
+                logger.error("健康检查中的内存探测失败: %s", e)
             checks["memory"] = {"status": memory_status, "details": memory_details}
 
             # ---- Redis ----
@@ -276,7 +289,8 @@ async def health_check():
                     redis_details = {"message": "Redis not configured"}
             except Exception as e:
                 redis_status = "unavailable"
-                redis_details = {"error": str(e)[:100]}
+                redis_details = {"error_code": "redis_check_failed"}
+                logger.error("健康检查中的 Redis 探测失败: %s", e)
             checks["redis"] = {"status": redis_status, "details": redis_details}
 
             # ---- Storage 一致性（孤儿 collection / 遗留图谱文件）----
@@ -294,25 +308,18 @@ async def health_check():
                     }
                 client = get_vector_store().client
                 all_names = [str(getattr(c, "name", c)) for c in client.list_collections()]
-                orphaned = sorted(n for n in all_names if n and n not in active_names)
-                storage_details["chroma_collections"] = len(all_names)
-                storage_details["chroma_collections_active"] = len(active_names)
-                storage_details["chroma_collections_orphaned"] = len(orphaned)
-                if orphaned:
-                    storage_details["orphaned_sample"] = orphaned[:10]
                 data_dir = resolve_path("data")
-                storage_details["kg_files"] = (
+                kg_files = (
                     len(list(data_dir.glob("kg_*.db"))) if data_dir.exists() else 0
                 )
-                if orphaned or storage_details["kg_files"] > 0:
-                    storage_details["suggestion"] = (
-                        "存在孤儿资源，可调用 POST /api/v1/system/maintenance/cleanup"
-                        "（dry_run=true 预览，dry_run=false 清理）"
-                    )
+                storage_details = _storage_health_details(
+                    all_names, active_names, kg_files
+                )
             except Exception as e:
-                storage_details["error"] = str(e)[:120]
+                storage_details["error_code"] = "storage_consistency_check_failed"
+                logger.error("健康检查中的存储一致性探测失败: %s", e)
             checks["storage"] = {
-                "status": "ok" if "error" not in storage_details else "degraded",
+                "status": "ok" if "error_code" not in storage_details else "degraded",
                 "details": storage_details,
             }
 
@@ -344,7 +351,7 @@ async def health_check():
             status_code=500,
             content={
                 "status": "error",
-                "error": str(exc),
+                "error": "health check failed",
                 "timestamp": _cn_timestamp(),
             },
         )
@@ -452,7 +459,7 @@ async def maintenance_cleanup(
 
 @router.get("/api/ready")
 async def readiness_check():
-    """Kubernetes 就绪探针 - 只检查 DB + Chroma，并加超时防止探针挂起。
+    """Kubernetes 就绪探针 - 检查 DB、Chroma 和限流存储。
 
     与 /api/health 的分工：health 负责全量体检（带 TTL 缓存），
     ready 只回答「现在能不能接流量」，把 DB 与 Chroma 的同步调用
@@ -509,10 +516,68 @@ async def readiness_check():
         except Exception:
             llm_status = "not_available"
 
+        from src.rate_limit import rate_limit_health
+
+        limiter_status = rate_limit_health()
+        from src.ingest_jobs import worker_health
+        from src.tenant_quota import quota_health
+
+        ingest_worker_status = worker_health()
+        quota_status = quota_health()
+        auth_status: Dict[str, Any] = {"status": "not_required"}
+        try:
+            from src.team_auth import team_mode
+
+            if team_mode():
+                from src.db.database import SessionLocal
+                from src.db.models import User
+
+                def _probe_auth() -> Dict[str, Any]:
+                    with SessionLocal() as session:
+                        credentialed = session.query(User).filter(
+                            User.password_hash.isnot(None), User.password_hash != ""
+                        ).count()
+                    token_configured = bool(os.getenv("ZHIGE_BOOTSTRAP_TOKEN", "").strip())
+                    return {
+                        "status": "ready" if credentialed or token_configured else "bootstrap_unavailable",
+                        "admin_initialized": bool(credentialed),
+                        "bootstrap_token_configured": token_configured,
+                        "cookie_secure": os.getenv("ZHIGE_COOKIE_SECURE", "0").strip().lower()
+                        in ("1", "true", "yes", "on"),
+                    }
+
+                auth_status = await run_in_threadpool(_probe_auth)
+        except Exception:
+            auth_status = {"status": "unavailable"}
+        try:
+            from src.monitoring.metrics import metrics_collector
+
+            metrics_collector.update_dependency("database", db_status == "connected")
+            metrics_collector.update_dependency(
+                "vector_store", chroma_status in ("connected", "not_initialized")
+            )
+            metrics_collector.update_dependency(
+                "rate_limit", limiter_status["status"] == "connected"
+            )
+            metrics_collector.update_dependency(
+                "ingest_worker",
+                ingest_worker_status["status"] in ("not_required", "healthy"),
+            )
+            metrics_collector.update_dependency(
+                "tenant_quota", not bool(quota_status.get("fallback"))
+            )
+            metrics_collector.update_dependency(
+                "team_auth", auth_status["status"] in ("ready", "not_required")
+            )
+        except Exception:
+            pass
+
         is_ready = db_status == "connected" and chroma_status in (
             "connected",
             "not_initialized",
-        )
+        ) and limiter_status["status"] in ("connected", "degraded") and (
+            ingest_worker_status["status"] in ("not_required", "healthy")
+        ) and auth_status["status"] in ("ready", "not_required")
         return {
             "is_ready": is_ready,
             "checks": {
@@ -520,6 +585,10 @@ async def readiness_check():
                 "chroma": chroma_status,
                 "chroma_detail": chroma_detail,
                 "llm": llm_status,
+                "rate_limit": limiter_status,
+                "ingest_worker": ingest_worker_status,
+                "tenant_quota": quota_status,
+                "team_auth": auth_status,
             },
         }
 

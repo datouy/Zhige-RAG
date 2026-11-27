@@ -16,6 +16,7 @@ import shutil
 from pathlib import Path
 from typing import Generator
 
+from filelock import FileLock
 from sqlalchemy import create_engine, event, inspect, text, Engine
 from sqlalchemy.orm import sessionmaker, Session
 from sqlalchemy.pool import NullPool, QueuePool
@@ -290,6 +291,23 @@ def init_db() -> None:
     老库直接启动会在读写时报 ``no such column``。这里按方言做存在性检查后
     ``ALTER TABLE`` 补列；完整迁移仍走 alembic。
     """
+    if _is_postgresql:
+        with engine.begin() as lock_conn:
+            # 同一数据库的所有实例串行执行结构初始化；事务结束自动释放。
+            lock_conn.exec_driver_sql("SELECT pg_advisory_xact_lock(1416127846)")
+            _init_db_unlocked()
+        return
+
+    # SQLite 的 CREATE TABLE 没有跨进程原子检查，多个 uvicorn worker 同时
+    # 对空库启动会出现 ``table users already exists``。锁文件与数据库同目录，
+    # 保证同一工作区内的迁移只执行一次；持锁 worker 完成后再放行其它 worker。
+    lock_path = str(Path(str(DB_PATH) + ".migration.lock"))
+    with FileLock(lock_path, timeout=120):
+        _init_db_unlocked()
+
+
+def _init_db_unlocked() -> None:
+    """在 SQLite 文件锁 / PostgreSQL advisory lock 内执行结构初始化。"""
     Base.metadata.create_all(bind=engine)
 
     for table, columns in _LIGHT_COLUMN_MIGRATIONS.items():
@@ -321,7 +339,9 @@ def init_db() -> None:
     try:
         with engine.begin() as conn:
             conn.exec_driver_sql(
-                "UPDATE users SET role='admin' WHERE is_admin = 1"
+                "UPDATE users SET role='admin' WHERE is_admin IS TRUE"
+                if engine.dialect.name != "sqlite"
+                else "UPDATE users SET role='admin' WHERE is_admin = 1"
             )
     except Exception:  # noqa: BLE001
         _log.warning("用户角色回填跳过", exc_info=True)

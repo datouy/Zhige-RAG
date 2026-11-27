@@ -13,17 +13,32 @@
 """
 from __future__ import annotations
 
+import os
+import threading
 import time
 import psutil
-import os
 from typing import Callable, Optional
 from functools import wraps
 
 try:
-    from prometheus_client import Counter, Histogram, Gauge, generate_latest, CONTENT_TYPE_LATEST
+    from prometheus_client import (
+        CONTENT_TYPE_LATEST,
+        REGISTRY,
+        CollectorRegistry,
+        Counter,
+        Gauge,
+        Histogram,
+        generate_latest,
+        multiprocess,
+    )
     PROMETHEUS_AVAILABLE = True
 except ImportError:
     PROMETHEUS_AVAILABLE = False
+
+
+_MULTIPROCESS_DIR = os.getenv("PROMETHEUS_MULTIPROC_DIR", "").strip()
+_SERVE_REGISTRY = None
+_SERVE_REGISTRY_LOCK = threading.Lock()
 
 
 if PROMETHEUS_AVAILABLE:
@@ -112,6 +127,24 @@ if PROMETHEUS_AVAILABLE:
         "errors_total",
         "Total errors",
         ["error_type", "component"],
+    )
+
+    ingest_queue_jobs = Gauge(
+        "ingest_queue_jobs",
+        "Current durable ingestion jobs by status",
+        ["status"],
+    )
+
+    tenant_quota_rejections_total = Counter(
+        "tenant_quota_rejections_total",
+        "Rejected requests by quota scope and window",
+        ["scope", "window"],
+    )
+
+    dependency_up = Gauge(
+        "dependency_up",
+        "Readiness probe result for a dependency (1 healthy, 0 unavailable)",
+        ["component"],
     )
 
 
@@ -216,6 +249,23 @@ class PrometheusMetrics:
             return
         active_connections.set(count)
 
+    def update_ingest_queue(self, counts: dict[str, int]):
+        """Publish durable ingestion queue depth for every known status."""
+        if not PROMETHEUS_AVAILABLE:
+            return
+        for status in ("queued", "running", "done", "failed", "interrupted"):
+            ingest_queue_jobs.labels(status=status).set(int(counts.get(status, 0)))
+
+    def record_quota_rejection(self, scope: str, window: str):
+        """Record quota pressure without user identifiers or request content."""
+        if PROMETHEUS_AVAILABLE:
+            tenant_quota_rejections_total.labels(scope=scope, window=window).inc()
+
+    def update_dependency(self, component: str, healthy: bool):
+        """Publish a bounded dependency enum without leaking details."""
+        if PROMETHEUS_AVAILABLE:
+            dependency_up.labels(component=str(component)).set(1 if healthy else 0)
+
     def record_cache_hit(self):
         """记录缓存命中。"""
         if not PROMETHEUS_AVAILABLE:
@@ -272,8 +322,29 @@ class PrometheusMetrics:
         if not PROMETHEUS_AVAILABLE:
             return b"", "text/plain"
 
-        metrics_output = generate_latest()
+        # Multi-process mode is per pod. Prometheus itself aggregates the
+        # resulting series across replicas. Without this registry, a scrape
+        # hits one worker and silently hides counters/tokens accumulated in
+        # the other workers.
+        if _MULTIPROCESS_DIR:
+            registry = self._multiprocess_registry()
+            metrics_output = generate_latest(registry)
+        else:
+            metrics_output = generate_latest(REGISTRY)
         return metrics_output, CONTENT_TYPE_LATEST
+
+    @staticmethod
+    def _multiprocess_registry():
+        global _SERVE_REGISTRY
+        if _SERVE_REGISTRY is not None:
+            return _SERVE_REGISTRY
+        with _SERVE_REGISTRY_LOCK:
+            if _SERVE_REGISTRY is None:
+                os.makedirs(_MULTIPROCESS_DIR, exist_ok=True)
+                registry = CollectorRegistry()
+                multiprocess.MultiProcessCollector(registry, path=_MULTIPROCESS_DIR)
+                _SERVE_REGISTRY = registry
+        return _SERVE_REGISTRY
 
 
 def track_request_metrics(metric_name: str = "request"):

@@ -268,7 +268,10 @@ retrieval:
   llm_query_rewrite_max_tokens: 96
   llm_query_rewrite_timeout_sec: 20
   status_filter: true
-  status_filter_fallback: true
+  # 仅兼容完全没有 doc_status 元数据的旧索引。集合中存在任意新版状态时
+  # 不会回退，避免草稿/过期资料在“查询无命中”时重新暴露。新版部署应保持
+  # false，并把旧数据重索引；需要迁移旧库时再显式临时开启。
+  status_filter_fallback: false
   acl_filter: true
 
 # ------------------ 重排序（关键优化）------------------
@@ -530,6 +533,12 @@ rag:
     # 该阈值时，直接返回 rag.fallback_answer 拒答，而不是硬答一篇无关原文。
     # 默认 1 = 至少命中 1 个词面；调 0 恢复旧行为（无 LLM 模式下总返回 top 块）。
     min_term_hits: 1
+    # 独立开发集（42 条）校准的充分性门禁。问题词覆盖率低于 0.22 时，
+    # 只对最多 8 个候选句做一次受限语义补判；相似度仍低于 0.66 就拒答。
+    # 这两个阈值必须在留出集上重新验证，不能当作生产准确率。
+    min_query_coverage: 0.22
+    semantic_rescue_threshold: 0.66
+    semantic_candidates: 8
   system_prompt_file: "config/prompts.yaml"
   assistant_name: "小识"
   org_name: "企业知识库"

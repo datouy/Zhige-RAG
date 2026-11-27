@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, Iterable, List, Sequence
+from dataclasses import dataclass
+from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
 _SENTENCE_RE = re.compile(r"[^。！？!?；;\n]+[。！？!?；;]?")
 _TERM_RE = re.compile(r"[A-Za-z0-9_+.-]+|[\u4e00-\u9fff]+")
@@ -33,6 +34,17 @@ _STOP_BIGRAMS = frozenset(
         "那个",
     }
 )
+
+
+@dataclass(frozen=True)
+class ExtractiveEvidence:
+    """Deterministic evidence diagnostics for the extractive answer mode."""
+
+    query_term_count: int
+    best_term_hits: int
+    best_query_coverage: float
+    best_sentence: str
+    candidate_sentences: Tuple[str, ...]
 
 
 def _query_terms(text: str) -> set[str]:
@@ -87,6 +99,63 @@ def _strip_heading_markers(text: str) -> str:
     return cleaned.strip()
 
 
+def _iter_chunk_sentences(context_chunks: Sequence[Dict[str, Any]]) -> Iterable[Tuple[int, str]]:
+    """Yield ``(position, sentence)`` without leaking chunk headings."""
+    for chunk in context_chunks:
+        content = str(chunk.get("content") or "").strip()
+        header = _LEADING_HEADER_RE.match(content)
+        if header:
+            content = content[header.end():].lstrip()
+        content = _strip_markdown_headings(content).strip()
+        sentences = _split_sentences(content)
+        if not sentences and content:
+            sentences = [content[:260].strip()]
+        for position, sentence in enumerate(sentences):
+            if sentence.strip():
+                yield position, sentence.strip()
+
+
+def assess_extractive_evidence(
+    question: str,
+    context_chunks: Sequence[Dict[str, Any]],
+    *,
+    candidate_limit: int = 8,
+) -> ExtractiveEvidence:
+    """Measure whether retrieved text has enough lexical overlap to answer.
+
+    This function is deliberately side-effect free. The caller may use the top
+    candidate sentences for a bounded semantic rescue when a genuinely relevant
+    question has low literal overlap (for example, a paraphrase or wrong-premise
+    question). The returned coverage is a development-set signal, not a claim of
+    universal answer accuracy.
+    """
+    terms = _query_terms(question)
+    ranked: list[tuple[float, int, int, str]] = []
+    seen: set[str] = set()
+    for position, sentence in _iter_chunk_sentences(context_chunks):
+        normalized = _SPACE_RE.sub("", sentence).lower()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        hits = _term_hits(terms, sentence)
+        coverage = hits / max(1, len(terms))
+        ranked.append((coverage, hits, -position, sentence))
+
+    ranked.sort(key=lambda item: (-item[0], -item[1], -item[2], item[3]))
+    limit = max(1, int(candidate_limit))
+    candidates = tuple(item[3] for item in ranked[:limit])
+    best_coverage, best_hits, _negative_position, best_sentence = (
+        ranked[0] if ranked else (0.0, 0, 0, "")
+    )
+    return ExtractiveEvidence(
+        query_term_count=len(terms),
+        best_term_hits=best_hits,
+        best_query_coverage=round(best_coverage, 6),
+        best_sentence=best_sentence,
+        candidate_sentences=candidates,
+    )
+
+
 def select_passages(
     question: str,
     context_chunks: Sequence[Dict[str, Any]],
@@ -95,6 +164,7 @@ def select_passages(
     max_sentences_per_chunk: int = 2,
     max_chars_per_passage: int = 260,
     min_term_hits: int = 1,
+    min_query_coverage: float = 0.0,
 ) -> List[str]:
     """Select the most query-relevant source sentences from each chunk.
 
@@ -107,6 +177,11 @@ def select_passages(
     terms = _query_terms(question)
     selected: List[str] = []
     seen: set[str] = set()
+
+    evidence = assess_extractive_evidence(question, context_chunks)
+    coverage_floor = max(0.0, float(min_query_coverage))
+    if evidence.query_term_count and evidence.best_query_coverage < coverage_floor:
+        return []
 
     chunks = list(context_chunks)
     chunk_scores = [
@@ -186,6 +261,7 @@ def build_extractive_answer(
     max_sentences_per_chunk: int = 2,
     max_chars_per_passage: int = 260,
     min_term_hits: int = 1,
+    min_query_coverage: float = 0.0,
 ) -> str:
     """Return a compact evidence answer where every fact carries a citation."""
     passages = select_passages(
@@ -195,6 +271,7 @@ def build_extractive_answer(
         max_sentences_per_chunk=max_sentences_per_chunk,
         max_chars_per_passage=max_chars_per_passage,
         min_term_hits=min_term_hits,
+        min_query_coverage=min_query_coverage,
     )
     return "\n".join(passages)
 
@@ -206,4 +283,10 @@ def iter_answer_chunks(answer: str, max_chars: int = 120) -> Iterable[str]:
         yield text[start : start + max_chars]
 
 
-__all__ = ["build_extractive_answer", "iter_answer_chunks", "select_passages"]
+__all__ = [
+    "ExtractiveEvidence",
+    "assess_extractive_evidence",
+    "build_extractive_answer",
+    "iter_answer_chunks",
+    "select_passages",
+]

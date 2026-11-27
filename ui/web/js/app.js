@@ -962,6 +962,18 @@ class ChatApp {
         } else if (event === "token") {
             this.hideTypingIndicator();
             this.appendToken(String(data ?? ""));
+        } else if (event === "replace") {
+            this.hideTypingIndicator();
+            let message = this.el.messages.querySelector(".message.assistant.streaming");
+            if (!message) {
+                message = this.appendMessage("assistant", "");
+                message.classList.add("streaming");
+            }
+            const body = message.querySelector(".message-content");
+            body.textContent = String(data ?? "");
+            this.currentSources = [];
+            this.currentVerification = payload.verification || this.currentVerification;
+            this.scrollBottom();
         } else if (event === "done") {
             this.hideTypingIndicator();
             this.completedRequestId = requestId || this.activeRequestId;

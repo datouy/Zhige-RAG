@@ -522,6 +522,15 @@ def append_message(
     """追加一条消息，并更新会话的统计与首条标题。"""
     import json
 
+    session = (
+        db.query(ChatSession)
+        .filter(ChatSession.id == session_id, ChatSession.user_id == user_id)
+        .first()
+    )
+    if session is None:
+        # 不创建孤儿消息：前端传入不存在或属于其它用户的会话 ID时必须拒绝。
+        raise KBError("会话不存在或无权访问")
+
     message = ChatMessage(
         session_id=session_id,
         user_id=user_id,
@@ -533,17 +542,11 @@ def append_message(
     )
     db.add(message)
 
-    session = (
-        db.query(ChatSession)
-        .filter(ChatSession.id == session_id, ChatSession.user_id == user_id)
-        .first()
-    )
-    if session is not None:
-        session.message_count = (session.message_count or 0) + 1
-        session.last_message_at = datetime.now(timezone.utc).replace(tzinfo=None)
-        # 首条用户消息自动成为标题（用户体验：无需手动命名）
-        if role == "user" and (session.title in ("", "新会话")):
-            session.title = _auto_title(content)
+    session.message_count = (session.message_count or 0) + 1
+    session.last_message_at = datetime.now(timezone.utc).replace(tzinfo=None)
+    # 首条用户消息自动成为标题（用户体验：无需手动命名）
+    if role == "user" and (session.title in ("", "新会话")):
+        session.title = _auto_title(content)
     db.commit()
     db.refresh(message)
     return message

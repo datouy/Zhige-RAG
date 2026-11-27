@@ -29,13 +29,19 @@ logger = get_logger("verifier")
 _REF_SECTION_RE = re.compile(r"参考资料[:：]?\s*$", re.MULTILINE)
 # 引用编号：[1]、[1][2]、[1,2]
 _CITE_RE = re.compile(r"\[([0-9]{1,2})\]")
+# 数字允许千分位；长金额可能被模型写成 ``500,000.01 元``，不能拆成
+# ``000 元`` 后误判为无据事实。
+_NUMBER_PATTERN = r"(?<![\d,])(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?(?![\d,])"
 # 硬事实：带单位/量级的数字（百分比、金额、日期、数量），忽略普通序号
 _FACT_PATTERNS = [
-    re.compile(r"\d+(?:\.\d+)?\s*%"),
-    re.compile(r"\d{4}\s*年(?:\d{1,2}\s*月)?(?:\d{1,2}\s*日)?"),
-    re.compile(r"\d{4}[-/.]\d{1,2}[-/.]\d{1,2}"),
-    re.compile(r"\d+(?:\.\d+)?\s*(?:万元|亿元|元|天|日|小时|分钟|人|次|个|条|台|月|年|km|kg|m²|㎡)"),
-    re.compile(r"\d{3,}"),
+    re.compile(rf"{_NUMBER_PATTERN}\s*%"),
+    re.compile(r"(?<!\d)\d{4}\s*年(?:\s*\d{1,2}\s*月)?(?:\s*\d{1,2}\s*日)?(?!\d)"),
+    re.compile(r"(?<!\d)\d{4}[-/.]\d{1,2}[-/.]\d{1,2}(?!\d)"),
+    re.compile(
+        rf"{_NUMBER_PATTERN}\s*"
+        r"(?:万元|亿元|元|天|日|小时|分钟|人|次|个|条|台|月|年|km|kg|m²|㎡)"
+    ),
+    re.compile(r"(?<![\d.])(?:\d{3,}|\d{1,3}(?:,\d{3})+)(?:\.\d+)?(?![\d.])"),
 ]
 # 剔除列表序号（"1. "、"（1）"、"[1]" 引用本身）
 _SENT_SPLIT_RE = re.compile(r"(?<=[。！？!?；;])|\n")
@@ -51,12 +57,35 @@ _REFUSAL_PREFIX_RE = re.compile(
     r"(?:当前|现有|手头|检索到的)?(?:资料|材料|知识库)(?:中)?"
     r"(?:没有|未|无法)(?:找到|检索到|确定|回答|提供)"
     r"|无法回答(?:该|这个)?问题"
-    r")(?:[^。！？!?\n]{0,20})(?:[。！？!?\n]|——|$)"
+    # 生成模型也常用不带“资料”主语的直接判断，例如
+    # “无法确定，本次检索到的片段只涉及……”。它仍位于首句，属于整题拒答。
+    r"|(?:无法|不能|未能)(?:确定|判断|核实|确认|回答|给出|提供)"
+    # 解释对象常包含一个完整问题（例如“是否在深圳设有分支机构及负责人”），
+    # 20 字会漏掉长问句。仍限制在首个句末前，避免把正文中的局部澄清误判
+    # 成整题拒答。
+    r")(?:[^。！？!?\n]{0,160})(?:[。！？!?\n]|——|$)"
 )
 _REFUSAL_EXPLANATION_RE = re.compile(
-    r"^(?:检索到的|当前|现有|手头)?(?:资料|材料|知识库)(?:中)?没有"
-    r"[^。！？!?\n]{0,80}(?:无法|不能)(?:回答|确定|核实|判断)"
-    r"(?:该|这个)?问题"
+    r"^(?:根据)?(?:目前|当前|本次|本次检索到的|检索到的|现有|手头)?"
+    # 生成模型经常把“资料/片段”改写成“内容/信息/上下文/证据”。这些说法
+    # 与“无法确定”组合时同样是明确拒答；漏识别会把可靠拒答误算成作答，
+    # 并让引用校验继续接受一个没有证据的答案。
+    r"[^，。！？!?\n]{0,50}(?:资料|材料|片段|知识库|内容|信息|上下文|证据)"
+    r"(?:"
+    r"(?:中|里)?[，,]?"
+    r"(?:没有|未(?:找到|检索到|出现|包含|提及|涉及|说明|规定)|无法(?:找到|检索到|确定|回答|提供))"
+    r"[^。！？!?\n]{0,120}"
+    r"|[^，。！？!?\n]{0,30}[，,]\s*"
+    r")"
+    r"(?:无法|不能|未能)(?:据此|据该片段|根据现有资料)?"
+    r"(?:给出|回答|确定|核实|判断|提供|得出|确认)"
+)
+_REFUSAL_ABSENCE_RE = re.compile(
+    r"^(?:根据)?(?:目前|当前|本次|本次检索到的|检索到的|现有|手头)?"
+    r"[^，。！？!?\n]{0,60}(?:资料|材料|片段|知识库|内容|信息|上下文|证据)"
+    r"(?:中|里)?[，,]?(?:没有|未)"
+    r"(?:涉及|提及|说明|规定|包含|找到|检索到|出现)"
+    r"[^。！？!?\n]{0,140}(?:[。！？!?\n]|$)"
 )
 
 
@@ -75,7 +104,27 @@ def is_refusal_answer(answer: str, fallback_answer: Optional[str] = None) -> boo
     return bool(
         _REFUSAL_PREFIX_RE.match(normalized)
         or _REFUSAL_EXPLANATION_RE.match(normalized)
+        or _REFUSAL_ABSENCE_RE.match(normalized)
     )
+
+
+def has_hard_verification_defect(verification: Optional[Any]) -> bool:
+    """Whether an answer must be withheld before it reaches the user.
+
+    Invalid citation markers and unsupported hard facts are fail-closed
+    conditions. A wrong number, date, amount, or citation cannot be repaired by
+    displaying a warning after the fact. Softer grounding defects remain visible
+    in the verification report but do not automatically replace the whole answer.
+    """
+    if not verification:
+        return False
+    if isinstance(verification, dict):
+        invalid = verification.get("invalid_citations") or []
+        unsupported = verification.get("unsupported_facts") or []
+    else:
+        invalid = getattr(verification, "invalid_citations", []) or []
+        unsupported = getattr(verification, "unsupported_facts", []) or []
+    return bool(invalid or unsupported)
 
 # 提炼 / 判断句的标记词。
 #
@@ -120,7 +169,15 @@ class VerificationResult:
 
     refused: bool = False
     invalid_citations: List[int] = field(default_factory=list)
+    citation_total: int = 0
+    valid_citation_total: int = 0
     cited_sentence_ratio: float = 0.0
+    sentence_count: int = 0
+    cited_sentence_count: int = 0
+    hard_fact_total: int = 0
+    # 用户问题本身已经给出的数字/日期可作为回显依据；它们不证明知识库事实，
+    # 但不应被误报成模型新增的幻觉。
+    question_supported_facts: List[str] = field(default_factory=list)
     unsupported_facts: List[str] = field(default_factory=list)
     # 带引用但词面内容在所引上下文中找不到依据的句子（编造/改写的直接信号）
     unsupported_sentences: List[str] = field(default_factory=list)
@@ -137,7 +194,13 @@ class VerificationResult:
         d: Dict[str, Any] = {
             "refused": self.refused,
             "invalid_citations": list(self.invalid_citations),
+            "citation_total": self.citation_total,
+            "valid_citation_total": self.valid_citation_total,
             "cited_sentence_ratio": round(self.cited_sentence_ratio, 3),
+            "sentence_count": self.sentence_count,
+            "cited_sentence_count": self.cited_sentence_count,
+            "hard_fact_total": self.hard_fact_total,
+            "question_supported_facts": list(self.question_supported_facts),
             "unsupported_facts": list(self.unsupported_facts),
             "unsupported_sentences": list(self.unsupported_sentences),
             "status": self.status,
@@ -172,7 +235,35 @@ def _extract_facts(text: str) -> List[str]:
             # 过滤被空格包裹的列表序号误报（如 "1. 万元"）与纯年份泛指
             if tok and tok not in facts:
                 facts.append(tok)
-    return facts
+    compact = [re.sub(r"[\s,]", "", fact) for fact in facts]
+    # 去掉被更长事实完整包含的重复片段，例如日期中的年份或金额整数部分。
+    return [
+        fact
+        for index, fact in enumerate(facts)
+        if not any(
+            index != other_index
+            and compact[index] != compact[other_index]
+            and compact[index] in compact[other_index]
+            for other_index in range(len(facts))
+        )
+    ]
+
+
+def _fact_supported_by_text(fact: str, text: str) -> bool:
+    """Exact fact match, with numeric fallback for formatting differences."""
+    compact_fact = re.sub(r"[\s,]", "", fact)
+    compact_text = re.sub(r"[\s,]", "", text or "")
+    if compact_fact and compact_fact in compact_text:
+        return True
+    match = re.search(r"\d+(?:\.\d+)?", compact_fact)
+    if not match:
+        return False
+    number = match.group(0).lstrip("0") or "0"
+    text_numbers = {
+        value.lstrip("0") or "0"
+        for value in re.findall(r"\d+(?:\.\d+)?", compact_text)
+    }
+    return number in text_numbers
 
 
 def verify_answer(
@@ -182,6 +273,7 @@ def verify_answer(
     min_cited_ratio: float = 0.5,
     min_grounding: float = 0.6,
     synthesis_aware: bool = False,
+    question: Optional[str] = None,
 ) -> VerificationResult:
     """校验答案对上下文的可验证性。
 
@@ -215,18 +307,27 @@ def verify_answer(
     valid_idx = {int(c.get("index", 0)) for c in context_chunks if c.get("index")}
     cited = [int(x) for x in _CITE_RE.findall(body)]
     res.invalid_citations = sorted({n for n in cited if n not in valid_idx})
+    res.citation_total = len(cited)
+    res.valid_citation_total = sum(1 for number in cited if number in valid_idx)
 
     # 3. 句子引用覆盖率
     sentences = _split_sentences(body)
+    res.sentence_count = len(sentences)
     if sentences:
         cited_sents = sum(1 for s in sentences if _CITE_RE.search(s))
         res.cited_sentence_ratio = cited_sents / len(sentences)
+        res.cited_sentence_count = cited_sents
 
     # 4. 硬事实支持度：答案中的数字/日期必须出现在任一上下文块中
     context_text = "".join(str(c.get("content") or "") for c in context_chunks)
-    context_norm = re.sub(r"\s+", "", context_text)
-    for fact in _extract_facts(body):
-        if re.sub(r"\s+", "", fact) not in context_norm:
+    facts = _extract_facts(body)
+    res.hard_fact_total = len(facts)
+    for fact in facts:
+        if _fact_supported_by_text(fact, context_text):
+            continue
+        if question and _fact_supported_by_text(fact, question):
+            res.question_supported_facts.append(fact)
+        else:
             res.unsupported_facts.append(fact)
 
     # 4.5 句子级词面接地：带引用的句子，其词元必须大部分出现在所引
@@ -282,11 +383,11 @@ def verify_answer(
         res.status = "verified"
 
     logger.debug(
-        "verify: status=%s cited_ratio=%.2f invalid=%s unsupported=%s ungrounded=%d",
+        "verify: status=%s cited_ratio=%.2f invalid_count=%d unsupported_count=%d ungrounded=%d",
         res.status,
         res.cited_sentence_ratio,
-        res.invalid_citations,
-        res.unsupported_facts,
+        len(res.invalid_citations),
+        len(res.unsupported_facts),
         len(res.unsupported_sentences),
     )
     return res
@@ -371,6 +472,7 @@ def verify_answer_with_decision(
     min_grounding: float = 0.6,
     quality_ladder: Optional[Sequence[str]] = None,
     synthesis_aware: bool = False,
+    question: Optional[str] = None,
 ) -> VerificationResult:
     """在规则校验之上叠加 d1 决策校验（``noul`` 接地 + ``score`` 质量）。
 
@@ -398,6 +500,7 @@ def verify_answer_with_decision(
         min_cited_ratio=min_cited_ratio,
         min_grounding=min_grounding,
         synthesis_aware=synthesis_aware,
+        question=question,
     )
     if provider is None or res.refused or not (answer or "").strip():
         return res
@@ -451,6 +554,8 @@ def verify_answer_with_decision(
 
 __all__ = [
     "VerificationResult",
+    "has_hard_verification_defect",
+    "is_refusal_answer",
     "verify_answer",
     "verify_answer_with_decision",
     "DEFAULT_QUALITY_LADDER",

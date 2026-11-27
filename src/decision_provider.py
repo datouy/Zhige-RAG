@@ -483,7 +483,7 @@ class LLMDecisionProvider(BaseDecisionProvider):
             return {}
         obj = _extract_json_object(out if isinstance(out, str) else str(out))
         if not obj:
-            logger.warning("决策 LLM 未返回可解析 JSON，已跳过（原文前 120 字：%s）", str(out)[:120])
+            logger.warning("决策 LLM 未返回可解析 JSON，已跳过（output_chars=%d）", len(str(out or "")))
             return {}
         results: Dict[str, DecisionValue] = {}
         for name, spec in specs.items():

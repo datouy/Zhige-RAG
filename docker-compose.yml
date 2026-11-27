@@ -33,20 +33,45 @@ services:
       - OPENAI_MODEL=${OPENAI_MODEL:-deepseek-chat}
       # Security
       - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-http://localhost:8000,http://127.0.0.1:8000}
-      # Rate Limiting
+      # 团队认证：生产必须设置 ZHIGE_BOOTSTRAP_TOKEN，再完成首位管理员引导。
+      - ZHIGE_AUTH_MODE=${ZHIGE_AUTH_MODE:-team}
+      - ZHIGE_BOOTSTRAP_TOKEN=${ZHIGE_BOOTSTRAP_TOKEN:?ZHIGE_BOOTSTRAP_TOKEN 必须设置，用于一次性管理员初始化}
+      - ZHIGE_COOKIE_SECURE=${ZHIGE_COOKIE_SECURE:-1}
+      - ZHIGE_TOKEN_RESPONSE_ENABLED=${ZHIGE_TOKEN_RESPONSE_ENABLED:-0}
+      # 只有直连对端确实属于反向代理时才信任 X-Forwarded-For。
+      - TRUSTED_PROXIES=${TRUSTED_PROXIES:-127.0.0.1/32,::1/128}
+      # Rate limiting / shared cache
+      - REDIS_URL=redis://redis:6379/0
       - RATE_LIMIT_STORAGE_URL=redis://redis:6379/0
+      - CACHE_STORAGE_URL=redis://redis:6379/0
       # 单机多 worker：利用多核提升并发吞吐（Chroma 本地卷读多写少，默认 2 即可）。
       - WEB_CONCURRENCY=${WEB_CONCURRENCY:-2}
+      - PROMETHEUS_MULTIPROC_DIR=/tmp/prometheus-multiprocess
+      - INGEST_EXECUTION_MODE=worker
+      - INGEST_WORKERS=${INGEST_WORKERS:-2}
+      - INGEST_MAX_PENDING=${INGEST_MAX_PENDING:-100}
+      - ZHIGE_BACKUP_KEY_FILE=/app/data/.backup-key
+      - ZHIGE_BACKUP_ENCRYPTION=required
+      - ZHIGE_TENANT_QUOTA_ENABLED=true
+      - ZHIGE_QUOTA_SEARCH_MINUTE=${ZHIGE_QUOTA_SEARCH_MINUTE:-120}
+      - ZHIGE_QUOTA_SEARCH_DAY=${ZHIGE_QUOTA_SEARCH_DAY:-100000}
+      - ZHIGE_QUOTA_CHAT_MINUTE=${ZHIGE_QUOTA_CHAT_MINUTE:-60}
+      - ZHIGE_QUOTA_CHAT_DAY=${ZHIGE_QUOTA_CHAT_DAY:-20000}
+      - ZHIGE_QUOTA_INGEST_MINUTE=${ZHIGE_QUOTA_INGEST_MINUTE:-20}
+      - ZHIGE_QUOTA_INGEST_DAY=${ZHIGE_QUOTA_INGEST_DAY:-2000}
       # Chroma
       - VECTOR_STORE_PERSIST_DIR=/app/data/chroma
       # Paths
       - DATA_PATH=/app/data/raw
       - LOG_PATH=/app/logs/server.log
+      # 设置页的可写覆盖必须落在数据卷，config/ 以只读方式挂载。
+      - ZHIGE_LOCAL_OVERRIDES_PATH=/app/data/local_overrides.yaml
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs
       - ./config:/app/config:ro
       - ./ui/web:/app/ui/web:ro
+      - prometheus_multiprocess:/tmp/prometheus-multiprocess
       # Mount model cache (optional)
       # - ${MODEL_CACHE_DIR:-~/.cache}:/root/.cache:ro
     depends_on:
@@ -56,11 +81,47 @@ services:
         condition: service_healthy
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health')"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health/live')"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 40s
+    networks:
+      - chineseragkb-network
+
+  ingest-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.lite
+    container_name: chineseragkb-ingest-worker
+    command: ["python", "scripts/ingest_worker.py", "--poll", "2"]
+    environment:
+      - DATABASE_URL=postgresql+psycopg://${POSTGRES_USER:-raguser}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD 必须设置（见 .env.example）}@postgres:5432/${POSTGRES_DB:-chineseragkb}
+      - LLM_BACKEND=${LLM_BACKEND:-extractive}
+      - EMBEDDING_BACKEND=${EMBEDDING_BACKEND:-onnx}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - OPENAI_BASE_URL=${OPENAI_BASE_URL:-https://api.deepseek.com/v1}
+      - OPENAI_MODEL=${OPENAI_MODEL:-deepseek-chat}
+      - REDIS_URL=redis://redis:6379/0
+      - CACHE_STORAGE_URL=redis://redis:6379/0
+      - PROMETHEUS_MULTIPROC_DIR=/tmp/prometheus-multiprocess
+      - INGEST_EXECUTION_MODE=worker
+      - INGEST_MAX_PENDING=${INGEST_MAX_PENDING:-100}
+      - VECTOR_STORE_PERSIST_DIR=/app/data/chroma
+      - DATA_PATH=/app/data/raw
+      - LOG_PATH=/app/logs/ingest-worker.log
+      - ZHIGE_LOCAL_OVERRIDES_PATH=/app/data/local_overrides.yaml
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./config:/app/config:ro
+      - prometheus_multiprocess:/tmp/prometheus-multiprocess
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
     networks:
       - chineseragkb-network
 
@@ -112,3 +173,4 @@ networks:
 volumes:
   postgres_data:
   redis_data:
+  prometheus_multiprocess:

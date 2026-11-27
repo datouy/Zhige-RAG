@@ -115,21 +115,10 @@ def _is_sensitive_path(path: str) -> bool:
 
 
 def _get_client_ip(request: Request) -> str:
-    """获取客户端真实 IP。"""
-    # 优先从代理头获取
-    forwarded = request.headers.get("X-Forwarded-For")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
+    """获取客户端真实 IP，代理头仅在直连对端可信时生效。"""
+    from src.rate_limit import get_real_client_ip
 
-    real_ip = request.headers.get("X-Real-IP")
-    if real_ip:
-        return real_ip
-
-    # 回退到直接获取
-    if request.client:
-        return request.client.host
-
-    return "unknown"
+    return get_real_client_ip(request)
 
 
 class RequestLoggingMiddleware(BaseHTTPMiddleware):

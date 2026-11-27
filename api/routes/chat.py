@@ -9,8 +9,8 @@
 - POST /api/v1/ingest/dir    （目录批量入库）
 - WS   /ws/chat              （兼容旧前端）
 
-WS 聊天处理器通过 ``LLMConcurrencyGate`` 进行并发门控（P1.3），通过单例
-Pipeline 复用 LLM / Embedding（P1.4）。
+WS 聊天处理器复用单例 Pipeline；模型并发由提供方内部的
+``LLMConcurrencyGate`` 统一控制，路由层不再重复获取同一把闸。
 """
 from __future__ import annotations
 
@@ -40,7 +40,6 @@ from sqlalchemy.orm import Session
 
 from api.deps import (
     get_decision_provider,
-    get_llm_gate,
     get_runtime_config,
     get_runtime_pipeline,
     get_splitter,
@@ -51,18 +50,83 @@ from src.db.models import DocumentRecord, KnowledgeGap, User
 from src.document_loader import load_document, load_directory
 from src.document_meta import enrich_directory, enrich_file
 from src.factories import TenantAwareFactory
+from src.circuit_breaker import CircuitBreakerOpenError
+from src.http_client import RemoteServiceError
+from src.llm_concurrency import (
+    LLMConcurrencyLimitError,
+    LLMConcurrencyTimeoutError,
+)
 from src.memory import SESSION_MEMORY
 from src.middleware.audit import AuditAction, get_audit_logger
 from src.middleware.identity import get_current_user
 from src.monitoring.metrics import metrics_collector
 from src.rag_pipeline import RAGPipeline
 from src.rate_limit import limiter
-from src.team_auth import require_editor
+from src.team_auth import has_role, require_editor
 from src.utils import SUPPORTED_EXTENSIONS, ensure_dir, get_logger, resolve_path
 
 logger = get_logger("api.routes.chat")
 
 router = APIRouter()
+
+
+_GENERATION_UNAVAILABLE_ERRORS = (
+    TimeoutError,
+    RemoteServiceError,
+    CircuitBreakerOpenError,
+    LLMConcurrencyLimitError,
+    LLMConcurrencyTimeoutError,
+)
+
+
+def _generation_failure_code(exc: BaseException) -> str:
+    """Return a stable, non-sensitive code for audit and UI troubleshooting."""
+    if isinstance(exc, CircuitBreakerOpenError):
+        return "generation_circuit_open"
+    if isinstance(exc, LLMConcurrencyLimitError):
+        return "generation_capacity_exhausted"
+    if isinstance(exc, LLMConcurrencyTimeoutError):
+        return "generation_queue_timeout"
+    if isinstance(exc, TimeoutError):
+        return "generation_timeout"
+    if isinstance(exc, RemoteServiceError):
+        return "generation_backend_unavailable"
+    return "internal_error"
+
+
+def _generation_failure_http(exc: BaseException) -> Optional[HTTPException]:
+    """Translate an expected dependency outage into a safe HTTP 503."""
+    if not isinstance(exc, _GENERATION_UNAVAILABLE_ERRORS):
+        return None
+
+    code = _generation_failure_code(exc)
+    retry_after = "10"
+    if isinstance(exc, LLMConcurrencyLimitError):
+        retry_after = "5"
+    elif isinstance(exc, CircuitBreakerOpenError):
+        retry_after = str(max(1, min(60, int(exc.remaining_timeout) + 1)))
+    elif isinstance(exc, LLMConcurrencyTimeoutError):
+        retry_after = "15"
+
+    messages = {
+        "generation_capacity_exhausted": "生成服务当前繁忙，请稍后重试",
+        "generation_queue_timeout": "等待生成服务超时，请稍后重试",
+        "generation_timeout": "生成请求超时，请稍后重试",
+        "generation_circuit_open": (
+            "生成模型暂时不可用，服务已停止重试；请稍后重试或切换摘录模式"
+        ),
+        "generation_backend_unavailable": (
+            "生成依赖暂时不可用，服务已停止重试；请稍后重试或切换摘录模式"
+        ),
+    }
+    return HTTPException(
+        status_code=503,
+        detail=messages.get(code, "服务暂时不可用，请稍后重试"),
+        headers={
+            "Retry-After": retry_after,
+            "X-Zhige-Error-Code": code,
+        },
+    )
 
 
 def _ingest_guard_provider(cfg: Dict[str, Any]):
@@ -84,6 +148,37 @@ def _ingest_guard_provider(cfg: Dict[str, Any]):
 _UPLOAD_CHUNK_SIZE = 1024 * 1024
 
 
+def _is_websocket_disconnect_error(exc: BaseException) -> bool:
+    """Recognize close/disconnect errors without hiding real server faults."""
+    if isinstance(exc, WebSocketDisconnect):
+        return True
+    message = str(exc).lower()
+    markers = (
+        "cannot call \"send\" once a close message has been sent",
+        "clientdisconnected",
+        "websocketdisconnected",
+        "websocket is not connected",
+        "connection closed",
+        "connection is closed",
+        "disconnect",
+    )
+    return any(marker in message for marker in markers)
+
+
+def _query_audit_fingerprint(query: str) -> Dict[str, Any]:
+    """Build a correlatable audit value without persisting user text.
+
+    Chat questions commonly contain contract values, personal data, or trade
+    secrets. A short hash supports incident correlation; character count and
+    citation count support operational analysis without exposing the content.
+    """
+    raw = (query or "").encode("utf-8", errors="replace")
+    return {
+        "query_chars": len(query or ""),
+        "query_sha256_16": hashlib.sha256(raw).hexdigest()[:16],
+    }
+
+
 def _allowed_groups(user: User) -> Optional[List[str]]:
     """用户的可见分组：全员 ``*`` 恒可见，另加其所属部门。
 
@@ -95,6 +190,36 @@ def _allowed_groups(user: User) -> Optional[List[str]]:
     if dept:
         groups.add(dept)
     return sorted(groups)
+
+
+def _load_session_history(
+    db: Session,
+    user_id: str,
+    session_id: str,
+    limit: int = 20,
+) -> List[Dict[str, str]]:
+    """读取多轮上下文；真实会话优先使用数据库中的共享历史。"""
+    sid = (session_id or "default").strip() or "default"
+    memory_history = SESSION_MEMORY.get_history(user_id, sid)
+    if sid == "default":
+        return memory_history
+
+    try:
+        from src.kb_service import KBError, list_messages
+
+        rows = list_messages(db, user_id, sid, limit=max(2, int(limit)))
+    except KBError:
+        return memory_history
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("读取持久化会话历史失败，回退进程内记忆: %s", exc)
+        return memory_history
+
+    persisted = [
+        {"role": str(row.role), "content": str(row.content or "")}
+        for row in rows
+        if row.role in {"user", "assistant"} and str(row.content or "").strip()
+    ]
+    return persisted or memory_history
 
 
 def _record_knowledge_gap(
@@ -495,8 +620,15 @@ async def get_document_chunks(
         store = TenantAwareFactory.get_chroma_store_by_name(kb["collection_name"], cfg)
 
         def _fetch() -> Dict[str, Any]:
+            from src.vector_store import build_security_where
+
+            security_where = build_security_where(
+                extra_where={"source": {"$eq": doc_id}},
+                status_filter=not has_role(user, "editor"),
+                acl_groups=_allowed_groups(user),
+            )
             return store.collection.get(
-                where={"source": {"$eq": doc_id}},
+                where=security_where,
                 include=["documents", "metadatas"],
                 limit=limit,
             )
@@ -516,6 +648,8 @@ async def get_document_chunks(
                 }
             )
         return {"doc_id": doc_id, "chunks": chunks, "total": len(chunks)}
+    except HTTPException:
+        raise
     except Exception as exc:
         logger.error("获取分块失败: %s", exc)
         raise HTTPException(status_code=500, detail=str(exc))
@@ -546,7 +680,17 @@ async def update_document_chunk(
         store = TenantAwareFactory.get_chroma_store_by_name(kb["collection_name"], cfg)
 
         def _patch() -> Dict[str, Any]:
-            got = store.collection.get(ids=[chunk_id], include=["documents", "metadatas", "embeddings"])
+            from src.vector_store import build_security_where
+
+            security_where = build_security_where(
+                status_filter=False,
+                acl_groups=_allowed_groups(user),
+            )
+            got = store.collection.get(
+                ids=[chunk_id],
+                where=security_where,
+                include=["documents", "metadatas", "embeddings"],
+            )
             ids = got.get("ids") or []
             if not ids:
                 raise HTTPException(status_code=404, detail=f"分块不存在: {chunk_id}")
@@ -838,7 +982,7 @@ async def search_documents(
     start = time.perf_counter()
     try:
         cfg = get_runtime_config()
-        kb = _resolve_kb(user, cfg, body.kb_id)
+        kb = _resolve_kb(user, cfg, body.kb_id, quota_scope="search")
         store = TenantAwareFactory.get_chroma_store_by_name(kb["collection_name"], cfg)
         retrieval_cfg = cfg.get("retrieval", {})
         # 缺省回落：retrieval.top_k 是 top_k 的唯一真值来源
@@ -847,14 +991,36 @@ async def search_documents(
         def _query() -> List[Any]:
             from src.vector_store import build_security_where
 
+            acl_groups = (
+                _allowed_groups(user)
+                if retrieval_cfg.get("acl_filter", True)
+                else None
+            )
             where = build_security_where(
                 status_filter=bool(retrieval_cfg.get("status_filter", True)),
-                acl_groups=_allowed_groups(user) if retrieval_cfg.get("acl_filter", True) else None,
+                acl_groups=acl_groups,
             )
             hits = store.query(query_text=body.query, top_k=top_k, where=where)
-            # 旧索引兼容回退（仅状态过滤；ACL 绝不回退）
+            # 旧索引兼容回退：只撤掉 doc_status，ACL 必须继续下发。无 ACL
+            # 元数据的旧分块宁可不可见，也不能通过 fallback 泄露给其它部门。
+            legacy_status_index = False
             if not hits and where is not None and retrieval_cfg.get("status_filter_fallback", True):
-                hits = store.query(query_text=body.query, top_k=top_k)
+                probe = getattr(store, "has_doc_status_metadata", None)
+                if callable(probe):
+                    try:
+                        legacy_status_index = not bool(probe())
+                    except Exception as probe_exc:
+                        logger.warning("无法确认文档状态元数据，禁用检索回退：%s", probe_exc)
+            if not hits and where is not None and legacy_status_index:
+                acl_only_where = build_security_where(
+                    status_filter=False,
+                    acl_groups=acl_groups,
+                )
+                hits = store.query(
+                    query_text=body.query,
+                    top_k=top_k,
+                    where=acl_only_where,
+                )
             return hits
 
         hits = await run_in_threadpool(_query)
@@ -875,6 +1041,8 @@ async def search_documents(
             ],
             "total": len(hits),
         }
+    except HTTPException:
+        raise
     except Exception as exc:
         logger.error("检索失败: %s", exc)
         raise HTTPException(status_code=500, detail=str(exc))
@@ -920,7 +1088,12 @@ def chat_sync(
     start = time.perf_counter()
     try:
         # 指定知识库时在该库内检索，否则用默认库（行为与之前一致）
-        kb = _resolve_kb(user, get_runtime_config(), body.kb_id) if body.kb_id else None
+        kb = _resolve_kb(
+            user,
+            get_runtime_config(),
+            body.kb_id,
+            quota_scope="chat",
+        )
         pipeline = get_runtime_pipeline(
             user_id=(kb or {}).get("owner_id") or user.id, kb=kb
         )
@@ -934,7 +1107,7 @@ def chat_sync(
                 memories_written.append({"key": key, "value": value})
 
         # 即时记忆：取当前会话窗口
-        history = SESSION_MEMORY.get_history(user.id, session_id)
+        history = _load_session_history(db, user.id, session_id)
 
         result = pipeline.answer(
             body.query,
@@ -990,7 +1163,10 @@ def chat_sync(
                 action=AuditAction.CHAT_QUERY,
                 user_id=user.id,
                 resource=(kb or {}).get("id") or "default",
-                details={"query": (body.query or "")[:200], "cited": len(result.sources or [])},
+                details={
+                    **_query_audit_fingerprint(body.query),
+                    "cited": len(result.sources or []),
+                },
                 db=db,
             )
         except Exception:  # noqa: BLE001
@@ -1011,21 +1187,34 @@ def chat_sync(
     except HTTPException:
         raise
     except Exception as exc:
-        logger.error("同步问答失败: %s", exc)
+        code = _generation_failure_code(exc)
+        status_code = 503 if code != "internal_error" else 500
+        logger.error(
+            "同步问答失败: error_type=%s, code=%s, status=%s",
+            type(exc).__name__,
+            code,
+            status_code,
+        )
         try:
             get_audit_logger().log(
                 action=AuditAction.CHAT_QUERY,
                 user_id=user.id,
                 success=False,
-                error_message=str(exc)[:300],
+                error_message=code,
                 db=db,
             )
         except Exception:  # noqa: BLE001
             pass
         metrics_collector.record_request(
-            "POST", "/api/v1/chat", 500, time.perf_counter() - start
+            "POST", "/api/v1/chat", status_code, time.perf_counter() - start
         )
-        raise HTTPException(status_code=500, detail=str(exc))
+        dependency_error = _generation_failure_http(exc)
+        if dependency_error is not None:
+            raise dependency_error from exc
+        raise HTTPException(
+            status_code=500,
+            detail="问答处理失败，请稍后重试",
+        ) from exc
 
 
 # =========================== Ingest ===========================
@@ -1034,6 +1223,7 @@ def _resolve_kb(
     cfg: Dict[str, Any],
     kb_id: Optional[str],
     required_role: str = "viewer",
+    quota_scope: Optional[str] = None,
 ) -> Dict[str, Any]:
     """解析本次写入的目标知识库。
 
@@ -1056,13 +1246,33 @@ def _resolve_kb(
         else:
             kb = ensure_default_kb(db, user.id, cfg)
             access_role = "owner"
-        return {
+        resolved = {
             "id": kb.id,
             "name": kb.name,
             "collection_name": kb.collection_name,
             "owner_id": kb.user_id,
             "access_role": access_role,
         }
+        if quota_scope:
+            from src.tenant_quota import check_tenant_quota
+
+            decision = check_tenant_quota(kb.user_id, quota_scope)
+            if not decision.allowed:
+                raise HTTPException(
+                    status_code=429,
+                    detail=(
+                        "当前租户已达到"
+                        + ("每分钟" if decision.window == "minute" else "每日")
+                        + "配额，请稍后重试"
+                    ),
+                    headers={
+                        "Retry-After": str(max(1, decision.retry_after)),
+                        "X-Zhige-Error-Code": "tenant_quota_exceeded",
+                        "X-Zhige-Quota-Scope": decision.scope,
+                        "X-Zhige-Quota-Window": decision.window,
+                    },
+                )
+        return resolved
     finally:
         db.close()
 
@@ -1093,11 +1303,13 @@ def _maybe_trigger_kg_build(user_id: str, cfg: Dict[str, Any]) -> None:
     if not raw_dir.exists():
         return
     try:
-        from src.ingest_jobs import create_job, submit as _submit_job
+        from src.ingest_jobs import create_job, dispatch as _dispatch_job
         from scripts.build_kg import build as _build_kg
 
         job_id = create_job(
-            "kg_build", "知识图谱自动构建", {"dir": str(raw_dir), "user_id": user_id}
+            "kg_build",
+            "知识图谱自动构建",
+            {"dir": str(raw_dir), "user_id": user_id, "owner_id": user_id},
         )
 
         def _bg(reporter) -> Dict[str, Any]:
@@ -1107,7 +1319,7 @@ def _maybe_trigger_kg_build(user_id: str, cfg: Dict[str, Any]) -> None:
             reporter(1.0, "done")
             return summary
 
-        _submit_job(_bg, job_id)
+        _dispatch_job(_bg, job_id)
         logger.info("已提交知识图谱后台构建任务 %s（%s）", job_id, raw_dir)
     except Exception as exc:  # noqa: BLE001
         logger.warning("提交 KG 后台构建任务失败: %s", exc)
@@ -1153,14 +1365,31 @@ async def ingest_file(
 
         # P1 异步入库：background=true 时落盘后即返，后台线程做重活
         if background:
-            from src.ingest_jobs import create_job, submit as _submit_job
+            from src.ingest_jobs import create_job, dispatch as _dispatch_job
 
-            _kb_early = _resolve_kb(user, cfg, kb_id, required_role="editor")
+            _kb_early = _resolve_kb(
+                user,
+                cfg,
+                kb_id,
+                required_role="editor",
+                quota_scope="ingest",
+            )
             _uid, _kbid, _cfg_snapshot = _kb_early["owner_id"], _kb_early["id"], dict(cfg)
             _orig_name = file.filename
             _tmp = str(temp_path)
-            job_id = create_job("file", _orig_name or safe_name,
-                               {"kb_id": _kbid, "path": _tmp, "user_id": user.id})
+            job_id = create_job(
+                "file",
+                _orig_name or safe_name,
+                {
+                    "kb_id": _kbid,
+                    "kb_name": _kb_early.get("name", ""),
+                    "collection_name": _kb_early["collection_name"],
+                    "owner_id": _uid,
+                    "path": _tmp,
+                    "user_id": user.id,
+                    "original_name": _orig_name or safe_name,
+                },
+            )
 
             def _bg_file(reporter) -> Dict[str, Any]:
                 from pathlib import Path as _P
@@ -1216,7 +1445,7 @@ async def ingest_file(
                         "unchanged": incremental["unchanged"],
                         "kb_id": _kbid, "data_quality": rep}
 
-            _submit_job(_bg_file, job_id)
+            _dispatch_job(_bg_file, job_id)
             return {"job_id": job_id, "status": "queued",
                     "filename": file.filename, "kb_id": _kb_early["id"],
                     "poll": f"/api/v1/ingest/jobs/{job_id}"}
@@ -1263,7 +1492,13 @@ async def ingest_file(
             raise HTTPException(status_code=400, detail="文件解析后没有可用内容")
 
         # 知识库隔离：写入目标知识库专属的 collection
-        kb = _resolve_kb(user, cfg, kb_id, required_role="editor")
+        kb = _resolve_kb(
+            user,
+            cfg,
+            kb_id,
+            required_role="editor",
+            quota_scope="ingest",
+        )
         for c in all_chunks:
             c.metadata["kb_id"] = kb["id"]
         store = TenantAwareFactory.get_chroma_store_by_name(kb["collection_name"], cfg)
@@ -1375,9 +1610,15 @@ async def ingest_url(
 
         # P1 异步入库：URL抓取也可能慢，先返job_id，后台fetch→分块→upsert
         if body.background:
-            from src.ingest_jobs import create_job, submit as _submit_job
+            from src.ingest_jobs import create_job, dispatch as _dispatch_job
 
-            _kb_early = _resolve_kb(user, cfg, body.kb_id, required_role="editor")
+            _kb_early = _resolve_kb(
+                user,
+                cfg,
+                body.kb_id,
+                required_role="editor",
+                quota_scope="ingest",
+            )
             _uid, _kbid = _kb_early["owner_id"], _kb_early["id"]
             _cfg_snapshot = dict(cfg)
             _body_url, _body_title = body.url, body.title
@@ -1385,7 +1626,16 @@ async def ingest_url(
             job_id = create_job(
                 "url",
                 _body_url,
-                {"kb_id": _kbid, "url": _body_url, "user_id": user.id},
+                {
+                    "kb_id": _kbid,
+                    "kb_name": _kb_early.get("name", ""),
+                    "collection_name": _kb_early["collection_name"],
+                    "owner_id": _uid,
+                    "url": _body_url,
+                    "title": _body_title,
+                    "timeout": _body_timeout,
+                    "user_id": user.id,
+                },
             )
 
             def _bg_url(reporter) -> Dict[str, Any]:
@@ -1437,7 +1687,7 @@ async def ingest_url(
                         "changed": incremental["changed"],
                         "unchanged": incremental["unchanged"], "kb_id": _kbid}
 
-            _submit_job(_bg_url, job_id)
+            _dispatch_job(_bg_url, job_id)
             return {"job_id": job_id, "status": "queued", "url": body.url,
                     "kb_id": _kb_early["id"],
                     "poll": f"/api/v1/ingest/jobs/{job_id}"}
@@ -1496,7 +1746,13 @@ async def ingest_url(
             raise HTTPException(status_code=400, detail="网页正文为空，无法入库")
 
         # 知识库隔离：写入目标知识库专属的 collection
-        kb = _resolve_kb(user, cfg, body.kb_id, required_role="editor")
+        kb = _resolve_kb(
+            user,
+            cfg,
+            body.kb_id,
+            required_role="editor",
+            quota_scope="ingest",
+        )
         for c in chunks:
             c.metadata["kb_id"] = kb["id"]
         store = TenantAwareFactory.get_chroma_store_by_name(kb["collection_name"], cfg)
@@ -1557,7 +1813,13 @@ async def ingest_directory(
     user: User = current_user
     try:
         cfg = get_runtime_config()
-        kb = _resolve_kb(user, cfg, kb_id, required_role="editor")
+        kb = _resolve_kb(
+            user,
+            cfg,
+            kb_id,
+            required_role="editor",
+            quota_scope="ingest",
+        )
 
         raw_root = resolve_path(cfg.get("paths", {}).get("raw_docs", "data/raw"))
         user_scope = raw_root / user.id[:8]
@@ -1568,14 +1830,22 @@ async def ingest_directory(
 
         # P1 异步入库：目录批量同样支持 background=true
         if background:
-            from src.ingest_jobs import create_job, submit as _submit_job
+            from src.ingest_jobs import create_job, dispatch as _dispatch_job
 
             _kb_e, _uid, _cfg_s = kb, kb["owner_id"], dict(cfg)
             _tgt, _rec = str(target), bool(recursive)
             job_id = create_job(
                 "dir",
                 _tgt,
-                {"kb_id": _kb_e["id"], "dir": _tgt, "user_id": user.id},
+                {
+                    "kb_id": _kb_e["id"],
+                    "kb_name": _kb_e.get("name", ""),
+                    "collection_name": _kb_e["collection_name"],
+                    "owner_id": _uid,
+                    "dir": _tgt,
+                    "recursive": _rec,
+                    "user_id": user.id,
+                },
             )
 
             def _bg_dir(reporter) -> Dict[str, Any]:
@@ -1625,7 +1895,7 @@ async def ingest_directory(
                         "ingested": n, "changed": incremental["changed"],
                         "unchanged": incremental["unchanged"], "kb_id": _kb_e["id"]}
 
-            _submit_job(_bg_dir, job_id)
+            _dispatch_job(_bg_dir, job_id)
             return {"job_id": job_id, "status": "queued", "dir": str(target),
                     "kb_id": kb["id"], "poll": f"/api/v1/ingest/jobs/{job_id}"}
 
@@ -1727,6 +1997,22 @@ async def websocket_chat(websocket: WebSocket):
             return
         user_id = ws_user.id
         await websocket.accept()
+        connection_state = {"connected": True}
+
+        async def _safe_send(payload: Dict[str, Any]) -> bool:
+            """Send only while the peer is connected; close errors are terminal."""
+            if not connection_state["connected"]:
+                return False
+            try:
+                await websocket.send_json(payload)
+                return True
+            except Exception as exc:  # noqa: BLE001 - filtered below
+                if not _is_websocket_disconnect_error(exc):
+                    raise
+                connection_state["connected"] = False
+                logger.info("WebSocket 客户端已断开，停止发送: %s", type(exc).__name__)
+                return False
+
         while True:
             data = await websocket.receive_json()
             request_id = str(data.get("request_id") or uuid.uuid4().hex)
@@ -1746,25 +2032,28 @@ async def websocket_chat(websocket: WebSocket):
             direct = data.get("direct", False)
 
             if not query:
-                await websocket.send_json(
+                if not await _safe_send(
                     _with_request_id({"event": "error", "data": "query is required"})
-                )
+                ):
+                    return
                 continue
 
-            # P0-1 修复：使用 LLMConcurrencyGate 替代已删除的 AsyncLLMExecutor
-            gate = get_llm_gate()
             started = time.perf_counter()
 
             # 指定知识库时在该库内检索（与 /api/v1/chat 行为一致）
-            kb = None
-            if kb_id:
-                try:
-                    kb = _resolve_kb(ws_user, _cfg_ws, kb_id)
-                except HTTPException as kb_exc:
-                    await websocket.send_json(
-                        _with_request_id({"event": "error", "data": str(kb_exc.detail)})
-                    )
-                    continue
+            try:
+                kb = _resolve_kb(
+                    ws_user,
+                    _cfg_ws,
+                    kb_id,
+                    quota_scope="chat",
+                )
+            except HTTPException as kb_exc:
+                if not await _safe_send(
+                    _with_request_id({"event": "error", "data": str(kb_exc.detail)})
+                ):
+                    return
+                continue
 
             # 长期记忆：显式"记住"指令先行落库（失败/替身缺失均不影响问答）
             try:
@@ -1777,7 +2066,7 @@ async def websocket_chat(websocket: WebSocket):
             except Exception as exc:  # noqa: BLE001
                 logger.warning("WS 长期记忆写入失败（已忽略）: %s", exc)
 
-            history = SESSION_MEMORY.get_history(user_id, session_id)
+            history = _load_session_history(db, user_id, session_id)
             answer_buf = {"text": ""}
             metadata_buf = {"sources": [], "verification": None, "timings": {}}
             cancel_requested = {"value": False}
@@ -1795,6 +2084,7 @@ async def websocket_chat(websocket: WebSocket):
                             cancel_requested["value"] = True
                             return
                 except (WebSocketDisconnect, RuntimeError):
+                    connection_state["connected"] = False
                     return
 
             # P1-4：记录时机，用于流式响应的性能元数据
@@ -1802,22 +2092,25 @@ async def websocket_chat(websocket: WebSocket):
             ttft_ms: Optional[float] = None
             first_token_time: Optional[float] = None
 
-            # P1.3：semaphore 保护，避免并发 WS 流量击穿 LLM
+            # LLMConcurrencyGate 由模型提供方在真正调用模型时持有。这里不能
+            # 再包一层同一把进程内闸：并发 WebSocket 占满外层许可后，内层
+            # 模型调用会等待自己已经持有的许可，形成嵌套获取/死锁。
             async def _run() -> bool:
                 nonlocal ttft_ms, first_token_time
                 pipeline: RAGPipeline = get_runtime_pipeline(
                     user_id=(kb or {}).get("owner_id") or user_id, kb=kb
                 )
                 watcher = asyncio.create_task(_watch_cancel())
+                stream = pipeline.astream_answer(
+                    query,
+                    top_k=top_k,
+                    history=history,
+                    user_id=user_id,
+                    allowed_groups=_allowed_groups(ws_user),
+                    direct=direct,
+                )
                 try:
-                    async for event in pipeline.astream_answer(
-                        query,
-                        top_k=top_k,
-                        history=history,
-                        user_id=user_id,
-                        allowed_groups=_allowed_groups(ws_user),
-                        direct=direct,
-                    ):
+                    async for event in stream:
                         if cancel_requested["value"]:
                             break
                         event_type = event.get("event")
@@ -1834,6 +2127,12 @@ async def websocket_chat(websocket: WebSocket):
                                 ttft_ms = round((first_token_time - started) * 1000, 2)
                                 metadata_buf["timings"]["ttft_ms"] = ttft_ms
                             answer_buf["text"] += str(event.get("data") or "")
+                        elif event_type == "replace":
+                            # 生成后校验发现硬事实或引用缺陷时，服务端会以拒答
+                            # 文案撤回整轮可见答案；持久化也必须保存替换后的文本。
+                            answer_buf["text"] = str(event.get("data") or "")
+                            metadata_buf["sources"] = []
+                            metadata_buf["verification"] = event.get("verification")
                         elif event_type == "done":
                             metadata_buf["sources"] = event.get("data", [])
                             metadata_buf["verification"] = event.get("verification")
@@ -1843,8 +2142,16 @@ async def websocket_chat(websocket: WebSocket):
                                     (time.perf_counter() - first_token_time) * 1000, 2
                                 )
 
-                        await websocket.send_json(_with_request_id(event))
+                        if not await _safe_send(_with_request_id(event)):
+                            cancel_requested["value"] = True
+                            break
                 finally:
+                    close_stream = getattr(stream, "aclose", None)
+                    if callable(close_stream):
+                        try:
+                            await close_stream()
+                        except (asyncio.CancelledError, WebSocketDisconnect, RuntimeError):
+                            pass
                     watcher.cancel()
                     try:
                         await watcher
@@ -1858,7 +2165,7 @@ async def websocket_chat(websocket: WebSocket):
                 total_ms = round((time.perf_counter() - started) * 1000, 2)
                 metadata_buf["timings"]["total_ms"] = total_ms
                 
-                await websocket.send_json({
+                await _safe_send({
                     "event": "metadata",
                     "data": {
                         "sources": metadata_buf["sources"],
@@ -1867,18 +2174,10 @@ async def websocket_chat(websocket: WebSocket):
                     },
                     "request_id": request_id,
                 })
-                return False
+                return False if connection_state["connected"] else True
 
             try:
-                # 用 gate 本身做上下文管理器（而不是 gate.semaphore）：
-                # gate 内部按事件循环挑选信号量，并保证 acquire/release
-                # 落在同一把上 —— 直接拿属性会在跨循环时抛
-                # "bound to a different event loop"。
-                if gate is not None:
-                    async with gate:
-                        was_cancelled = await _run()
-                else:
-                    was_cancelled = await _run()
+                was_cancelled = await _run()
                 # 回写即时记忆
                 SESSION_MEMORY.append(user_id, session_id, "user", query)
                 SESSION_MEMORY.append(user_id, session_id, "assistant", answer_buf["text"])
@@ -1916,21 +2215,45 @@ async def websocket_chat(websocket: WebSocket):
                         detail=str(verification.get("status") or ""),
                     )
                 if was_cancelled:
-                    await websocket.send_json(
+                    await _safe_send(
                         _with_request_id({
                             "event": "cancelled",
                             "data": metadata_buf["sources"],
                         })
                     )
             except Exception as exc:
-                logger.error("WebSocket 流式生成失败: %s", exc)
-                await websocket.send_json(
-                    _with_request_id({"event": "error", "data": str(exc)})
+                if _is_websocket_disconnect_error(exc):
+                    logger.info("WebSocket 客户端断开，流式生成已停止")
+                    connection_state["connected"] = False
+                    return
+                code = _generation_failure_code(exc)
+                logger.error(
+                    "WebSocket 流式生成失败: error_type=%s, code=%s",
+                    type(exc).__name__,
+                    code,
                 )
+                if code == "internal_error":
+                    message = "问答处理失败，请稍后重试"
+                elif code == "generation_capacity_exhausted":
+                    message = "生成服务当前繁忙，请稍后重试"
+                elif code == "generation_circuit_open":
+                    message = "生成模型暂时不可用，请稍后重试或切换摘录模式"
+                else:
+                    message = "生成依赖暂时不可用，请稍后重试或切换摘录模式"
+                if not await _safe_send(
+                    _with_request_id(
+                        {
+                            "event": "error",
+                            "data": message,
+                            "code": code,
+                        }
+                    )
+                ):
+                    return
                 # 错误后必须补一条 done：客户端普遍以 "done" 作为"本轮结束"的
                 # 信号，只发 error 就结束会让前端一直转圈 / 测试 receive_json 永久阻塞。
                 try:
-                    await websocket.send_json({
+                    await _safe_send({
                         "event": "done",
                         "data": metadata_buf["sources"],
                         "verification": metadata_buf["verification"],
@@ -1941,13 +2264,29 @@ async def websocket_chat(websocket: WebSocket):
     except WebSocketDisconnect:
         logger.info("WebSocket 客户端断开")
     except Exception as exc:
+        if _is_websocket_disconnect_error(exc):
+            logger.info("WebSocket 客户端断开: %s", type(exc).__name__)
+            return
         # 顶层异常（如 get_local_user 失败、DB 不可用）必须回一条 error 事件。
         # 此前只写日志就静默结束，客户端那边 receive_json() 会一直等下去 ——
         # 前端表现为"消息一直转圈"，服务端日志里也只有一行 ERROR，极难定位。
-        logger.error("WebSocket 异常: %s", exc, exc_info=True)
+        logger.error(
+            "WebSocket 异常: error_type=%s, code=%s",
+            type(exc).__name__,
+            _generation_failure_code(exc),
+        )
         try:
-            await websocket.send_json({"event": "error", "data": f"会话初始化失败：{exc}"})
-        except Exception:  # noqa: BLE001 - 连接可能已断开，无需再处理
-            pass
+            # ``_safe_send`` only exists after accept; this fallback is for
+            # pre-accept/local initialization failures.
+            await websocket.send_json(
+                {
+                    "event": "error",
+                    "data": "会话初始化失败，请稍后重试",
+                    "code": "session_initialization_failed",
+                }
+            )
+        except Exception as send_exc:  # noqa: BLE001
+            if not _is_websocket_disconnect_error(send_exc):
+                logger.exception("WebSocket 错误提示发送失败")
     finally:
         db.close()

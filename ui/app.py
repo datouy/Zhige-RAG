@@ -273,6 +273,11 @@ def page_chat(pipeline: RAGPipeline, cfg: dict):
                     elif etype == "token":
                         full_answer += data
                         placeholder.markdown(full_answer + "▌")
+                    elif etype == "replace":
+                        full_answer = str(data or "")
+                        sources = []
+                        verif = ev.get("verification") or verif
+                        placeholder.markdown(full_answer)
                     elif etype == "done":
                         sources = data or sources
                         verif = ev.get("verification") or {}
@@ -297,7 +302,7 @@ def page_chat(pipeline: RAGPipeline, cfg: dict):
                 else:
                     st.caption(f"耗时 {elapsed:.0f} ms · 未命中知识库")
             except Exception as exc:
-                placeholder.error(f"生成失败：{exc}")
+                placeholder.error("生成失败，请稍后重试（错误码：generation_failed）")
                 logger.exception("生成失败")
 
             st.session_state.chat_history.append(
